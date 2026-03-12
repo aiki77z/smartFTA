@@ -1,5 +1,4 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
-import { toPng } from 'html-to-image'
 import FaultTreeCanvas from '../components/fta/FaultTreeCanvas.jsx'
 import rawFtaSample from '../raw-FTA/raw-FTA.json'
 import { parseRawFtaJson } from '../utils/ftaParser.js'
@@ -45,6 +44,7 @@ function FaultTreePage() {
   const [selectedNode, setSelectedNode] = useState(null)
   const [exporting, setExporting] = useState(false)
   const canvasRef = useRef(null)
+  const canvasActionsRef = useRef(null)
 
   const handleJsonChange = useCallback((e) => {
     setRawJsonText(e.target.value)
@@ -72,25 +72,17 @@ function FaultTreePage() {
   }, [rawJsonText])
 
   const handleDownloadImage = useCallback(async () => {
-    if (!canvasRef.current) return
+    if (!canvasActionsRef.current?.exportImage) return
     try {
       setExporting(true)
       await new Promise((resolve) => setTimeout(resolve, 50))
-
-      const target =
-        canvasRef.current.querySelector('.react-flow__renderer') ||
-        canvasRef.current
-
-      const dataUrl = await toPng(target, {
-        cacheBust: true,
-        backgroundColor: '#f8fafc',
-      })
+      const dataUrl = await canvasActionsRef.current.exportImage()
+      if (!dataUrl) throw new Error('export returned empty')
       const link = document.createElement('a')
       link.href = dataUrl
       link.download = 'fault-tree.png'
       link.click()
     } catch (err) {
-      // eslint-disable-next-line no-console
       console.error(err)
       setError('图片导出失败，请重试')
     } finally {
@@ -161,6 +153,7 @@ function FaultTreePage() {
             <FaultTreeCanvas
               graphData={graphData}
               onNodeSelect={setSelectedNode}
+              canvasActionsRef={canvasActionsRef}
               showChrome
             />
           </div>
