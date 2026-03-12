@@ -1,0 +1,53 @@
+{
+    "attr": {
+      "background": "#fff",
+      "fontColor": "#000",
+      "eventColor": "#000",
+      "eventFillColor": "#fff",
+      "gateColor": "#000",
+      "gateFillColor": "#fff",
+      "linkColor": "#456",
+      "eventCode": true,
+      "eventProbability": false,
+      "containerX": 0,
+      "containerY": 0,
+      "width": 1920,
+      "height": 1080
+    },
+    "nodeList": [
+      {
+        "type": "1",
+        "gate": "2",
+        "name": "设备停机",
+        "event": null,
+        "x": 200,
+        "y": 200,
+        "id": "node-top-1",
+        "transfer": ""
+      },
+      {
+        "type": "3",
+        "gate": "2",
+        "name": "电源故障",
+        "x": 400,
+        "y": 150,
+        "id": "node-basic-1",
+        "transfer": "",
+        "event": { "id": "E001", "name": "电源故障", "description": "", "errorLevel": "", "priority": 0, "probability": 1e-8, "showProbability": 0.000001, "rules": [], "investigateMethod": "", "documents": [] }
+      },
+      {
+        "type": "3",
+        "gate": "2",
+        "name": "控制系统故障",
+        "x": 400,
+        "y": 250,
+        "id": "node-basic-2",
+        "transfer": "",
+        "event": { "id": "E002", "name": "控制系统故障", "description": "", "errorLevel": "", "priority": 0, "probability": 1e-8, "showProbability": 0.000001, "rules": [], "investigateMethod": "", "documents": [] }
+      }
+    ],
+    "linkList": [
+      { "type": "link", "sourceId": "node-basic-1", "targetId": "node-top-1", "isCondition": false },
+      { "type": "link", "sourceId": "node-basic-2", "targetId": "node-top-1", "isCondition": false }
+    ]
+}

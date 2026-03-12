@@ -1,0 +1,440 @@
+:root {
+  --fta-bg: #f8fafc;
+  --fta-surface: #ffffff;
+  --fta-border: #e2e8f0;
+  --fta-accent: #818cf8;
+  --fta-accent-hover: #6366f1;
+  --fta-text-main: #334155;
+  --fta-text-subtle: #94a3b8;
+  --fta-radius-lg: 20px;
+  --fta-radius-md: 14px;
+}
+
+.fta-layout {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.75rem 0.9rem 0.9rem;
+  box-sizing: border-box;
+  background: var(--fta-bg);
+  color: var(--fta-text-main);
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+/* ── Header ── */
+
+.fta-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 0.75rem 1.2rem;
+  border-radius: 999px;
+  border: 1px solid var(--fta-border);
+  background: var(--fta-surface);
+  box-shadow: 0 2px 12px rgba(148, 163, 184, 0.15);
+}
+
+.fta-title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #1e293b;
+}
+
+.fta-subtitle {
+  margin: 0.15rem 0 0;
+  font-size: 0.78rem;
+  color: var(--fta-text-subtle);
+}
+
+.fta-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* ── Main Grid ── */
+
+.fta-main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(240px, 340px) minmax(0, 1fr);
+  gap: 0.75rem;
+  min-height: 0;
+}
+
+/* ── Panels ── */
+
+.fta-side,
+.fta-canvas-section {
+  padding: 1rem 1.1rem;
+  border-radius: var(--fta-radius-lg);
+  border: 1px solid var(--fta-border);
+  background: var(--fta-surface);
+  box-shadow: 0 2px 16px rgba(148, 163, 184, 0.1);
+}
+
+.fta-side {
+  overflow-y: auto;
+}
+
+.fta-canvas-section {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.fta-section-title {
+  margin: 0 0 0.3rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fta-accent);
+}
+
+.fta-section-desc {
+  margin: 0 0 0.7rem;
+  font-size: 0.78rem;
+  color: var(--fta-text-subtle);
+}
+
+/* ── JSON Input ── */
+
+.fta-json-input {
+  width: 100%;
+  min-height: 240px;
+  resize: vertical;
+  box-sizing: border-box;
+  padding: 0.7rem 0.8rem;
+  border-radius: var(--fta-radius-md);
+  border: 1px solid var(--fta-border);
+  background: #f1f5f9;
+  color: var(--fta-text-main);
+  font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.fta-json-input:focus {
+  border-color: var(--fta-accent);
+  box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.2);
+}
+
+/* ── Buttons ── */
+
+.fta-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  padding: 0.4rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background 0.2s,
+    color 0.2s,
+    border-color 0.2s,
+    transform 0.1s,
+    box-shadow 0.2s;
+  white-space: nowrap;
+}
+
+.fta-btn.full {
+  margin-top: 0.7rem;
+  width: 100%;
+}
+
+.fta-btn.primary {
+  background: #818cf8;
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(129, 140, 248, 0.3);
+}
+
+.fta-btn.primary:not(:disabled):hover {
+  background: #6366f1;
+  box-shadow: 0 6px 20px rgba(129, 140, 248, 0.4);
+  transform: translateY(-1px);
+}
+
+.fta-btn.ghost {
+  background: #f1f5f9;
+  border-color: var(--fta-border);
+  color: var(--fta-text-main);
+}
+
+.fta-btn.ghost:not(:disabled):hover {
+  background: #e2e8f0;
+  border-color: #cbd5e1;
+  transform: translateY(-1px);
+}
+
+.fta-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.fta-error-text {
+  margin-top: 0.5rem;
+  font-size: 0.76rem;
+  color: #f43f5e;
+}
+
+/* ── Canvas Wrapper ── */
+
+.fta-canvas-wrapper {
+  flex: 1;
+  margin-top: 0.4rem;
+  min-height: 300px;
+  border-radius: var(--fta-radius-md);
+  border: 1px solid var(--fta-border);
+  overflow: hidden;
+  background: #f8fafc;
+  box-shadow: inset 0 1px 4px rgba(148, 163, 184, 0.1);
+}
+
+.fta-reactflow {
+  background: transparent !important;
+}
+
+.fta-canvas-exporting .react-flow__controls,
+.fta-canvas-exporting .react-flow__minimap {
+  opacity: 0;
+}
+
+/* ── Node Info Panel ── */
+
+.fta-node-panel {
+  position: absolute;
+  right: 1rem;
+  bottom: 1rem;
+  width: 310px;
+  max-height: 55vh;
+  padding: 0.7rem 0.85rem;
+  border-radius: 16px;
+  border: 1px solid var(--fta-border);
+  background: var(--fta-surface);
+  box-shadow: 0 8px 30px rgba(148, 163, 184, 0.25);
+  color: var(--fta-text-main);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+}
+
+.fta-node-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.fta-node-panel-title {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.fta-node-panel-subtitle {
+  margin-top: 0.1rem;
+  font-size: 0.74rem;
+  color: var(--fta-text-subtle);
+}
+
+.fta-node-panel-body {
+  margin-top: 0.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.78rem;
+}
+
+.fta-node-panel-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.fta-node-panel-label {
+  color: var(--fta-text-subtle);
+}
+
+.fta-node-panel-value {
+  text-align: right;
+  color: #1e293b;
+}
+
+.fta-node-panel-rules {
+  margin-top: 0.3rem;
+}
+
+.fta-node-panel-json {
+  margin: 0.2rem 0 0;
+  padding: 0.35rem 0.5rem;
+  background: #f1f5f9;
+  border-radius: 10px;
+  border: 1px solid var(--fta-border);
+  font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.72rem;
+  max-height: 20vh;
+  overflow: auto;
+  color: var(--fta-text-main);
+}
+
+/* ── Custom FTA Node Styles ── */
+
+.react-flow__node-eventNode,
+.react-flow__node-gateNode {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  box-shadow: none !important;
+}
+
+.fta-node {
+  padding: 10px 14px;
+  border-radius: 0;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: center;
+  min-width: 110px;
+  max-width: 160px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  transition: box-shadow 0.2s, transform 0.15s;
+  cursor: pointer;
+}
+
+.fta-node:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+
+.fta-node--top {
+  background: #fda4af;
+  border: 2px solid #fb7185;
+  color: #881337;
+  font-weight: 700;
+  font-size: 14px;
+  min-width: 130px;
+}
+
+.fta-node--intermediate {
+  background: #bfdbfe;
+  border: 2px solid #93c5fd;
+  color: #1e3a5f;
+}
+
+.fta-node--basic {
+  background: #a7f3d0;
+  border: 2px solid #6ee7b7;
+  color: #064e3b;
+  border-radius: 50%;
+  width: 100px;
+  height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  min-width: unset;
+  max-width: unset;
+}
+
+.fta-node__label {
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.react-flow__node.selected .fta-node {
+  box-shadow: 0 0 0 3px var(--fta-accent), 0 6px 20px rgba(0, 0, 0, 0.12);
+}
+
+/* ── Gate Nodes ── */
+
+.fta-gate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  cursor: pointer;
+  transition: transform 0.15s;
+}
+
+.fta-gate:hover {
+  transform: translateY(-2px);
+}
+
+.fta-gate:hover svg {
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.15));
+}
+
+.react-flow__node.selected .fta-gate svg {
+  filter: drop-shadow(0 0 6px rgba(129, 140, 248, 0.5));
+}
+
+/* ── Handles ── */
+
+.fta-handle {
+  width: 8px !important;
+  height: 8px !important;
+  background: #cbd5e1 !important;
+  border: 2px solid #fff !important;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.react-flow__node:hover .fta-handle {
+  opacity: 1;
+}
+
+/* ── Fit-view button ── */
+
+.fta-fitview-btn {
+  font-size: 0.76rem;
+  padding: 0.3rem 0.6rem;
+}
+
+/* ── React Flow overrides for light theme ── */
+
+.react-flow__controls button {
+  background: var(--fta-surface) !important;
+  border-color: var(--fta-border) !important;
+  fill: var(--fta-text-subtle) !important;
+}
+
+.react-flow__controls button:hover {
+  background: #f1f5f9 !important;
+}
+
+.react-flow__minimap {
+  border: 1px solid var(--fta-border) !important;
+  border-radius: 10px !important;
+  overflow: hidden;
+}
+
+/* ── Responsive ── */
+
+@media (max-width: 960px) {
+  .fta-header {
+    flex-direction: column;
+    align-items: flex-start;
+    border-radius: 20px;
+    gap: 0.5rem;
+  }
+
+  .fta-main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fta-canvas-wrapper {
+    height: 420px;
+  }
+}
