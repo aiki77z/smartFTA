@@ -18,6 +18,7 @@ import {
   graphToRawJson,
   graphToTreeDataJson,
   getNodeEditInfo,
+  changeEventDescription,
 } from '../utils/ftaGraphEditor.js'
 import '../styles/fta.css'
 
@@ -90,6 +91,7 @@ function FaultTreePage() {
   const [exporting, setExporting] = useState(false)
   const [contextMenu, setContextMenu] = useState(null)
   const [edgeMenu, setEdgeMenu] = useState(null)
+  const [paneMenu, setPaneMenu] = useState(null)
   const [modal, setModal] = useState(null)
   const [validation, setValidation] = useState(null)
   const [validationLoading, setValidationLoading] = useState(false)
@@ -113,6 +115,16 @@ function FaultTreePage() {
       document.removeEventListener('click', dismiss)
     }
   }, [contextMenu])
+
+  useEffect(() => {
+    if (!paneMenu) return
+    const dismiss = () => setPaneMenu(null)
+    const timer = setTimeout(() => document.addEventListener('click', dismiss), 0)
+    return () => {
+      clearTimeout(timer)
+      document.removeEventListener('click', dismiss)
+    }
+  }, [paneMenu])
 
   const parsedInfo = useMemo(() => {
     try {
@@ -280,6 +292,7 @@ function FaultTreePage() {
     (event, rfNode) => {
       const info = getNodeEditInfo(graphData, rfNode.id)
       if (!info) return
+      setPaneMenu(null)
       setContextMenu({
         x: event.clientX,
         y: event.clientY,
@@ -289,9 +302,14 @@ function FaultTreePage() {
     [graphData],
   )
 
-  const handlePaneContextMenu = useCallback(() => {
+  const handlePaneContextMenu = useCallback((event) => {
+    event.preventDefault()
     setContextMenu(null)
     setEdgeMenu(null)
+    setPaneMenu({
+      x: event.clientX,
+      y: event.clientY,
+    })
   }, [])
 
   const handleNodeDoubleClick = useCallback(
@@ -370,6 +388,13 @@ function FaultTreePage() {
     [graphData, applyEdit],
   )
 
+  const doChangeDescription = useCallback(
+    (nodeId, newDesc) => {
+      applyEdit(changeEventDescription(graphData, nodeId, newDesc))
+    },
+    [graphData, applyEdit],
+  )
+
   const doInsertGate = useCallback(
     (parentId, gateType) => {
       applyEdit(insertGate(graphData, parentId, gateType))
@@ -387,6 +412,51 @@ function FaultTreePage() {
   const doDuplicate = useCallback(
     (nodeId) => {
       applyEdit(duplicateEventNode(graphData, nodeId))
+    },
+    [graphData, applyEdit],
+  )
+
+  const doAddStandaloneNode = useCallback(
+    (eventType) => {
+      const baseLabel =
+        eventType === 'top'
+          ? '新顶事件'
+          : eventType === 'intermediate'
+            ? '新中间事件'
+            : '新基本事件'
+      const existing = graphData.nodes.filter(
+        (n) => typeof n.label === 'string' && n.label.startsWith(baseLabel),
+      )
+      const nextIndex = existing.length + 1
+      const name = `${baseLabel}${nextIndex}`
+
+      const newId = `node-${Date.now().toString(36)}${Math.random()
+        .toString(36)
+        .slice(2, 9)}`
+
+      const newNode = {
+        id: newId,
+        label: name,
+        type: eventType,
+        position: { x: 0, y: 0 },
+        meta: {
+          rawType: eventType === 'top' ? '1' : eventType === 'intermediate' ? '2' : '3',
+          gateCode: '',
+          gateLabel: '',
+          event: {
+            id: newId,
+            name,
+          },
+          transfer: '',
+        },
+      }
+
+      const nextGraph = {
+        nodes: [...graphData.nodes, newNode],
+        edges: [...graphData.edges],
+      }
+      applyEdit(nextGraph)
+      setPaneMenu(null)
     },
     [graphData, applyEdit],
   )
@@ -454,9 +524,12 @@ function FaultTreePage() {
     const { x, y, info } = contextMenu
     const { node, isGate, gateChild, hasDirectChildren, isTop, parentId } = info
 
+    // 固定菜单最大高度与 CSS 中的 max-height 保持一致，靠近点击位置，
+    // 仅在接近窗口底部时进行少量上移，避免被裁剪
+    const MENU_MAX_HEIGHT = 260
     const menuStyle = {
       left: Math.min(x, window.innerWidth - 220),
-      top: Math.min(y, window.innerHeight - 320),
+      top: Math.min(y, window.innerHeight - MENU_MAX_HEIGHT - 8),
     }
 
     if (isGate) {
@@ -511,16 +584,18 @@ function FaultTreePage() {
           <span className="fta-ctx-icon">＋</span>
           在其下添加子节点
         </button>
-        <button
-          className="fta-context-menu-item"
-          onClick={() => {
-            doDuplicate(node.id)
-            setContextMenu(null)
-          }}
-        >
-          <span className="fta-ctx-icon">⧉</span>
-          复制此节点
-        </button>
+        {!isTop && (
+          <button
+            className="fta-context-menu-item"
+            onClick={() => {
+              doDuplicate(node.id)
+              setContextMenu(null)
+            }}
+          >
+            <span className="fta-ctx-icon">⧉</span>
+            复制此节点
+          </button>
+        )}
         {!isTop && parentId && (
           <button
             className="fta-context-menu-item"
@@ -633,9 +708,10 @@ function FaultTreePage() {
   function renderEdgeMenu() {
     if (!edgeMenu) return null
     const { x, y, edgeId } = edgeMenu
+    const MENU_MAX_HEIGHT = 160
     const menuStyle = {
       left: Math.min(x, window.innerWidth - 200),
-      top: Math.min(y, window.innerHeight - 120),
+      top: Math.min(y, window.innerHeight - MENU_MAX_HEIGHT - 8),
     }
     return (
       <div className="fta-context-menu" style={menuStyle}>
@@ -645,6 +721,34 @@ function FaultTreePage() {
         >
           <span className="fta-ctx-icon">✕</span>
           删除连线
+        </button>
+      </div>
+    )
+  }
+
+  function renderPaneMenu() {
+    if (!paneMenu) return null
+    const { x, y } = paneMenu
+    const menuStyle = {
+      left: Math.min(x, window.innerWidth - 200),
+      top: Math.min(y, window.innerHeight - 180),
+    }
+    return (
+      <div className="fta-context-menu" style={menuStyle}>
+        <div className="fta-context-menu-label">在此处新增事件节点</div>
+        <button
+          className="fta-context-menu-item"
+          onClick={() => doAddStandaloneNode('intermediate')}
+        >
+          <span className="fta-ctx-icon">◼</span>
+          新建中间事件
+        </button>
+        <button
+          className="fta-context-menu-item"
+          onClick={() => doAddStandaloneNode('basic')}
+        >
+          <span className="fta-ctx-icon">●</span>
+          新建基本事件
         </button>
       </div>
     )
@@ -686,7 +790,7 @@ function FaultTreePage() {
               setTheme((t) => (t === 'light' ? 'dark' : 'light'))
             }
           >
-            {theme === 'light' ? '切换到夜间模式' : '切换到日间模式'}
+            {theme === 'light' ? '夜间' : '日间'}
           </button>
           <button
             type="button"
@@ -778,6 +882,9 @@ function FaultTreePage() {
               onRename={(newName) => doRename(selectedNode.id, newName)}
               onChangeType={(newType) => doChangeType(selectedNode.id, newType)}
               onDelete={() => doDelete(selectedNode.id)}
+            onChangeDescription={(newDesc) =>
+              doChangeDescription(selectedNode.id, newDesc)
+            }
             />
           )}
         </section>
@@ -793,6 +900,7 @@ function FaultTreePage() {
 
       {renderContextMenu()}
       {renderEdgeMenu()}
+      {renderPaneMenu()}
       {renderModal()}
       {exportModalOpen && (
         <ExportImageModal
@@ -818,16 +926,21 @@ function NodeInfoPanel({
   onRename,
   onChangeType,
   onDelete,
+  onChangeDescription,
 }) {
   const [editingName, setEditingName] = useState(false)
   const [nameValue, setNameValue] = useState(selectedNode.data.label)
   const isGate = selectedNode.data.type === 'gate'
   const isTop = selectedNode.data.type === 'top'
+  const [descValue, setDescValue] = useState(
+    selectedMeta?.event?.description || '',
+  )
 
   useEffect(() => {
     setNameValue(selectedNode.data.label)
     setEditingName(false)
-  }, [selectedNode.id, selectedNode.data.label])
+    setDescValue(selectedMeta?.event?.description || '')
+  }, [selectedNode.id, selectedNode.data.label, selectedMeta?.event?.description])
 
   return (
     <div className="fta-node-panel">
@@ -909,7 +1022,16 @@ function NodeInfoPanel({
         <div className="fta-node-panel-body">
           <InfoRow label="事件编号" value={selectedMeta.event.id} />
           <InfoRow label="事件名称" value={selectedMeta.event.name} />
-          <InfoRow label="描述" value={selectedMeta.event.description} />
+          <div className="fta-node-panel-row">
+            <span className="fta-node-panel-label">描述</span>
+            <textarea
+              className="fta-node-panel-value"
+              style={{ width: '100%', minHeight: '4.5em', resize: 'vertical' }}
+              value={descValue}
+              onChange={(e) => setDescValue(e.target.value)}
+              onBlur={() => onChangeDescription(descValue)}
+            />
+          </div>
           <InfoRow label="错误等级" value={selectedMeta.event.errorLevel} />
           <InfoRow
             label="概率"

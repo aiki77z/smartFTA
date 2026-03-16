@@ -127,12 +127,6 @@ function buildLayout(nodes, edges) {
     }
   })
 
-  const allSources = new Set(edges.map((e) => e.source))
-  const root =
-    nodes.find((n) => n.type === 'top') ||
-    nodes.find((n) => !allSources.has(n.id)) ||
-    nodes[0]
-
   // 基础水平间距：略大于节点宽度，避免节点边缘轻微重叠
   const H_GAP = 160
   const nodeMap = new Map(nodes.map((n) => [n.id, n]))
@@ -154,7 +148,31 @@ function buildLayout(nodes, edges) {
     widthOf.set(id, Math.max(H_GAP, w))
     return widthOf.get(id)
   }
-  getWidth(root.id)
+
+  // 预先为所有节点计算子树宽度
+  nodes.forEach((n) => {
+    getWidth(n.id)
+  })
+
+  const allSources = new Set(edges.map((e) => e.source))
+
+  // 根节点选择策略：
+  // 1）若存在多个顶事件，优先选“子树宽度最大”的顶事件（通常是主故障树）
+  // 2）否则，选没有父节点的事件
+  // 3）再否则，退回第一个节点
+  const topNodes = nodes.filter((n) => n.type === 'top')
+  let root
+  if (topNodes.length > 0) {
+    root = topNodes.reduce((best, n) => {
+      const bw = widthOf.get(best.id) || H_GAP
+      const nw = widthOf.get(n.id) || H_GAP
+      return nw > bw ? n : best
+    }, topNodes[0])
+  } else {
+    root =
+      nodes.find((n) => !allSources.has(n.id)) ||
+      nodes[0]
+  }
 
   const centerMap = new Map()
   function layout(id, yOffset, left) {
@@ -174,12 +192,49 @@ function buildLayout(nodes, edges) {
   const rootW = widthOf.get(root.id) || H_GAP
   layout(root.id, 0, -rootW / 2)
 
-  nodes.forEach((n) => {
-    if (!centerMap.has(n.id)) {
-      const pos = n.position || { x: 0, y: 0 }
-      centerMap.set(n.id, { cx: pos.x, cy: pos.y })
+  // 对于未从根可达的节点（多个连通分量、孤立节点），
+  // 在主树下方按“类型分行、同类型横向排布”的方式尽量分散：
+  // 顶事件一排、中间事件一排、基本事件一排。
+  const placedIds = new Set(centerMap.keys())
+  if (placedIds.size < nodes.length) {
+    let maxCy = 0
+    centerMap.forEach((c) => {
+      if (c.cy > maxCy) maxCy = c.cy
+    })
+
+    const rows = {
+      top: [],
+      intermediate: [],
+      basic: [],
+      other: [],
     }
-  })
+
+    nodes.forEach((n) => {
+      if (centerMap.has(n.id)) return
+      if (n.type === 'top') rows.top.push(n)
+      else if (n.type === 'intermediate') rows.intermediate.push(n)
+      else if (n.type === 'basic') rows.basic.push(n)
+      else rows.other.push(n)
+    })
+
+    const rowOrder = ['top', 'intermediate', 'basic', 'other']
+    const rowGapY = 140
+    const colGapX = 200
+
+    let rowIndex = 0
+    rowOrder.forEach((key) => {
+      const list = rows[key]
+      if (!list.length) return
+      const cy = maxCy + 200 + rowIndex * rowGapY
+      const totalWidth = (list.length - 1) * colGapX
+      const startX = -totalWidth / 2
+      list.forEach((n, idx) => {
+        const cx = startX + idx * colGapX
+        centerMap.set(n.id, { cx, cy })
+      })
+      rowIndex += 1
+    })
+  }
 
   // 简单的防遮挡：同一层(y)上若多个节点计算到几乎相同的 cx，则做轻微水平错位
   const usedSlotsByRow = new Map()
@@ -375,7 +430,7 @@ function CanvasInner({
     if (!el) return null
 
     // 按当前画布主题使用相同背景色，其他样式与画布保持一致
-    const bg = theme === 'dark' ? '#696969' : '#F8F0F2'
+    const bg = theme === 'dark' ? '#4D4D4D' : '#F8F0F2'
 
     return toPng(el, {
       backgroundColor: bg,

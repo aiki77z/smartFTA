@@ -3,6 +3,11 @@ from typing import Any, Dict, List, Set
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import logging
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class GraphNode(BaseModel):
@@ -134,19 +139,33 @@ def validate_fault_tree(payload: ValidateRequest) -> Dict[str, Any]:
         count += 1
     event_children_count[parent_id] = count
 
+  # 基于父子关系计算“该父节点是否有 gate 子节点”
   has_gate_for_event: Set[str] = set()
-  for node in graph.nodes:
-    if (node.type or '').lower() == 'gate':
-      for e in graph.edges:
-        if e.source == node.id:
-          has_gate_for_event.add(e.target)
-          break
+  for parent_id, child_ids in children_map.items():
+    for cid in child_ids:
+      node = nodes_by_id.get(cid)
+      if node and (node.type or '').lower() == 'gate':
+        has_gate_for_event.add(parent_id)
+        break
 
   for nid, node in nodes_by_id.items():
     node_type = (node.type or '').lower()
     child_ids = children_map.get(nid, [])
     event_child_count = event_children_count.get(nid, 0)
+    # has_gate：当前图结构下，该事件是否拥有 gate 子节点
     has_gate = nid in has_gate_for_event
+
+    # 调试输出：关注所有作为“事件父节点”的非 basic / 非 gate 节点
+    if node_type not in {'basic', 'gate'}:
+      logger.info(
+        "PARENT DEBUG id=%s label=%s type=%s children=%s event_child_count=%s has_gate=%s",
+        nid,
+        getattr(node, "label", None),
+        node_type,
+        child_ids,
+        event_child_count,
+        has_gate,
+      )
 
     if node_type == 'basic' and child_ids:
       issues.append(
@@ -166,6 +185,29 @@ def validate_fault_tree(payload: ValidateRequest) -> Dict[str, Any]:
           level='ERROR',
           code='INTERMEDIATE_WITHOUT_CHILDREN',
           message=f"中间事件节点 '{node.label or nid}' 没有任何子事件，这违反“叶子节点必须为基本事件”的规则。",
+          node_ids=[nid],
+        ),
+      )
+
+    # 多个子事件子节点时必须有逻辑门 → 错误
+    # 这里的“事件父节点”指所有非 basic / 非 gate 的节点（包括 top、intermediate 及其它可能的事件类型）
+    if node_type not in {'basic', 'gate'} and event_child_count >= 2 and not has_gate:
+      issues.append(
+        _issue(
+          level='ERROR',
+          code='MULTI_CHILD_NO_GATE',
+          message=f"节点 '{node.label or nid}' 有多个事件子节点，但未定义逻辑门（AND/OR），不符合故障树建模规范。",
+          node_ids=[nid, *child_ids],
+        ),
+      )
+
+    # 恰好 1 个事件子节点但没有逻辑门 → 提示缺少 gate（warning）
+    if node_type not in {'basic', 'gate'} and event_child_count == 1 and not has_gate:
+      issues.append(
+        _issue(
+          level='WARNING',
+          code='MISSING_GATE',
+          message=f"节点 '{node.label or nid}' 有子节点但未通过逻辑门（AND/OR）连接。",
           node_ids=[nid],
         ),
       )
@@ -204,30 +246,6 @@ def validate_fault_tree(payload: ValidateRequest) -> Dict[str, Any]:
             node_ids=[child_id, parent_id],
           ),
         )
-
-    # 多个子事件子节点时必须有逻辑门（依据真实 gate 节点）→ 错误
-    if node_type in {'top', 'intermediate'} and event_child_count >= 2 and not has_gate:
-      issues.append(
-        _issue(
-          level='ERROR',
-          code='MULTI_CHILD_NO_GATE',
-          message=f"节点 '{node.label or nid}' 有多个事件子节点，但未定义逻辑门（AND/OR），不符合故障树建模规范。",
-          node_ids=[nid, *child_ids],
-        ),
-      )
-
-    # 恰好 1 个事件子节点但没有逻辑门 → 提示缺少 gate（warning）
-    if node_type in {'top', 'intermediate'} and event_child_count == 1 and not has_gate:
-      issues.append(
-        _issue(
-          level='WARNING',
-          code='MISSING_GATE',
-          message=f"节点 '{node.label or nid}' 有子节点但未通过逻辑门（AND/OR）连接。",
-          node_ids=[nid],
-        ),
-      )
-
-    # （暂不对“有逻辑门但当前没有事件子节点”单独告警，避免与可视化结构不一致造成误报）
 
   # DFS 检测环和不可达节点
   visited: Set[str] = set()
@@ -330,33 +348,27 @@ async def export_fault_tree_image(req: ExportImageRequest) -> Response:
 
     await page.goto(req.url, wait_until='networkidle')
 
-    # 根据请求主题切换前端模式（保持与当前 Web 一致）
+    # 根据请求主题强制设置前端模式（保持与当前 Web 一致），
+    # 直接修改根元素的 class，避免依赖按钮文案或默认状态。
     if req.theme in {'light', 'dark'}:
       try:
         await page.evaluate(
           """(desired) => {
             const root = document.querySelector('.fta-layout');
             if (!root) return;
-            const isDark = root.classList.contains('fta-layout--dark');
+            const cls = 'fta-layout--dark';
             const needDark = desired === 'dark';
-            if (needDark !== isDark) {
-              const buttons = Array.from(
-                document.querySelectorAll('.fta-header-actions .fta-btn.ghost'),
-              );
-              const toggleBtn = buttons.find((b) =>
-                b.textContent && (
-                  b.textContent.includes('切换到夜间模式') ||
-                  b.textContent.includes('切换到日间模式')
-                ),
-              );
-              if (toggleBtn) {
-                toggleBtn.click();
+            if (needDark) {
+              if (!root.classList.contains(cls)) {
+                root.classList.add(cls);
               }
+            } else {
+              root.classList.remove(cls);
             }
           }""",
           req.theme,
         )
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(200)
       except Exception:
         pass
 

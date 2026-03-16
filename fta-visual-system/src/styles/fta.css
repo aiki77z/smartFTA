@@ -38,7 +38,7 @@
   --fta-danger: #f97373;
   --fta-validation-bg: #020617;
   /* 夜间画布背景 */
-  --fta-canvas-bg: #696969;
+  --fta-canvas-bg: #4D4D4D;
 }
 
 .fta-layout--dark .fta-validation-panel {
@@ -494,8 +494,28 @@
 
 .fta-node-panel-value {
   text-align: right;
-  color: #1e293b;
+  color: var(--fta-text-main);
   word-break: break-all;
+  font-family: 'SourceHanSerifCN', system-ui, -apple-system, BlinkMacSystemFont,
+    'Segoe UI', sans-serif;
+}
+
+.fta-node-panel-row textarea.fta-node-panel-value {
+  text-align: left;
+  border: 1px solid var(--fta-border);
+  border-radius: 8px;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  background: #fafbfc;
+  box-sizing: border-box;
+  outline: none;
+  resize: vertical;
+}
+
+.fta-node-panel-row textarea.fta-node-panel-value:focus {
+  border-color: var(--fta-accent);
+  box-shadow: 0 0 0 2px rgba(129, 140, 248, 0.25);
 }
 
 .fta-node-panel-docs {
@@ -676,7 +696,7 @@
 
 /* 夜间主题下画布与节点配色 */
 .fta-layout--dark .fta-canvas-wrapper {
-  background: #696969;
+  background: #4D4D4D;
 }
 
 .fta-layout--dark .fta-node--top {
@@ -938,6 +958,9 @@
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.08);
   padding: 5px;
   animation: ftaMenuIn 0.15s ease;
+  /* 固定一个较短的高度，多余选项通过滚动条查看 */
+  max-height: 260px;
+  overflow-y: auto;
 }
 
 .fta-context-menu-item {
@@ -1063,6 +1086,13 @@
   font-size: 1.05rem;
   font-weight: 700;
   color: #1e293b;
+}
+
+.fta-layout--dark .fta-modal-title {
+  margin: 0 0 1rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #f9fafb;
 }
 
 .fta-modal-label {

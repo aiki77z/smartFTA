@@ -243,7 +243,22 @@ export function deleteNode(graphData, nodeId) {
 
   const node = nodes.find((n) => n.id === nodeId)
   if (!node) return graphData
-  if (node.type === 'top') return graphData
+
+  // 删除顶事件：
+  // 仅当图中还存在“其他顶事件节点”时才允许删除当前顶事件，
+  // 否则直接忽略（避免把唯一的顶事件删掉）。
+  if (node.type === 'top') {
+    const otherTopExists = nodes.some(
+      (n) => n.id !== nodeId && n.type === 'top',
+    )
+    if (!otherTopExists) return graphData
+
+    // 只移除该顶事件本身以及指向它的边，
+    // 保留其下方的逻辑门和事件子节点，使之成为悬空子树（由校验服务报错）
+    nodes = nodes.filter((n) => n.id !== nodeId)
+    edges = edges.filter((e) => e.target !== nodeId && e.source !== nodeId)
+    return autoCleanGates({ nodes, edges })
+  }
 
   // 如果是中间事件：将其子事件“提升”到父节点，保持原有故障路径
   if (node.type === 'intermediate') {
@@ -386,6 +401,24 @@ export function changeEventType(graphData, nodeId, newType) {
   return { ...graphData, nodes, edges: graphData.edges }
 }
 
+export function changeEventDescription(graphData, nodeId, newDescription) {
+  const nodes = graphData.nodes.map((n) => {
+    if (n.id !== nodeId) return n
+    if (!n.meta || !n.meta.event) return n
+    return {
+      ...n,
+      meta: {
+        ...n.meta,
+        event: {
+          ...n.meta.event,
+          description: newDescription,
+        },
+      },
+    }
+  })
+  return { ...graphData, nodes, edges: graphData.edges }
+}
+
 export function insertGate(graphData, parentId, gateType = 'OR') {
   let nodes = [...graphData.nodes]
   let edges = [...graphData.edges]
@@ -444,12 +477,6 @@ export function duplicateEventNode(graphData, nodeId) {
   const node = nodes.find((n) => n.id === nodeId)
   if (!node || node.type === 'gate') return graphData
 
-  const parentId = getParent(edges, nodeId)
-  if (!parentId) return graphData
-
-  const parentNode = nodes.find((n) => n.id === parentId)
-  if (!parentNode) return graphData
-
   const newId = generateId()
   const baseLabel = node.label || '事件'
   const copyLabel = `${baseLabel}(副本)`
@@ -469,23 +496,8 @@ export function duplicateEventNode(graphData, nodeId) {
   }
   nodes.push(newNode)
 
-  // 如果父节点下已有 gate，则直接把副本挂到该 gate 下
-  const gateChildId = getGateChild(nodes, edges, parentId)
-  if (gateChildId) {
-    if (!edges.some((e) => e.source === newId && e.target === gateChildId)) {
-      edges.push({
-        id: `${newId}-${gateChildId}`,
-        source: newId,
-        target: gateChildId,
-        relation: '',
-        meta: {},
-      })
-    }
-    return { nodes, edges }
-  }
-
-  // 无 gate 的情况：复用 addChildNode 的逻辑，让它处理插 OR 门等
-  return addChildNode({ nodes, edges }, parentId, copyLabel, node.type)
+  // 复制节点时，仅保留名称和详细信息，不复制任何父子关系或逻辑门结构
+  return { nodes, edges }
 }
 
 export function connectNodes(graphData, { sourceId, targetId }) {
@@ -740,6 +752,7 @@ export function graphToTreeDataJson(graphData, original) {
       name: n.label,
       type: STRING_TYPE_FROM_LABEL[n.type] || prev.type || 'basic_event',
       gate: gateLabel,
+      description: n.meta?.event?.description ?? prev.description,
       children,
     }
   })

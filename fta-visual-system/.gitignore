@@ -27,3 +27,6 @@ dist-ssr
 venv/
 .venv/
 env/
+
+# validator-service
+__pycache__/*

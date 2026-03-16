@@ -9,6 +9,12 @@
   --fta-danger: #f97373;
   --fta-validation-bg: #020617;
   /* 夜间画布背景 */
-  --fta-canvas-bg: #696969;
+  --fta-canvas-bg: #4D4D4D;
 }
 
+.fta-layout--dark .fta-modal-title {
+  margin: 0 0 1rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #f9fafb;
+}
