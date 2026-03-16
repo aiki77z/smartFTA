@@ -17,7 +17,7 @@ import { toPng } from 'html-to-image'
 import 'reactflow/dist/style.css'
 
 const EVENT_NODE_W = 140
-const GATE_NODE_W = 60
+const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '基本事件' }
 
 function formatBasicLabel(text) {
   if (!text) return [text]
@@ -29,16 +29,15 @@ function formatBasicLabel(text) {
   return chunks
 }
 
-/* ────────────────────────────────────────────
-   Custom Node: Event (top / intermediate / basic)
-   ──────────────────────────────────────────── */
 function EventNode({ data }) {
   const cls = `fta-node fta-node--${data.type || 'event'}`
   const isBasic = data.type === 'basic'
+  const typeTag = TYPE_LABELS[data.type] || ''
   return (
     <div className="fta-node-container">
       <Handle type="target" position={Position.Top} className="fta-handle" />
       <div className={cls}>
+        {typeTag && <div className="fta-node__type-tag">{typeTag}</div>}
         <div className="fta-node__label">
           {isBasic
             ? formatBasicLabel(data.label).map((chunk, i, arr) => (
@@ -55,10 +54,6 @@ function EventNode({ data }) {
   )
 }
 
-/* ────────────────────────────────────────────
-   Custom Node: Gate (AND / OR) with inline SVG
-   Inline styles ensure html-to-image export works
-   ──────────────────────────────────────────── */
 function GateNode({ data }) {
   const isAnd = data.label === 'AND'
   const shapeStyle = {
@@ -102,13 +97,6 @@ function GateNode({ data }) {
 const nodeTypes = {
   eventNode: EventNode,
   gateNode: GateNode,
-}
-
-/* ────────────────────────────────────────────
-   Layout
-   ──────────────────────────────────────────── */
-function stripGatePrefix(label) {
-  return label.replace(/^\[(AND|OR)\]\s*/, '')
 }
 
 function buildLayout(nodes, edges) {
@@ -181,7 +169,7 @@ function buildLayout(nodes, edges) {
     return {
       id: n.id,
       data: {
-        label: stripGatePrefix(n.label),
+        label: n.label,
         type: n.type,
         meta: n.meta,
       },
@@ -209,9 +197,6 @@ function buildLayout(nodes, edges) {
   return { rfNodes, rfEdges }
 }
 
-/* ────────────────────────────────────────────
-   Fit-view button
-   ──────────────────────────────────────────── */
 function FitViewButton({ resetLayout }) {
   const { fitView } = useReactFlow()
   return (
@@ -232,9 +217,6 @@ function FitViewButton({ resetLayout }) {
   )
 }
 
-/* ────────────────────────────────────────────
-   Legend panel
-   ──────────────────────────────────────────── */
 function LegendPanel() {
   const [open, setOpen] = useState(false)
   return (
@@ -288,23 +270,29 @@ function LegendPanel() {
   )
 }
 
-/* ────────────────────────────────────────────
-   Inner canvas
-   ──────────────────────────────────────────── */
-function CanvasInner({ graphData, onNodeSelect, showChrome = true, canvasActionsRef }) {
+function CanvasInner({
+  graphData,
+  onNodeSelect,
+  onNodeContextMenu,
+  onPaneContextMenu,
+  onNodeDoubleClick,
+  showChrome = true,
+  canvasActionsRef,
+}) {
   const init = useMemo(
     () => buildLayout(graphData.nodes || [], graphData.edges || []),
-    [graphData.nodes, graphData.edges],
+    [graphData],
   )
 
   const [nodes, setNodes] = useState(init.rfNodes)
   const [edges, setEdges] = useState(init.rfEdges)
-  const { getNodes } = useReactFlow()
+  const { getNodes, fitView } = useReactFlow()
 
   useEffect(() => {
     setNodes(init.rfNodes)
     setEdges(init.rfEdges)
-  }, [init.rfNodes, init.rfEdges])
+    setTimeout(() => fitView({ padding: 0.2, duration: 300 }), 80)
+  }, [init, fitView])
 
   const exportImage = useCallback(async () => {
     const currentNodes = getNodes()
@@ -333,6 +321,29 @@ function CanvasInner({ graphData, onNodeSelect, showChrome = true, canvasActions
     canvasActionsRef.current = { exportImage }
   }
 
+  const handleNodeCtx = useCallback(
+    (event, node) => {
+      event.preventDefault()
+      onNodeContextMenu?.(event, node)
+    },
+    [onNodeContextMenu],
+  )
+
+  const handlePaneCtx = useCallback(
+    (event) => {
+      event.preventDefault()
+      onPaneContextMenu?.(event)
+    },
+    [onPaneContextMenu],
+  )
+
+  const handleDblClick = useCallback(
+    (event, node) => {
+      onNodeDoubleClick?.(event, node)
+    },
+    [onNodeDoubleClick],
+  )
+
   return (
     <ReactFlow
       nodes={nodes}
@@ -341,6 +352,9 @@ function CanvasInner({ graphData, onNodeSelect, showChrome = true, canvasActions
       onNodesChange={(ch) => setNodes((ns) => applyNodeChanges(ch, ns))}
       onEdgesChange={(ch) => setEdges((es) => applyEdgeChanges(ch, es))}
       onNodeClick={(_, node) => onNodeSelect?.(node)}
+      onNodeContextMenu={handleNodeCtx}
+      onPaneContextMenu={handlePaneCtx}
+      onNodeDoubleClick={handleDblClick}
       fitView
       fitViewOptions={{ padding: 0.2 }}
       proOptions={{ hideAttribution: true }}
@@ -349,15 +363,14 @@ function CanvasInner({ graphData, onNodeSelect, showChrome = true, canvasActions
       <Background color="#e2e8f0" gap={20} />
       {showChrome && (
         <>
-          <MiniMap
-            nodeColor={() => '#818cf8'}
-            maskColor="rgba(255,255,255,0.7)"
-          />
+          <MiniMap nodeColor={() => '#818cf8'} maskColor="rgba(255,255,255,0.7)" />
           <Controls showInteractive={false} position="top-left" />
-          <FitViewButton resetLayout={() => {
-            setNodes(init.rfNodes)
-            setEdges(init.rfEdges)
-          }} />
+          <FitViewButton
+            resetLayout={() => {
+              setNodes(init.rfNodes)
+              setEdges(init.rfEdges)
+            }}
+          />
           <LegendPanel />
         </>
       )}
@@ -365,9 +378,6 @@ function CanvasInner({ graphData, onNodeSelect, showChrome = true, canvasActions
   )
 }
 
-/* ────────────────────────────────────────────
-   Exported wrapper
-   ──────────────────────────────────────────── */
 export default function FaultTreeCanvas({ canvasActionsRef, ...props }) {
   return (
     <ReactFlowProvider>

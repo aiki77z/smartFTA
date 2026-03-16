@@ -25,8 +25,7 @@ export function parseRawFtaJson(raw) {
     const y = typeof node.y === 'number' ? node.y : 0
 
     const baseLabel = node.name || (node.event && node.event.name) || node.id
-    const label =
-      gateLabel && typeCode !== 1 ? `[${gateLabel}] ${baseLabel}` : baseLabel
+    const label = baseLabel
 
     return {
       id: String(node.id),
