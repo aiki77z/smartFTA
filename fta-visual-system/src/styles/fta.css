@@ -1,6 +1,9 @@
 @font-face {
   font-family: 'SourceHanSerifCN';
-  src: url('/font/SourceHanSerifCN-Regular-1.otf') format('opentype');
+  src:
+    url('/font/SourceHanSerifCN-Regular-1.woff2') format('woff2'),
+    url('/font/SourceHanSerifCN-Regular-1.woff') format('woff'),
+    url('/font/SourceHanSerifCN-Regular-1.otf') format('opentype');
   font-weight: normal;
   font-style: normal;
   font-display: swap;
@@ -17,6 +20,122 @@
   --fta-radius-lg: 20px;
   --fta-radius-md: 14px;
   --fta-danger: #f43f5e;
+  /* 日间主题下逻辑校验窗口底色 */
+  --fta-validation-bg: #D8D8E6;
+  /* 日间画布背景 */
+  --fta-canvas-bg: #F8F0F2;
+}
+
+/* 夜间主题覆盖：通过在根容器上添加 .fta-layout--dark 来启用 */
+.fta-layout--dark {
+  --fta-bg: #0b1120;
+  --fta-surface: #020617;
+  --fta-border: #1f2937;
+  --fta-accent: #22c55e;
+  --fta-accent-hover: #16a34a;
+  --fta-text-main: #e5e7eb;
+  --fta-text-subtle: #9ca3af;
+  --fta-danger: #f97373;
+  --fta-validation-bg: #020617;
+  /* 夜间画布背景 */
+  --fta-canvas-bg: #696969;
+}
+
+.fta-layout--dark .fta-validation-panel {
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-validation-title {
+  color: #f9fafb;
+}
+
+.fta-layout--dark .fta-validation-toggle {
+  color: #d1d5db;
+}
+
+.fta-layout--dark .fta-validation-badge {
+  background: rgba(31, 41, 55, 0.6);
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-validation-badge.error {
+  background: rgba(248, 113, 113, 0.3);
+  color: #fee2e2;
+}
+
+.fta-layout--dark .fta-validation-badge.info {
+  background: rgba(59, 130, 246, 0.25);
+  color: #dbeafe;
+}
+
+.fta-layout--dark .fta-validation-badge.success {
+  background: rgba(34, 197, 94, 0.25);
+  color: #bbf7d0;
+}
+
+.fta-layout--dark .fta-validation-error {
+  color: #fecaca;
+}
+
+.fta-layout--dark .fta-validation-empty {
+  color: #9ca3af;
+}
+
+.fta-layout--dark .fta-validation-item {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.fta-layout--dark .fta-validation-nodes {
+  color: #d1d5db;
+}
+
+/* 夜间主题下按钮配色调整 */
+.fta-layout--dark .fta-btn.ghost {
+  background: #020617;
+  border-color: #1f2937;
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-btn.ghost:not(:disabled):hover {
+  background: #111827;
+  border-color: #374151;
+}
+
+.fta-layout--dark .fta-btn.primary {
+  background: #CC436F;
+  border-color: #9C3354;
+  color: #f9fafb;
+}
+
+.fta-layout--dark .fta-btn.primary:disabled {
+  background: #9C3354;
+  border-color: #9C3354;
+  color: #f9fafb;
+} 
+
+.fta-layout--dark .fta-btn.full {
+  background: #9C3354;
+  border-color: #9C3354;
+  color: #f9fafb;
+}
+
+.fta-layout--dark .fta-btn.full:not(:disabled):hover {
+  background: #cc6b8a;
+  border-color: #9C3354;
+  color: #f9fafb;
+}
+
+.fta-layout--dark .fta-btn.primary:not(:disabled):hover {
+  background: #cc6b8a;
+  border-color: #9C3354;
+}
+
+.fta-layout--dark .fta-title {
+  color: #f9fafb;
+}
+
+.fta-layout--dark .fta-section-title {
+  color: #cc4872;
 }
 
 .fta-layout {
@@ -152,6 +271,17 @@
   box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.2);
 }
 
+.fta-layout--dark .fta-json-input {
+  background: #020617;
+  border-color: #1f2937;
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-json-input:focus {
+  border-color: #cc4872;
+  box-shadow: 0 0 0 3px rgba(198, 72, 114, 0.2);
+}
+
 /* ── Buttons ── */
 
 .fta-btn {
@@ -282,7 +412,7 @@
   border-radius: var(--fta-radius-md);
   border: 1px solid var(--fta-border);
   overflow: hidden;
-  background: #F8F0F2;
+  background: var(--fta-canvas-bg);
   box-shadow: inset 0 1px 4px rgba(148, 163, 184, 0.1);
 }
 
@@ -544,6 +674,56 @@
   font-size: 16px;
 }
 
+/* 夜间主题下画布与节点配色 */
+.fta-layout--dark .fta-canvas-wrapper {
+  background: #696969;
+}
+
+.fta-layout--dark .fta-node--top {
+  background: #3E588A;
+  border-color: #6C9AF0;
+  color: #93C6FF;
+}
+
+.fta-layout--dark .fta-node--intermediate {
+  background: #A8526B;
+  border-color: #ED98B4;
+  color: #FFDBEC;
+}
+
+.fta-layout--dark .fta-node--basic {
+  background: #1D3827;
+  border-color: #4ade80;
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-node__type-tag {
+  color: #020617;
+}
+
+/* 夜间主题下 type tag 与节点边框颜色保持一致 */
+.fta-layout--dark .fta-node--top .fta-node__type-tag {
+  background: #6C9AF0;
+}
+
+.fta-layout--dark .fta-node--intermediate .fta-node__type-tag {
+  background: #ED98B4;
+}
+
+.fta-layout--dark .fta-node--basic .fta-node__type-tag {
+  background: #4ade80;
+}
+
+/* 夜间主题下逻辑门配色（覆盖 svg 内联样式） */
+.fta-layout--dark .fta-gate svg path {
+  fill: #111827 !important;
+  stroke: #6C9AF0 !important;
+}
+
+.fta-layout--dark .fta-gate svg text {
+  fill: #E5E7EB !important;
+}
+
 .fta-node__label {
   line-height: 1.3;
   word-break: break-all;
@@ -706,6 +886,44 @@
   border-radius: 50%;
   background: #DEFACD;
   border: 2px solid #8dc08a;
+}
+
+/* 夜间主题下图例与节点配色保持一致 */
+.fta-layout--dark .fta-legend {
+  background: #020617;
+  border-color: #1f2937;
+}
+
+.fta-layout--dark .fta-legend-title {
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-legend-item {
+  color: #d1d5db;
+}
+
+.fta-layout--dark .fta-legend-icon--top {
+  background: #3E588A;
+  border-color: #6C9AF0;
+}
+
+.fta-layout--dark .fta-legend-icon--intermediate {
+  background: #A8526B;
+  border-color: #ED98B4;
+}
+
+.fta-layout--dark .fta-legend-icon--basic {
+  background: #1D3827;
+  border-color: #4ade80;
+}
+
+.fta-layout--dark .fta-legend svg path {
+  fill: #111827 !important;
+  stroke: #6C9AF0 !important;
+}
+
+.fta-layout--dark .fta-legend svg text {
+  fill: #E5E7EB !important;
 }
 
 /* ── Context Menu ── */
@@ -951,4 +1169,139 @@
     max-height: none;
     margin-top: 0.5rem;
   }
+}
+
+/* ── Validation Panel ── */
+
+.fta-validation-panel {
+  position: fixed;
+  left: 1.5rem;
+  bottom: 1.5rem;
+  width: 320px;
+  max-height: 40vh;
+  background: var(--fta-validation-bg);
+  color: #1f2933;
+  border-radius: 0.75rem;
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+  overflow: hidden;
+  z-index: 50;
+}
+
+.fta-validation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.55rem 0.9rem;
+  cursor: pointer;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.06);
+  background: var(--fta-validation-bg);
+}
+
+.fta-validation-title {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.fta-validation-badge {
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.06);
+  font-size: 10px;
+}
+
+.fta-validation-badge.error {
+  background: rgba(248, 113, 113, 0.2);
+  color: #991b1b;
+}
+
+.fta-validation-badge.info {
+  background: rgba(59, 130, 246, 0.18);
+  color: #1d4ed8;
+}
+
+.fta-validation-badge.success {
+  background: rgba(34, 197, 94, 0.2);
+  color: #166534;
+}
+
+.fta-validation-toggle {
+  border: none;
+  background: transparent;
+  color: #4b5563;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.fta-validation-body {
+  max-height: calc(40vh - 2.2rem);
+  overflow: auto;
+  padding: 0.5rem 0.8rem 0.7rem;
+}
+
+.fta-validation-error {
+  color: #991b1b;
+  margin-bottom: 0.4rem;
+}
+
+.fta-validation-empty {
+  color: #6b7280;
+}
+
+.fta-validation-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.fta-validation-item {
+  padding: 0.4rem 0.5rem;
+  border-radius: 0.5rem;
+  background: rgba(15, 23, 42, 0.02);
+}
+
+.fta-validation-item--error {
+  border-left: 2px solid #f97373;
+}
+
+.fta-validation-item--warning {
+  border-left: 2px solid #facc15;
+}
+
+.fta-validation-item--info {
+  border-left: 2px solid #3b82f6;
+}
+
+.fta-validation-item-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.2rem;
+}
+
+.fta-validation-level {
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.fta-validation-code {
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.fta-validation-message {
+  font-size: 11px;
+  line-height: 1.4;
+  margin-bottom: 0.15rem;
+}
+
+.fta-validation-nodes {
+  font-size: 10px;
+  color: #4b5563;
 }

@@ -1,5 +1,10 @@
 const TYPE_TO_CODE = { top: '1', intermediate: '2', basic: '3' }
 const GATE_TO_CODE = { AND: '1', OR: '2' }
+const STRING_TYPE_FROM_LABEL = {
+  top: 'top_event',
+  intermediate: 'intermediate_event',
+  basic: 'basic_event',
+}
 
 function generateId() {
   return `node-${Date.now().toString(36)}${Math.random().toString(36).substr(2, 9)}`
@@ -38,23 +43,12 @@ function autoCleanGates(graphData) {
     for (const gate of gateNodes) {
       const children = getChildren(edges, gate.id)
       const parentId = getParent(edges, gate.id)
-      if (children.length <= 1) {
-        if (children.length === 1 && parentId) {
-          edges = edges.filter(
-            (e) => e.source !== gate.id && e.target !== gate.id,
-          )
-          edges.push({
-            id: `${children[0]}-${parentId}`,
-            source: children[0],
-            target: parentId,
-            relation: '',
-            meta: {},
-          })
-        } else {
-          edges = edges.filter(
-            (e) => e.source !== gate.id && e.target !== gate.id,
-          )
-        }
+      // 当 gate 不再有任何子节点时再清理掉该 gate；
+      // 若仍有 1 个子节点，则保留 gate，避免用户删除一个子事件后逻辑门被自动移除。
+      if (children.length === 0) {
+        edges = edges.filter(
+          (e) => e.source !== gate.id && e.target !== gate.id,
+        )
         nodes = nodes.filter((n) => n.id !== gate.id)
         changed = true
         break
@@ -117,10 +111,34 @@ export function addChildNode(
   const gateChildId = getGateChild(nodes, edges, parentId)
 
   if (gateChildId) {
+    // 结构：子事件们 -> gateChildId -> parentId
+    // 现在语义改为“在其下添加子节点”：在 parent 与 gate 之间插入新事件：
+    // 子事件们 -> gateChildId -> newNode -> parentId
+
+    // 强制新节点为中间事件，以避免“非叶基本事件”
+    nodes = nodes.map((n) =>
+      n.id === newId
+        ? {
+            ...n,
+            type: 'intermediate',
+            meta: { ...n.meta, rawType: TYPE_TO_CODE.intermediate },
+          }
+        : n,
+    )
+
+    // 修改 gate -> parent 的边为 gate -> newNode
+    const gateParentEdge = edges.find(
+      (e) => e.source === gateChildId && e.target === parentId,
+    )
+    if (gateParentEdge) {
+      gateParentEdge.target = newId
+    }
+
+    // 新事件再指向原父节点
     edges.push({
-      id: `${newId}-${gateChildId}`,
+      id: `${newId}-${parentId}`,
       source: newId,
-      target: gateChildId,
+      target: parentId,
       relation: '',
       meta: {},
     })
@@ -179,6 +197,46 @@ export function addChildNode(
   return autoCleanGates({ nodes, edges })
 }
 
+export function addChildUnderGate(
+  graphData,
+  gateId,
+  eventName,
+  eventType = 'basic',
+) {
+  let nodes = [...graphData.nodes]
+  let edges = [...graphData.edges]
+
+  const gate = nodes.find((n) => n.id === gateId)
+  if (!gate || gate.type !== 'gate') return graphData
+
+  const newId = generateId()
+  const newNode = {
+    id: newId,
+    label: eventName,
+    type: eventType,
+    position: { x: 0, y: 0 },
+    gate: '',
+    meta: {
+      rawType: TYPE_TO_CODE[eventType] || TYPE_TO_CODE.basic,
+      gateCode: '',
+      gateLabel: '',
+      event: makeDefaultEvent(eventName),
+      transfer: '',
+    },
+  }
+  nodes.push(newNode)
+
+  edges.push({
+    id: `${newId}-${gateId}`,
+    source: newId,
+    target: gateId,
+    relation: '',
+    meta: {},
+  })
+
+  return { nodes, edges }
+}
+
 export function deleteNode(graphData, nodeId) {
   let nodes = [...graphData.nodes]
   let edges = [...graphData.edges]
@@ -186,6 +244,57 @@ export function deleteNode(graphData, nodeId) {
   const node = nodes.find((n) => n.id === nodeId)
   if (!node) return graphData
   if (node.type === 'top') return graphData
+
+  // 如果是中间事件：将其子事件“提升”到父节点，保持原有故障路径
+  if (node.type === 'intermediate') {
+    const parentId = getParent(edges, nodeId)
+    if (parentId) {
+      // 找到挂在该中间事件下面的逻辑门（如果有）
+      const gateChildId = getGateChild(nodes, edges, nodeId)
+
+      if (gateChildId) {
+        // 结构：children -> gateChildId -> nodeId -> parentId
+        // 期望：children -> gateChildId -> parentId
+
+        // 1）将 gate -> node 的边改为 gate -> parent
+        edges = edges.map((e) =>
+          e.source === gateChildId && e.target === nodeId
+            ? { ...e, target: parentId }
+            : e,
+        )
+
+        // 2）删除与该中间事件相关的其他边
+        edges = edges.filter((e) => e.source !== nodeId && e.target !== nodeId)
+
+        // 3）删除该中间事件节点本身，但保留 gate 节点和其与子事件的连接
+        nodes = nodes.filter((n) => n.id !== nodeId)
+
+        return autoCleanGates({ nodes, edges })
+      } else {
+        // 无 gate：直接将子事件挂到父节点
+        const childEventIds = getChildren(edges, nodeId).filter((cid) => {
+          const cn = nodes.find((n) => n.id === cid)
+          return cn && cn.type !== 'gate'
+        })
+
+        edges = edges.filter((e) => e.source !== nodeId && e.target !== nodeId)
+        nodes = nodes.filter((n) => n.id !== nodeId)
+
+        for (const childId of childEventIds) {
+          edges.push({
+            id: `${childId}-${parentId}`,
+            source: childId,
+            target: parentId,
+            relation: '',
+            meta: {},
+          })
+        }
+
+        return autoCleanGates({ nodes, edges })
+      }
+    }
+    // 如果没有父节点（例如异常结构），则退回到原有“整棵删除”逻辑
+  }
 
   function getDescendants(nId) {
     const visited = new Set()
@@ -288,8 +397,8 @@ export function insertGate(graphData, parentId, gateType = 'OR') {
       const node = nodes.find((n) => n.id === id)
       return node && node.type !== 'gate'
     })
-
-  if (directChildren.length < 2) return graphData
+  // 没有直接事件子节点时无法插入逻辑门
+  if (directChildren.length === 0) return graphData
 
   const gateId = generateId() + '-gate'
   nodes.push({
@@ -300,10 +409,12 @@ export function insertGate(graphData, parentId, gateType = 'OR') {
     meta: { forNodeId: parentId, gateLabel: gateType },
   })
 
+  // 删除 parent 与这些直接子节点之间的原始边
   edges = edges.filter(
     (e) => !(e.target === parentId && directChildren.includes(e.source)),
   )
 
+  // 将这些事件子节点连到 gate
   for (const childId of directChildren) {
     edges.push({
       id: `${childId}-${gateId}`,
@@ -314,6 +425,7 @@ export function insertGate(graphData, parentId, gateType = 'OR') {
     })
   }
 
+  // gate 再连回 parent
   edges.push({
     id: `${gateId}-${parentId}`,
     source: gateId,
@@ -322,6 +434,175 @@ export function insertGate(graphData, parentId, gateType = 'OR') {
     meta: { gateFor: parentId },
   })
 
+  return { nodes, edges }
+}
+
+export function duplicateEventNode(graphData, nodeId) {
+  let nodes = [...graphData.nodes]
+  let edges = [...graphData.edges]
+
+  const node = nodes.find((n) => n.id === nodeId)
+  if (!node || node.type === 'gate') return graphData
+
+  const parentId = getParent(edges, nodeId)
+  if (!parentId) return graphData
+
+  const parentNode = nodes.find((n) => n.id === parentId)
+  if (!parentNode) return graphData
+
+  const newId = generateId()
+  const baseLabel = node.label || '事件'
+  const copyLabel = `${baseLabel}(副本)`
+
+  const newNode = {
+    ...node,
+    id: newId,
+    label: copyLabel,
+    position: { x: (node.position?.x || 0) + 40, y: (node.position?.y || 0) + 40 },
+    meta: node.meta
+      ? {
+          ...node.meta,
+          event: node.meta.event ? { ...node.meta.event, id: newId, name: copyLabel } : undefined,
+          raw: undefined,
+        }
+      : undefined,
+  }
+  nodes.push(newNode)
+
+  // 如果父节点下已有 gate，则直接把副本挂到该 gate 下
+  const gateChildId = getGateChild(nodes, edges, parentId)
+  if (gateChildId) {
+    if (!edges.some((e) => e.source === newId && e.target === gateChildId)) {
+      edges.push({
+        id: `${newId}-${gateChildId}`,
+        source: newId,
+        target: gateChildId,
+        relation: '',
+        meta: {},
+      })
+    }
+    return { nodes, edges }
+  }
+
+  // 无 gate 的情况：复用 addChildNode 的逻辑，让它处理插 OR 门等
+  return addChildNode({ nodes, edges }, parentId, copyLabel, node.type)
+}
+
+export function connectNodes(graphData, { sourceId, targetId }) {
+  let nodes = [...graphData.nodes]
+  let edges = [...graphData.edges]
+
+  const sourceNode = nodes.find((n) => n.id === sourceId)
+  const targetNode = nodes.find((n) => n.id === targetId)
+  if (!sourceNode || !targetNode) return graphData
+  // 不允许把逻辑门作为“子节点”，但允许把事件挂到逻辑门下面
+  if (sourceNode.type === 'gate') return graphData
+
+  const childId = sourceId
+  const parentId = targetId
+
+  // 避免自环
+  if (childId === parentId) return graphData
+
+  // 避免重复边
+  if (edges.some((e) => e.source === childId && e.target === parentId)) {
+    return graphData
+  }
+
+  // 目标是逻辑门：直接挂到该门下面
+  if (targetNode.type === 'gate') {
+    edges.push({
+      id: `${childId}-${parentId}`,
+      source: childId,
+      target: parentId,
+      relation: '',
+      meta: {},
+    })
+    return { nodes, edges }
+  }
+
+  // 若父是 basic，则先升级为 intermediate
+  if (targetNode.type === 'basic') {
+    nodes = nodes.map((n) =>
+      n.id === parentId
+        ? { ...n, type: 'intermediate', meta: { ...n.meta, rawType: TYPE_TO_CODE.intermediate } }
+        : n,
+    )
+  }
+
+  const gateChildId = getGateChild(nodes, edges, parentId)
+  if (gateChildId) {
+    // 父下已有 gate：直接把 child 挂到 gate 下
+    edges.push({
+      id: `${childId}-${gateChildId}`,
+      source: childId,
+      target: gateChildId,
+      relation: '',
+      meta: {},
+    })
+    return { nodes, edges }
+  }
+
+  const currentChildren = getChildren(edges, parentId)
+  if (currentChildren.length === 0) {
+    // 父目前没有子节点，直接挂上去
+    edges.push({
+      id: `${childId}-${parentId}`,
+      source: childId,
+      target: parentId,
+      relation: '',
+      meta: {},
+    })
+    return { nodes, edges }
+  }
+
+  // 父已有子节点但还没有 gate：需要插入 OR 门，再把所有子节点挂到门下
+  const gateId = generateId() + '-gate'
+  const gateNode = {
+    id: gateId,
+    label: 'OR',
+    type: 'gate',
+    position: { x: 0, y: 0 },
+    meta: { forNodeId: parentId, gateLabel: 'OR' },
+  }
+  nodes.push(gateNode)
+
+  const childEdges = edges.filter((e) => e.target === parentId)
+  edges = edges.filter((e) => e.target !== parentId)
+
+  for (const ce of childEdges) {
+    edges.push({
+      id: `${ce.source}-${gateId}`,
+      source: ce.source,
+      target: gateId,
+      relation: '',
+      meta: {},
+    })
+  }
+
+  // 新连接的 child 也挂到 gate 下
+  edges.push({
+    id: `${childId}-${gateId}`,
+    source: childId,
+    target: gateId,
+    relation: '',
+    meta: {},
+  })
+
+  edges.push({
+    id: `${gateId}-${parentId}`,
+    source: gateId,
+    target: parentId,
+    relation: 'OR',
+    meta: { gateFor: parentId },
+  })
+
+  return { nodes, edges }
+}
+
+export function deleteEdgeById(graphData, edgeId) {
+  const nodes = [...graphData.nodes]
+  const edges = graphData.edges.filter((e) => e.id !== edgeId)
   return { nodes, edges }
 }
 
@@ -411,6 +692,67 @@ export function graphToRawJson(graphData, attr) {
   }
 }
 
+export function graphToTreeDataJson(graphData, original) {
+  const { nodes, edges } = graphData
+  const eventNodes = nodes.filter((n) => n.type !== 'gate')
+
+  const nodesById = new Map(nodes.map((n) => [n.id, n]))
+
+  const gateForEvent = new Map()
+  const gateByParent = new Map()
+  const gateNodes = nodes.filter((n) => n.type === 'gate')
+  for (const gate of gateNodes) {
+    const parentEdge = edges.find((e) => e.source === gate.id)
+    if (parentEdge) {
+      gateForEvent.set(parentEdge.target, gate.label)
+      gateByParent.set(parentEdge.target, gate)
+    }
+  }
+
+  const originalTreeData = original?.tree_data || {}
+  const originalNodes = originalTreeData.nodes || {}
+  const newNodes = {}
+
+  eventNodes.forEach((n) => {
+    const prev = originalNodes[n.id] || {}
+    const gateLabel = gateForEvent.has(n.id) ? gateForEvent.get(n.id) : null
+     let children = []
+
+    const gateNode = gateByParent.get(n.id)
+    if (gateNode) {
+      // 通过逻辑门连接的子节点：gate 的事件子节点
+      children = edges
+        .filter((e) => e.target === gateNode.id)
+        .map((e) => nodesById.get(e.source))
+        .filter((cn) => cn && cn.type !== 'gate')
+        .map((cn) => cn.id)
+    } else {
+      // 直接连接的事件子节点
+      children = edges
+        .filter((e) => e.target === n.id)
+        .map((e) => nodesById.get(e.source))
+        .filter((cn) => cn && cn.type !== 'gate')
+        .map((cn) => cn.id)
+    }
+    newNodes[n.id] = {
+      ...prev,
+      id: n.id,
+      name: n.label,
+      type: STRING_TYPE_FROM_LABEL[n.type] || prev.type || 'basic_event',
+      gate: gateLabel,
+      children,
+    }
+  })
+
+  return {
+    ...(original || {}),
+    tree_data: {
+      ...originalTreeData,
+      nodes: newNodes,
+    },
+  }
+}
+
 export function getNodeEditInfo(graphData, nodeId) {
   const { nodes, edges } = graphData
   const node = nodes.find((n) => n.id === nodeId)
@@ -424,9 +766,10 @@ export function getNodeEditInfo(graphData, nodeId) {
   const directEventChildren = isGate
     ? []
     : getDirectEventChildren(nodes, edges, nodeId)
-  const hasDirectChildren = directEventChildren.length >= 2
+  const hasDirectChildren = directEventChildren.length >= 1
   const isTop = node.type === 'top'
   const childCount = getChildren(edges, nodeId).length
+  const parentId = getParent(edges, nodeId)
 
   return {
     node,
@@ -435,5 +778,78 @@ export function getNodeEditInfo(graphData, nodeId) {
     hasDirectChildren,
     isTop,
     childCount,
+    parentId,
   }
+}
+
+export function insertParentEvent(
+  graphData,
+  childId,
+  eventName = '新中间事件',
+  eventType = 'intermediate',
+) {
+  let nodes = [...graphData.nodes]
+  let edges = [...graphData.edges]
+
+  const childNode = nodes.find((n) => n.id === childId)
+  if (!childNode) return graphData
+
+  const directParentId = getParent(edges, childId)
+  if (!directParentId) return graphData
+
+  const directParentNode = nodes.find((n) => n.id === directParentId)
+  if (!directParentNode) return graphData
+
+  const newId = generateId()
+  const newNode = {
+    id: newId,
+    label: eventName,
+    type: eventType,
+    position: { x: 0, y: 0 },
+    gate: '',
+    meta: {
+      rawType: TYPE_TO_CODE[eventType] || TYPE_TO_CODE.intermediate,
+      gateCode: '',
+      gateLabel: '',
+      event: makeDefaultEvent(eventName),
+      transfer: '',
+    },
+  }
+  nodes.push(newNode)
+
+  if (directParentNode.type === 'gate') {
+    // 结构为：child -> gate -> (event...)
+    // 在 gate 与 child 之间插入新事件：child -> newId -> gate
+    edges = edges.map((e) =>
+      e.source === childId && e.target === directParentId
+        ? { ...e, target: newId }
+        : e,
+    )
+
+    edges.push({
+      id: `${newId}-${directParentId}`,
+      source: newId,
+      target: directParentId,
+      relation: '',
+      meta: {},
+    })
+  } else {
+    // 结构为：child -> eventParentId（无 gate）
+    // 改为：child -> newId -> eventParentId
+    edges = edges.map((e) =>
+      e.source === childId && e.target === directParentId
+        ? { ...e, target: newId }
+        : e,
+    )
+
+    edges.push({
+      id: `${newId}-${directParentId}`,
+      source: newId,
+      target: directParentId,
+      relation: '',
+      meta: {},
+    })
+  }
+
+  return { nodes, edges }
 }

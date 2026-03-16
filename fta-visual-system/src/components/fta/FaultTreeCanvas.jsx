@@ -18,6 +18,7 @@ import 'reactflow/dist/style.css'
 
 const EVENT_NODE_W = 140
 const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '基本事件' }
+const FITVIEW_PADDING = 0.15
 
 function formatBasicLabel(text) {
   if (!text) return [text]
@@ -56,17 +57,33 @@ function EventNode({ data }) {
 
 function GateNode({ data }) {
   const isAnd = data.label === 'AND'
-  const shapeStyle = {
-    fill: isAnd ? '#fffbeb' : '#faf5ff',
-    stroke: isAnd ? '#f59e0b' : '#a855f7',
-    strokeWidth: 2.5,
-  }
-  const textStyle = {
-    fill: isAnd ? '#92400e' : '#6b21a8',
-    fontSize: '15px',
-    fontWeight: 700,
-    fontFamily: 'SourceHanSerifCN, system-ui, -apple-system, sans-serif',
-  }
+  const isDark = data.theme === 'dark'
+
+  const shapeStyle = isDark
+    ? {
+        fill: '#111827',
+        stroke: '#6C9AF0',
+        strokeWidth: 2.5,
+      }
+    : {
+        fill: isAnd ? '#fffbeb' : '#faf5ff',
+        stroke: isAnd ? '#f59e0b' : '#a855f7',
+        strokeWidth: 2.5,
+      }
+
+  const textStyle = isDark
+    ? {
+        fill: '#E5E7EB',
+        fontSize: '15px',
+        fontWeight: 700,
+        fontFamily: 'SourceHanSerifCN, system-ui, -apple-system, sans-serif',
+      }
+    : {
+        fill: isAnd ? '#92400e' : '#6b21a8',
+        fontSize: '15px',
+        fontWeight: 700,
+        fontFamily: 'SourceHanSerifCN, system-ui, -apple-system, sans-serif',
+      }
   return (
     <div className={`fta-gate ${isAnd ? 'fta-gate--and' : 'fta-gate--or'}`}>
       <Handle type="target" position={Position.Top} className="fta-handle" />
@@ -116,7 +133,8 @@ function buildLayout(nodes, edges) {
     nodes.find((n) => !allSources.has(n.id)) ||
     nodes[0]
 
-  const H_GAP = 120
+  // 基础水平间距：略大于节点宽度，避免节点边缘轻微重叠
+  const H_GAP = 160
   const nodeMap = new Map(nodes.map((n) => [n.id, n]))
   const widthOf = new Map()
   const visitedW = new Set()
@@ -144,7 +162,8 @@ function buildLayout(nodes, edges) {
     centerMap.set(id, { cx: left + w / 2, cy: yOffset })
     const node = nodeMap.get(id)
     const isGate = node && node.type === 'gate'
-    const vGap = isGate ? 100 : 70
+    // 垂直间距：事件节点与其子节点间留出更长线段，避免“父-子直连”时线段被子节点遮挡
+    const vGap = isGate ? 100 : 90
     let cur = left
     ;(childrenOf.get(id) || []).forEach((kid) => {
       const kw = widthOf.get(kid) || H_GAP
@@ -162,8 +181,34 @@ function buildLayout(nodes, edges) {
     }
   })
 
+  // 简单的防遮挡：同一层(y)上若多个节点计算到几乎相同的 cx，则做轻微水平错位
+  const usedSlotsByRow = new Map()
+  const adjustedCenters = new Map()
+  const MIN_HORIZONTAL_GAP = EVENT_NODE_W * 0.8
+
+  centerMap.forEach((c, id) => {
+    const rowKey = Math.round(c.cy / 10) * 10
+    const row = usedSlotsByRow.get(rowKey) || []
+
+    let offsetCx = c.cx
+    let tries = 0
+    while (
+      row.some((existingCx) => Math.abs(existingCx - offsetCx) < MIN_HORIZONTAL_GAP) &&
+      tries < 10
+    ) {
+      const direction = tries % 2 === 0 ? 1 : -1
+      const step = Math.ceil(tries / 2) * (MIN_HORIZONTAL_GAP * 0.6)
+      offsetCx = c.cx + direction * step
+      tries += 1
+    }
+
+    row.push(offsetCx)
+    usedSlotsByRow.set(rowKey, row)
+    adjustedCenters.set(id, { cx: offsetCx, cy: c.cy })
+  })
+
   const rfNodes = nodes.map((n) => {
-    const c = centerMap.get(n.id)
+    const c = adjustedCenters.get(n.id) || centerMap.get(n.id)
     const isGate = n.type === 'gate'
     const halfW = EVENT_NODE_W / 2
     return {
@@ -197,7 +242,7 @@ function buildLayout(nodes, edges) {
   return { rfNodes, rfEdges }
 }
 
-function FitViewButton({ resetLayout }) {
+function FitViewButton({ resetLayout, onResetViewFlag }) {
   const { fitView } = useReactFlow()
   return (
     <Panel position="top-right">
@@ -206,8 +251,14 @@ function FitViewButton({ resetLayout }) {
         className="fta-btn primary fta-fitview-btn"
         onClick={() => {
           resetLayout()
+          onResetViewFlag?.()
           setTimeout(() => {
-            fitView({ padding: 0.2, duration: 300, maxZoom: 1.5, minZoom: 0.1 })
+            fitView({
+              padding: FITVIEW_PADDING,
+              duration: 350,
+              maxZoom: 1.5,
+              minZoom: 0.1,
+            })
           }, 50)
         }}
       >
@@ -276,23 +327,41 @@ function CanvasInner({
   onNodeContextMenu,
   onPaneContextMenu,
   onNodeDoubleClick,
+  onConnectEdge,
+  onEdgeContextMenu,
   showChrome = true,
   canvasActionsRef,
+  theme = 'light',
 }) {
-  const init = useMemo(
-    () => buildLayout(graphData.nodes || [], graphData.edges || []),
-    [graphData],
-  )
+  const init = useMemo(() => {
+    const layout = buildLayout(graphData.nodes || [], graphData.edges || [])
+    return {
+      rfNodes: layout.rfNodes.map((n) => ({
+        ...n,
+        data: {
+          ...n.data,
+          theme,
+        },
+      })),
+      rfEdges: layout.rfEdges,
+    }
+  }, [graphData, theme])
 
   const [nodes, setNodes] = useState(init.rfNodes)
   const [edges, setEdges] = useState(init.rfEdges)
+  const [userAdjustedView, setUserAdjustedView] = useState(false)
   const { getNodes, fitView } = useReactFlow()
 
   useEffect(() => {
     setNodes(init.rfNodes)
     setEdges(init.rfEdges)
-    setTimeout(() => fitView({ padding: 0.2, duration: 300 }), 80)
-  }, [init, fitView])
+    if (!userAdjustedView) {
+      setTimeout(
+        () => fitView({ padding: FITVIEW_PADDING, duration: 350 }),
+        80,
+      )
+    }
+  }, [init, fitView, userAdjustedView])
 
   const exportImage = useCallback(async () => {
     const currentNodes = getNodes()
@@ -304,8 +373,12 @@ function CanvasInner({
     const vp = getViewportForBounds(bounds, w, h, 0.5, 2)
     const el = document.querySelector('.react-flow__viewport')
     if (!el) return null
+
+    // 按当前画布主题使用相同背景色，其他样式与画布保持一致
+    const bg = theme === 'dark' ? '#696969' : '#F8F0F2'
+
     return toPng(el, {
-      backgroundColor: '#F8F0F2',
+      backgroundColor: bg,
       width: w,
       height: h,
       pixelRatio: 3,
@@ -315,7 +388,7 @@ function CanvasInner({
         transform: `translate(${vp.x}px, ${vp.y}px) scale(${vp.zoom})`,
       },
     })
-  }, [getNodes])
+  }, [getNodes, theme])
 
   if (canvasActionsRef) {
     canvasActionsRef.current = { exportImage }
@@ -344,6 +417,18 @@ function CanvasInner({
     [onNodeDoubleClick],
   )
 
+  const handleEdgeCtx = useCallback(
+    (event, edge) => {
+      event.preventDefault()
+      onEdgeContextMenu?.(event, edge)
+    },
+    [onEdgeContextMenu],
+  )
+
+  const handleMove = useCallback(() => {
+    setUserAdjustedView(true)
+  }, [])
+
   return (
     <ReactFlow
       nodes={nodes}
@@ -355,12 +440,21 @@ function CanvasInner({
       onNodeContextMenu={handleNodeCtx}
       onPaneContextMenu={handlePaneCtx}
       onNodeDoubleClick={handleDblClick}
+      onConnect={onConnectEdge}
+      onEdgeContextMenu={handleEdgeCtx}
+      onMove={handleMove}
+      onMoveStart={handleMove}
+      onMoveEnd={handleMove}
       fitView
-      fitViewOptions={{ padding: 0.2 }}
+      fitViewOptions={{ padding: FITVIEW_PADDING }}
       proOptions={{ hideAttribution: true }}
       className="fta-reactflow"
     >
-      <Background color="#e2e8f0" gap={20} />
+      <Background
+        color={theme === 'dark' ? '#d1d5db' : '#e2e8f0'}
+        gap={20}
+        variant="dots"
+      />
       {showChrome && (
         <>
           <MiniMap nodeColor={() => '#818cf8'} maskColor="rgba(255,255,255,0.7)" />
@@ -370,6 +464,7 @@ function CanvasInner({
               setNodes(init.rfNodes)
               setEdges(init.rfEdges)
             }}
+            onResetViewFlag={() => setUserAdjustedView(false)}
           />
           <LegendPanel />
         </>
@@ -378,10 +473,10 @@ function CanvasInner({
   )
 }
 
-export default function FaultTreeCanvas({ canvasActionsRef, ...props }) {
+export default function FaultTreeCanvas({ canvasActionsRef, theme = 'light', ...props }) {
   return (
     <ReactFlowProvider>
-      <CanvasInner {...props} canvasActionsRef={canvasActionsRef} />
+      <CanvasInner {...props} canvasActionsRef={canvasActionsRef} theme={theme} />
     </ReactFlowProvider>
   )
 }

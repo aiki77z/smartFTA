@@ -9,58 +9,13 @@ const TYPE_LABEL_MAP = {
   3: 'basic',
 }
 
-export function parseRawFtaJson(raw) {
-  if (!raw || !Array.isArray(raw.nodeList) || !Array.isArray(raw.linkList)) {
-    return { nodes: [], edges: [] }
-  }
+const STRING_TYPE_LABEL_MAP = {
+  top_event: 'top',
+  intermediate_event: 'intermediate',
+  basic_event: 'basic',
+}
 
-  const { nodeList, linkList } = raw
-
-  const baseNodes = nodeList.map((node) => {
-    const typeCode = Number(node.type)
-    const gateCode = Number(node.gate)
-    const gateLabel = GATE_LABEL_MAP[gateCode] || ''
-
-    const x = typeof node.x === 'number' ? node.x : 0
-    const y = typeof node.y === 'number' ? node.y : 0
-
-    const baseLabel = node.name || (node.event && node.event.name) || node.id
-    const label = baseLabel
-
-    return {
-      id: String(node.id),
-      label,
-      type: TYPE_LABEL_MAP[typeCode] || 'event',
-      position: { x, y },
-      gate: gateLabel,
-      meta: {
-        rawType: node.type,
-        gateCode: node.gate,
-        gateLabel,
-        event: node.event,
-        transfer: node.transfer,
-        raw: node,
-      },
-    }
-  })
-
-  const baseEdges = linkList.map((link) => {
-    const sourceId = String(link.sourceId)
-    const targetId = String(link.targetId)
-    const id = `${sourceId}-${targetId}`
-
-    return {
-      id,
-      source: sourceId,
-      target: targetId,
-      relation: '',
-      meta: {
-        isCondition: link.isCondition,
-        raw: link,
-      },
-    }
-  })
-
+function buildGraphWithGates(baseNodes, baseEdges) {
   const nodesById = new Map(baseNodes.map((n) => [n.id, n]))
   const incomingByTarget = new Map()
 
@@ -136,5 +91,123 @@ export function parseRawFtaJson(raw) {
     nodes: [...baseNodes, ...gateNodes],
     edges: [...remainingEdges, ...gateEdges],
   }
+}
+
+export function parseRawFtaJson(raw) {
+  if (!raw || !Array.isArray(raw.nodeList) || !Array.isArray(raw.linkList)) {
+    return { nodes: [], edges: [] }
+  }
+
+  const { nodeList, linkList } = raw
+
+  const baseNodes = nodeList.map((node) => {
+    const typeCode = Number(node.type)
+    const gateCode = Number(node.gate)
+    const gateLabel = GATE_LABEL_MAP[gateCode] || ''
+
+    const x = typeof node.x === 'number' ? node.x : 0
+    const y = typeof node.y === 'number' ? node.y : 0
+
+    const baseLabel = node.name || (node.event && node.event.name) || node.id
+    const label = baseLabel
+
+    return {
+      id: String(node.id),
+      label,
+      type: TYPE_LABEL_MAP[typeCode] || 'event',
+      position: { x, y },
+      gate: gateLabel,
+      meta: {
+        rawType: node.type,
+        gateCode: node.gate,
+        gateLabel,
+        event: node.event,
+        transfer: node.transfer,
+        raw: node,
+      },
+    }
+  })
+
+  const baseEdges = linkList.map((link) => {
+    const sourceId = String(link.sourceId)
+    const targetId = String(link.targetId)
+    const id = `${sourceId}-${targetId}`
+
+    return {
+      id,
+      source: sourceId,
+      target: targetId,
+      relation: '',
+      meta: {
+        isCondition: link.isCondition,
+        raw: link,
+      },
+    }
+  })
+
+  return buildGraphWithGates(baseNodes, baseEdges)
+}
+
+export function parseTreeDataJson(raw) {
+  if (!raw || !raw.tree_data || !raw.tree_data.nodes) {
+    return { nodes: [], edges: [] }
+  }
+
+  const treeData = raw.tree_data
+  const nodeMap = treeData.nodes || {}
+  const nodeList = Object.values(nodeMap)
+
+  const baseNodes = nodeList.map((node) => {
+    const typeLabel = STRING_TYPE_LABEL_MAP[node.type] || 'event'
+    const gateRaw = typeof node.gate === 'string' ? node.gate.toUpperCase() : ''
+    const gateLabel = gateRaw === 'AND' || gateRaw === 'OR' ? gateRaw : ''
+
+    const baseLabel = node.name || node.id
+
+    return {
+      id: String(node.id),
+      label: baseLabel,
+      type: typeLabel,
+      position: { x: 0, y: 0 },
+      gate: gateLabel,
+      meta: {
+        rawType: node.type,
+        gateCode: null,
+        gateLabel,
+        event: {
+          id: node.id,
+          name: node.name,
+          description: node.description,
+        },
+        transfer: null,
+        raw: node,
+      },
+    }
+  })
+
+  const baseEdges = []
+
+  nodeList.forEach((node) => {
+    if (!Array.isArray(node.children)) return
+    const parentId = String(node.id)
+    node.children.forEach((childId) => {
+      const sourceId = String(childId)
+      const targetId = parentId
+      baseEdges.push({
+        id: `${sourceId}-${targetId}`,
+        source: sourceId,
+        target: targetId,
+        relation: '',
+        meta: {
+          raw: {
+            parentId,
+            childId: sourceId,
+          },
+        },
+      })
+    })
+  })
+
+  return buildGraphWithGates(baseNodes, baseEdges)
 }
 

@@ -1,16 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import FaultTreeCanvas from '../components/fta/FaultTreeCanvas.jsx'
-import rawFtaSample from '../raw-FTA/raw-FTA.json'
-import { parseRawFtaJson } from '../utils/ftaParser.js'
+import rawFtaSample from '../raw-FTA/raw-FTA-4.json'
+import { parseRawFtaJson, parseTreeDataJson } from '../utils/ftaParser.js'
 import {
   addChildNode,
+  addChildUnderGate,
   deleteNode,
   deleteGate,
   changeGateType,
   renameNode,
   changeEventType,
   insertGate,
+  insertParentEvent,
+  duplicateEventNode,
+  connectNodes,
+  deleteEdgeById,
   graphToRawJson,
+  graphToTreeDataJson,
   getNodeEditInfo,
 } from '../utils/ftaGraphEditor.js'
 import '../styles/fta.css'
@@ -22,6 +28,9 @@ function normalizeToGraph(raw) {
   if (!raw) return { nodes: [], edges: [] }
   if (Array.isArray(raw.nodeList) && Array.isArray(raw.linkList)) {
     return parseRawFtaJson(raw)
+  }
+  if (raw.tree_data && raw.tree_data.nodes) {
+    return parseTreeDataJson(raw)
   }
   if (Array.isArray(raw.nodes) && Array.isArray(raw.edges)) {
     return {
@@ -45,19 +54,55 @@ function normalizeToGraph(raw) {
 }
 
 function FaultTreePage() {
-  const [rawJsonText, setRawJsonText] = useState(
-    JSON.stringify(rawFtaSample, null, 2),
-  )
-  const [graphData, setGraphData] = useState(() =>
-    normalizeToGraph(rawFtaSample),
-  )
+  const initialState = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return {
+        raw: JSON.stringify(rawFtaSample, null, 2),
+        graph: normalizeToGraph(rawFtaSample),
+      }
+    }
+    try {
+      const params = new URLSearchParams(window.location.search)
+      const snap = params.get('snapshot')
+      if (!snap) {
+        return {
+          raw: JSON.stringify(rawFtaSample, null, 2),
+          graph: normalizeToGraph(rawFtaSample),
+        }
+      }
+      const parsed = JSON.parse(snap)
+      return {
+        raw: JSON.stringify(parsed, null, 2),
+        graph: normalizeToGraph(parsed),
+      }
+    } catch {
+      return {
+        raw: JSON.stringify(rawFtaSample, null, 2),
+        graph: normalizeToGraph(rawFtaSample),
+      }
+    }
+  }, [])
+
+  const [rawJsonText, setRawJsonText] = useState(initialState.raw)
+  const [graphData, setGraphData] = useState(initialState.graph)
   const [error, setError] = useState('')
   const [selectedNode, setSelectedNode] = useState(null)
   const [exporting, setExporting] = useState(false)
   const [contextMenu, setContextMenu] = useState(null)
+  const [edgeMenu, setEdgeMenu] = useState(null)
   const [modal, setModal] = useState(null)
+  const [validation, setValidation] = useState(null)
+  const [validationLoading, setValidationLoading] = useState(false)
+  const [validationError, setValidationError] = useState('')
+  const [showValidationPanel, setShowValidationPanel] = useState(true)
+  const [history, setHistory] = useState([])
+  const [redoHistory, setRedoHistory] = useState([])
+  const [theme, setTheme] = useState('light')
+  const [exportModalOpen, setExportModalOpen] = useState(false)
   const canvasRef = useRef(null)
   const canvasActionsRef = useRef(null)
+
+  const VALIDATION_API_URL = 'http://localhost:8000/validate-fault-tree'
 
   useEffect(() => {
     if (!contextMenu) return
@@ -69,23 +114,88 @@ function FaultTreePage() {
     }
   }, [contextMenu])
 
-  const rawAttr = useMemo(() => {
+  const parsedInfo = useMemo(() => {
     try {
       const parsed = JSON.parse(rawJsonText)
-      return parsed.attr
+      if (Array.isArray(parsed.nodeList) && Array.isArray(parsed.linkList)) {
+        return { parsed, kind: 'rawFta', attr: parsed.attr }
+      }
+      if (parsed.tree_data && parsed.tree_data.nodes) {
+        return { parsed, kind: 'treeData', attr: undefined }
+      }
+      if (Array.isArray(parsed.nodes) && Array.isArray(parsed.edges)) {
+        return { parsed, kind: 'graph', attr: undefined }
+      }
+      return { parsed, kind: 'unknown', attr: undefined }
     } catch {
-      return undefined
+      return { parsed: null, kind: 'invalid', attr: undefined }
     }
   }, [rawJsonText])
 
   const applyEdit = useCallback(
     (newGraphData) => {
+      setHistory((h) => [...h, { graphData, rawJsonText }])
+      setRedoHistory([])
       setGraphData(newGraphData)
-      setRawJsonText(JSON.stringify(graphToRawJson(newGraphData, rawAttr), null, 2))
+      let nextJson
+      if (parsedInfo.kind === 'rawFta' && parsedInfo.parsed) {
+        nextJson = graphToRawJson(newGraphData, parsedInfo.attr)
+      } else if (parsedInfo.kind === 'treeData' && parsedInfo.parsed) {
+        nextJson = graphToTreeDataJson(newGraphData, parsedInfo.parsed)
+      } else if (parsedInfo.kind === 'graph' && parsedInfo.parsed) {
+        nextJson = {
+          ...parsedInfo.parsed,
+          nodes: newGraphData.nodes,
+          edges: newGraphData.edges,
+        }
+      } else {
+        nextJson = graphToRawJson(newGraphData, parsedInfo.attr)
+      }
+      setRawJsonText(JSON.stringify(nextJson, null, 2))
       setError('')
     },
-    [rawAttr],
+    [parsedInfo, graphData, rawJsonText],
   )
+
+  useEffect(() => {
+    if (!graphData || graphData.nodes.length === 0) {
+      setValidation(null)
+      setValidationError('')
+      return
+    }
+
+    setValidationLoading(true)
+    setValidationError('')
+
+    const controller = new AbortController()
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(VALIDATION_API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({ graph: graphData }),
+        })
+        if (!res.ok) {
+          throw new Error(`校验服务返回错误状态：${res.status}`)
+        }
+        const data = await res.json()
+        setValidation(data.validation || null)
+      } catch (err) {
+        if (err.name === 'AbortError') return
+        console.error(err)
+        setValidationError(err.message || '调用校验服务失败')
+        setValidation(null)
+      } finally {
+        setValidationLoading(false)
+      }
+    }, 400)
+
+    return () => {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [graphData])
 
   const handleJsonChange = useCallback((e) => {
     setRawJsonText(e.target.value)
@@ -95,12 +205,14 @@ function FaultTreePage() {
     try {
       const parsed = JSON.parse(rawJsonText)
       const normalized = normalizeToGraph(parsed)
+      setHistory((h) => [...h, { graphData, rawJsonText }])
+      setRedoHistory([])
       setGraphData(normalized)
       setError('')
     } catch (err) {
       setError(`JSON 解析失败：${err.message}`)
     }
-  }, [rawJsonText])
+  }, [rawJsonText, graphData, rawJsonText])
 
   const handleDownloadJson = useCallback(() => {
     const blob = new Blob([rawJsonText], { type: 'application/json' })
@@ -131,6 +243,39 @@ function FaultTreePage() {
     }
   }, [])
 
+  const handleDownloadHiResImage = useCallback(async () => {
+    try {
+      const origin = window.location.origin
+      const snapParam = encodeURIComponent(rawJsonText)
+      const url = `${origin}/fta-viewer?snapshot=${snapParam}`
+      const resp = await fetch('http://localhost:8000/export-fault-tree-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          selector: '.fta-canvas-wrapper',
+          width: 1600,
+          height: 900,
+          scale: 3.0,
+          theme,
+        }),
+      })
+      if (!resp.ok) {
+        throw new Error(`高保真导出失败：${resp.status}`)
+      }
+      const blob = await resp.blob()
+      const dlUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = dlUrl
+      a.download = 'fault-tree-hires.png'
+      a.click()
+      URL.revokeObjectURL(dlUrl)
+    } catch (e) {
+      console.error(e)
+      setError(e.message || '高保真图片导出失败')
+    }
+  }, [rawJsonText, theme])
+
   const handleNodeContextMenu = useCallback(
     (event, rfNode) => {
       const info = getNodeEditInfo(graphData, rfNode.id)
@@ -146,6 +291,7 @@ function FaultTreePage() {
 
   const handlePaneContextMenu = useCallback(() => {
     setContextMenu(null)
+    setEdgeMenu(null)
   }, [])
 
   const handleNodeDoubleClick = useCallback(
@@ -158,8 +304,26 @@ function FaultTreePage() {
   )
 
   const doAddChild = useCallback(
-    (parentId, name, type) => {
-      applyEdit(addChildNode(graphData, parentId, name, type))
+    (parentId) => {
+      const existing = graphData.nodes.filter((n) =>
+        typeof n.label === 'string' && n.label.startsWith('新中间事件'),
+      )
+      const nextIndex = existing.length + 1
+      const name = `新中间事件${nextIndex}`
+      applyEdit(addChildNode(graphData, parentId, name, 'intermediate'))
+      setSelectedNode(null)
+    },
+    [graphData, applyEdit],
+  )
+
+  const doAddChildUnderGate = useCallback(
+    (gateId) => {
+      const existing = graphData.nodes.filter((n) =>
+        typeof n.label === 'string' && n.label.startsWith('新基本事件'),
+      )
+      const nextIndex = existing.length + 1
+      const name = `新基本事件${nextIndex}`
+      applyEdit(addChildUnderGate(graphData, gateId, name, 'basic'))
       setSelectedNode(null)
     },
     [graphData, applyEdit],
@@ -213,6 +377,71 @@ function FaultTreePage() {
     [graphData, applyEdit],
   )
 
+  const doInsertParent = useCallback(
+    (childId) => {
+      applyEdit(insertParentEvent(graphData, childId))
+    },
+    [graphData, applyEdit],
+  )
+
+  const doDuplicate = useCallback(
+    (nodeId) => {
+      applyEdit(duplicateEventNode(graphData, nodeId))
+    },
+    [graphData, applyEdit],
+  )
+
+  const handleConnect = useCallback(
+    (params) => {
+      const { source, target } = params || {}
+      if (!source || !target) return
+      // React Flow 里用户通常是从父节点拖到子节点；
+      // 我们内部的图结构采用 child -> parent，因此这里反转一次。
+      applyEdit(connectNodes(graphData, { sourceId: target, targetId: source }))
+    },
+    [graphData, applyEdit],
+  )
+
+  const handleEdgeContextMenu = useCallback((event, edge) => {
+    setEdgeMenu({
+      x: event.clientX,
+      y: event.clientY,
+      edgeId: edge.id,
+    })
+  }, [])
+
+  const doDeleteEdge = useCallback(
+    (edgeId) => {
+      applyEdit(deleteEdgeById(graphData, edgeId))
+      setEdgeMenu(null)
+    },
+    [graphData, applyEdit],
+  )
+
+  const handleUndo = useCallback(() => {
+    setHistory((h) => {
+      if (!h.length) return h
+      const last = h[h.length - 1]
+      setRedoHistory((r) => [...r, { graphData, rawJsonText }])
+      setGraphData(last.graphData)
+      setRawJsonText(last.rawJsonText)
+      setError('')
+      return h.slice(0, -1)
+    })
+  }, [graphData, rawJsonText])
+
+  const handleRedo = useCallback(() => {
+    setRedoHistory((r) => {
+      if (!r.length) return r
+      const last = r[r.length - 1]
+      setHistory((h) => [...h, { graphData, rawJsonText }])
+      setGraphData(last.graphData)
+      setRawJsonText(last.rawJsonText)
+      setError('')
+      return r.slice(0, -1)
+    })
+  }, [graphData, rawJsonText])
+
   const hasGraph = useMemo(
     () => graphData.nodes.length > 0,
     [graphData.nodes.length],
@@ -223,7 +452,7 @@ function FaultTreePage() {
   function renderContextMenu() {
     if (!contextMenu) return null
     const { x, y, info } = contextMenu
-    const { node, isGate, gateChild, hasDirectChildren, isTop } = info
+    const { node, isGate, gateChild, hasDirectChildren, isTop, parentId } = info
 
     const menuStyle = {
       left: Math.min(x, window.innerWidth - 220),
@@ -234,6 +463,17 @@ function FaultTreePage() {
       const otherType = node.label === 'AND' ? 'OR' : 'AND'
       return (
         <div className="fta-context-menu" style={menuStyle}>
+          <button
+            className="fta-context-menu-item"
+            onClick={() => {
+              doAddChildUnderGate(node.id)
+              setContextMenu(null)
+            }}
+          >
+            <span className="fta-ctx-icon">＋</span>
+            在门下添加事件子节点
+          </button>
+          <div className="fta-context-menu-sep" />
           <button
             className="fta-context-menu-item"
             onClick={() => {
@@ -264,13 +504,35 @@ function FaultTreePage() {
         <button
           className="fta-context-menu-item"
           onClick={() => {
+            doAddChild(node.id)
             setContextMenu(null)
-            setModal({ type: 'addChild', parentId: node.id })
           }}
         >
           <span className="fta-ctx-icon">＋</span>
-          添加子节点
+          在其下添加子节点
         </button>
+        <button
+          className="fta-context-menu-item"
+          onClick={() => {
+            doDuplicate(node.id)
+            setContextMenu(null)
+          }}
+        >
+          <span className="fta-ctx-icon">⧉</span>
+          复制此节点
+        </button>
+        {!isTop && parentId && (
+          <button
+            className="fta-context-menu-item"
+            onClick={() => {
+              doInsertParent(node.id)
+              setContextMenu(null)
+            }}
+          >
+            <span className="fta-ctx-icon">⇡</span>
+            在其上插入父节点
+          </button>
+        )}
         <button
           className="fta-context-menu-item"
           onClick={() => {
@@ -368,20 +630,28 @@ function FaultTreePage() {
     )
   }
 
+  function renderEdgeMenu() {
+    if (!edgeMenu) return null
+    const { x, y, edgeId } = edgeMenu
+    const menuStyle = {
+      left: Math.min(x, window.innerWidth - 200),
+      top: Math.min(y, window.innerHeight - 120),
+    }
+    return (
+      <div className="fta-context-menu" style={menuStyle}>
+        <button
+          className="fta-context-menu-item fta-context-menu-item--danger"
+          onClick={() => doDeleteEdge(edgeId)}
+        >
+          <span className="fta-ctx-icon">✕</span>
+          删除连线
+        </button>
+      </div>
+    )
+  }
+
   function renderModal() {
     if (!modal) return null
-
-    if (modal.type === 'addChild') {
-      return (
-        <AddChildModal
-          onConfirm={(name, type) => {
-            doAddChild(modal.parentId, name, type)
-            setModal(null)
-          }}
-          onCancel={() => setModal(null)}
-        />
-      )
-    }
 
     if (modal.type === 'rename') {
       return (
@@ -400,7 +670,7 @@ function FaultTreePage() {
   }
 
   return (
-    <div className="fta-layout">
+    <div className={`fta-layout${theme === 'dark' ? ' fta-layout--dark' : ''}`}>
       <header className="fta-header">
         <div>
           <h1 className="fta-title">故障树可视化编辑</h1>
@@ -409,16 +679,48 @@ function FaultTreePage() {
           </p>
         </div>
         <div className="fta-header-actions">
+          <button
+            type="button"
+            className="fta-btn ghost"
+            onClick={() =>
+              setTheme((t) => (t === 'light' ? 'dark' : 'light'))
+            }
+          >
+            {theme === 'light' ? '切换到夜间模式' : '切换到日间模式'}
+          </button>
+          <button
+            type="button"
+            className="fta-btn ghost"
+            onClick={handleUndo}
+            disabled={history.length === 0}
+          >
+            撤销
+          </button>
+          <button
+            type="button"
+            className="fta-btn ghost"
+            onClick={handleRedo}
+            disabled={redoHistory.length === 0}
+          >
+            重做
+          </button>
           <button type="button" className="fta-btn ghost" onClick={handleDownloadJson}>
             下载 JSON
           </button>
           <button
             type="button"
-            className="fta-btn primary"
-            onClick={handleDownloadImage}
+            className="fta-btn ghost"
+            onClick={() => setExportModalOpen(true)}
             disabled={!hasGraph}
           >
-            下载故障树图片
+            导出图片
+          </button>
+          <button
+            type="button"
+            className="fta-btn primary"
+            disabled={!validation || validation.error_count > 0}
+          >
+            提交
           </button>
         </div>
       </header>
@@ -460,7 +762,10 @@ function FaultTreePage() {
               onNodeContextMenu={handleNodeContextMenu}
               onPaneContextMenu={handlePaneContextMenu}
               onNodeDoubleClick={handleNodeDoubleClick}
+              onConnectEdge={handleConnect}
+              onEdgeContextMenu={handleEdgeContextMenu}
               canvasActionsRef={canvasActionsRef}
+              theme={theme}
               showChrome
             />
           </div>
@@ -478,8 +783,30 @@ function FaultTreePage() {
         </section>
       </main>
 
+      <ValidationPanel
+        validation={validation}
+        loading={validationLoading}
+        error={validationError}
+        show={showValidationPanel}
+        onToggle={() => setShowValidationPanel((v) => !v)}
+      />
+
       {renderContextMenu()}
+      {renderEdgeMenu()}
       {renderModal()}
+      {exportModalOpen && (
+        <ExportImageModal
+          onClose={() => setExportModalOpen(false)}
+          onSimple={() => {
+            setExportModalOpen(false)
+            handleDownloadImage()
+          }}
+          onHiRes={() => {
+            setExportModalOpen(false)
+            handleDownloadHiResImage()
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -656,7 +983,7 @@ function AddChildModal({ onConfirm, onCancel }) {
   return (
     <div className="fta-modal-overlay" onClick={onCancel}>
       <div className="fta-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="fta-modal-title">添加子节点</div>
+        <div className="fta-modal-title">在其下添加子节点</div>
         <label className="fta-modal-label">事件名称</label>
         <input
           ref={inputRef}
@@ -736,6 +1063,120 @@ function RenameModal({ initialValue, onConfirm, onCancel }) {
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+function ExportImageModal({ onClose, onSimple, onHiRes }) {
+  return (
+    <div className="fta-modal-overlay" onClick={onClose}>
+      <div className="fta-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="fta-modal-title">选择导出方式</div>
+        <div className="fta-modal-body">
+          <p style={{ marginBottom: '0.8rem', lineHeight: 1.5 }}>
+            请选择导出图片的方式：
+          </p>
+          <div className="fta-modal-actions" style={{ justifyContent: 'space-between' }}>
+            <button
+              type="button"
+              className="fta-btn ghost"
+              onClick={onSimple}
+            >
+              简易导出（当前页面渲染）
+            </button>
+            <button
+              type="button"
+              className="fta-btn primary"
+              onClick={onHiRes}
+            >
+              高保真导出（服务器截图）
+            </button>
+          </div>
+        </div>
+        <div className="fta-modal-actions" style={{ marginTop: '0.8rem' }}>
+          <button type="button" className="fta-btn ghost" onClick={onClose}>
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ValidationPanel({ validation, loading, error, show, onToggle }) {
+  const hasIssues =
+    validation && Array.isArray(validation.issues) && validation.issues.length > 0
+  const hasErrors = validation && validation.error_count > 0
+  const hasWarnings = validation && validation.warning_count > 0
+
+  return (
+    <div className="fta-validation-panel">
+      <div className="fta-validation-header" onClick={onToggle}>
+        <span className="fta-validation-title">
+          逻辑校验
+          {loading && <span className="fta-validation-badge">校验中…</span>}
+          {!loading && validation && hasErrors && (
+            <span className="fta-validation-badge error">
+              错误 {validation.error_count} · 警告 {validation.warning_count}
+            </span>
+          )}
+          {!loading && validation && !hasErrors && hasWarnings && (
+            <span className="fta-validation-badge error">
+              警告 {validation.warning_count}
+            </span>
+          )}
+          {!loading && validation && validation.passed && hasIssues && !hasWarnings && (
+            <span className="fta-validation-badge info">
+              通过（提示 {validation.info_count}）
+            </span>
+          )}
+          {!loading && validation && validation.passed && !hasIssues && (
+            <span className="fta-validation-badge success">通过</span>
+          )}
+        </span>
+        <button
+          type="button"
+          className="fta-validation-toggle"
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggle()
+          }}
+        >
+          {show ? '收起' : '展开'}
+        </button>
+      </div>
+
+      {show && (
+        <div className="fta-validation-body">
+          {error && <div className="fta-validation-error">校验服务错误：{error}</div>}
+
+          {!error && !validation && !loading && (
+            <div className="fta-validation-empty">暂无校验结果。</div>
+          )}
+
+          {!error && validation && (
+            <ul className="fta-validation-list">
+              {validation.issues.map((iss, idx) => (
+                <li
+                  key={`${iss.code}-${idx}`}
+                  className={`fta-validation-item fta-validation-item--${iss.level?.toLowerCase()}`}
+                >
+                  <div className="fta-validation-item-header">
+                    <span className="fta-validation-level">{iss.level}</span>
+                    <span className="fta-validation-code">{iss.code}</span>
+                  </div>
+                  <div className="fta-validation-message">{iss.message}</div>
+                  {Array.isArray(iss.node_ids) && iss.node_ids.length > 0 && (
+                    <div className="fta-validation-nodes">
+                      相关节点：{iss.node_ids.join(', ')}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
     </div>
   )
 }

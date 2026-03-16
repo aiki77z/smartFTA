@@ -1,0 +1,14 @@
+.fta-layout--dark {
+  --fta-bg: #0b1120;
+  --fta-surface: #020617;
+  --fta-border: #1f2937;
+  --fta-accent: #22c55e;
+  --fta-accent-hover: #16a34a;
+  --fta-text-main: #e5e7eb;
+  --fta-text-subtle: #9ca3af;
+  --fta-danger: #f97373;
+  --fta-validation-bg: #020617;
+  /* 夜间画布背景 */
+  --fta-canvas-bg: #696969;
+}
+
