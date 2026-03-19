@@ -20,6 +20,15 @@ const EVENT_NODE_W = 140
 const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '基本事件' }
 const FITVIEW_PADDING = 0.15
 
+function getErrorLevelCategory(errorLevel) {
+  if (!errorLevel) return 'mild'
+  if (typeof errorLevel !== 'string') return 'mild'
+  const lv = errorLevel.trim()
+  if (lv === '严重') return 'severe'
+  if (lv === '中等') return 'moderate'
+  return 'mild'
+}
+
 function formatBasicLabel(text) {
   if (!text) return [text]
   const display = text.length > 16 ? text.slice(0, 15) + '…' : text
@@ -34,10 +43,19 @@ function EventNode({ data }) {
   const cls = `fta-node fta-node--${data.type || 'event'}`
   const isBasic = data.type === 'basic'
   const typeTag = TYPE_LABELS[data.type] || ''
+
+  const errorLevel = data.meta?.event?.errorLevel
+  const viewMode = data.viewMode || 'type'
+  const shouldColorByErrorLevel = viewMode === 'errorLevel' && data.type !== 'top'
+  const errorCategory = shouldColorByErrorLevel
+    ? getErrorLevelCategory(errorLevel)
+    : null
+  const errorBgClass = errorCategory ? `fta-errorLevel-bg--${errorCategory}` : ''
+
   return (
     <div className="fta-node-container">
       <Handle type="target" position={Position.Top} className="fta-handle" />
-      <div className={cls}>
+      <div className={`${cls}${errorBgClass ? ` ${errorBgClass}` : ''}`}>
         {typeTag && <div className="fta-node__type-tag">{typeTag}</div>}
         <div className="fta-node__label">
           {isBasic
@@ -323,7 +341,7 @@ function FitViewButton({ resetLayout, onResetViewFlag }) {
   )
 }
 
-function LegendPanel() {
+function LegendPanel({ viewMode = 'type' }) {
   const [open, setOpen] = useState(false)
   return (
     <Panel position="bottom-left">
@@ -331,18 +349,71 @@ function LegendPanel() {
         <div className="fta-legend">
           <div className="fta-legend-title">图例</div>
           <div className="fta-legend-items">
-            <div className="fta-legend-item">
-              <span className="fta-legend-icon fta-legend-icon--top" />
-              <span>顶事件</span>
-            </div>
-            <div className="fta-legend-item">
-              <span className="fta-legend-icon fta-legend-icon--intermediate" />
-              <span>中间事件</span>
-            </div>
-            <div className="fta-legend-item">
-              <span className="fta-legend-icon fta-legend-icon--basic" />
-              <span>基本事件</span>
-            </div>
+            {viewMode === 'errorLevel' ? (
+              
+               
+              
+              <div className="fta-legend-item" style={{ alignItems: 'flex-start' }}>
+                 
+                <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center' }}>
+                  <div
+                    style={{
+                      width: '26px',
+                      height: '92px',
+                      border: '1px solid var(--fta-border)',
+                      borderRadius: '6px',
+                      overflow: 'hidden',
+                      display: 'flex',
+                      flexDirection: 'column',
+                    }}
+                  >
+                    <div
+                      className="fta-errorLevel-bar--severe"
+                      style={{ flex: 1 }}
+                    />
+                    <div
+                      className="fta-errorLevel-bar--moderate"
+                      style={{ flex: 1 }}
+                    />
+                    <div className="fta-errorLevel-bar--mild" style={{ flex: 1 }} />
+                  </div>
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      height: '92px',
+                      justifyContent: 'space-between',
+                      paddingTop: '0.05rem',
+                    }}
+                  >
+                    <span>严重</span>
+                    <span>中等</span>
+                    <span>轻微</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="fta-legend-item">
+                  <span className="fta-legend-icon fta-legend-icon--top" />
+                  <span>顶事件</span>
+                </div>
+                <div className="fta-legend-item">
+                  <span className="fta-legend-icon fta-legend-icon--intermediate" />
+                  <span>中间事件</span>
+                </div>
+                <div className="fta-legend-item">
+                  <span className="fta-legend-icon fta-legend-icon--basic" />
+                  <span>基本事件</span>
+                </div>
+              </>
+            )}
+            {viewMode === 'errorLevel' && (
+              <div className="fta-legend-item">
+                <span className="fta-legend-icon fta-legend-icon--top" />
+                <span>顶事件</span>
+              </div>
+            )}
             <div className="fta-legend-item">
               <svg viewBox="0 0 60 52" width="28" height="24">
                 <path d="M 2 52 L 2 22 C 2 0, 58 0, 58 22 L 58 52 Z"
@@ -387,6 +458,7 @@ function CanvasInner({
   showChrome = true,
   canvasActionsRef,
   theme = 'light',
+  viewMode = 'type',
 }) {
   const init = useMemo(() => {
     const layout = buildLayout(graphData.nodes || [], graphData.edges || [])
@@ -396,11 +468,12 @@ function CanvasInner({
         data: {
           ...n.data,
           theme,
+          viewMode,
         },
       })),
       rfEdges: layout.rfEdges,
     }
-  }, [graphData, theme])
+  }, [graphData, theme, viewMode])
 
   const [nodes, setNodes] = useState(init.rfNodes)
   const [edges, setEdges] = useState(init.rfEdges)
@@ -521,17 +594,27 @@ function CanvasInner({
             }}
             onResetViewFlag={() => setUserAdjustedView(false)}
           />
-          <LegendPanel />
+          <LegendPanel viewMode={viewMode} />
         </>
       )}
     </ReactFlow>
   )
 }
 
-export default function FaultTreeCanvas({ canvasActionsRef, theme = 'light', ...props }) {
+export default function FaultTreeCanvas({
+  canvasActionsRef,
+  theme = 'light',
+  viewMode = 'type',
+  ...props
+}) {
   return (
     <ReactFlowProvider>
-      <CanvasInner {...props} canvasActionsRef={canvasActionsRef} theme={theme} />
+      <CanvasInner
+        {...props}
+        canvasActionsRef={canvasActionsRef}
+        theme={theme}
+        viewMode={viewMode}
+      />
     </ReactFlowProvider>
   )
 }

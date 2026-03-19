@@ -21,6 +21,7 @@ import {
   changeEventDescription,
 } from '../utils/ftaGraphEditor.js'
 import '../styles/fta.css'
+import '../styles/fta-error-level.css'
 
 const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '基本事件' }
 const EVENT_TYPES = ['top', 'intermediate', 'basic']
@@ -86,6 +87,7 @@ function FaultTreePage() {
 
   const [rawJsonText, setRawJsonText] = useState(initialState.raw)
   const [graphData, setGraphData] = useState(initialState.graph)
+  const [viewMode, setViewMode] = useState('type')
   const [error, setError] = useState('')
   const [selectedNode, setSelectedNode] = useState(null)
   const [exporting, setExporting] = useState(false)
@@ -901,6 +903,33 @@ function FaultTreePage() {
             <span className="fta-toolbar-hint">
               右键节点编辑 · 双击修改名称 · 拖拽平移 · 滚轮缩放
             </span>
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <button
+                type="button"
+                className={`fta-btn-xs${viewMode === 'type' ? ' primary' : ' ghost'}`}
+                onClick={() => setViewMode('type')}
+              >
+                普通视图
+              </button>
+              <button
+                type="button"
+                className={`fta-btn-xs${
+                  viewMode === 'errorLevel' ? ' primary' : ' ghost'
+                }`}
+                onClick={() => setViewMode('errorLevel')}
+              >
+                错误等级视图
+              </button>
+              <button
+                type="button"
+                className={`fta-btn-xs${
+                  viewMode === 'probability' ? ' primary' : ' ghost'
+                }`}
+                onClick={() => setViewMode('probability')}
+              >
+                概率视图
+              </button>
+            </div>
           </div>
           <div
             ref={canvasRef}
@@ -916,6 +945,7 @@ function FaultTreePage() {
               onEdgeContextMenu={handleEdgeContextMenu}
               canvasActionsRef={canvasActionsRef}
               theme={theme}
+              viewMode={viewMode}
               showChrome
             />
           </div>

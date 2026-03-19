@@ -1,0 +1,47 @@
+/* Fault Tree - Error Level View
+ * 用独立 CSS 方便灵活调整“严重/中等/轻微(其他)”颜色。
+ */
+
+.fta-errorLevel-bg--severe {
+  border: 3px solid #633640;
+  background-color: #ed7e2f;
+  color: #FFE985;
+}
+
+.fta-errorLevel-bg--moderate {
+  border: 3px solid #633640;
+  background-color: #f0a170;
+  color: #FFE985;
+}
+
+.fta-errorLevel-bg--mild {
+  border: 3px solid #633640;
+  background-color: #f0cdb4;
+  color: #633640;
+}
+
+.fta-errorLevel-bg--severe .fta-node__type-tag {
+  background-color: #633640;
+}
+
+.fta-errorLevel-bg--moderate .fta-node__type-tag {
+  background-color: #633640;
+}
+
+.fta-errorLevel-bg--mild .fta-node__type-tag {
+  background-color: #633640;
+}
+
+.fta-errorLevel-bar--severe {
+  background-color: #ed7e2f;
+}
+
+.fta-errorLevel-bar--moderate {
+  background-color: #f0a170;
+}
+
+.fta-errorLevel-bar--mild {
+  background-color: #f0cdb4;
+}
+
+/* 预留：如后续需要针对 tag 单独按 errorLevel 颜色控制，可继续扩展 */
