@@ -1335,3 +1335,210 @@
   font-size: 10px;
   color: #4b5563;
 }
+
+/* ── AI Validation Panel ── */
+
+.fta-ai-panel {
+  position: fixed;
+  right: 1.5rem;
+  bottom: 1.5rem;
+  width: 420px;
+  max-height: 60vh;
+  background: var(--fta-surface);
+  border-radius: 0.75rem;
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+  font-size: 13px;
+  overflow: hidden;
+  z-index: 51;
+  border: 1px solid var(--fta-border);
+  display: flex;
+  flex-direction: column;
+  resize: both;
+  min-width: 320px;
+  min-height: 220px;
+  max-width: 80vw;
+  font-family: 'SourceHanSerifCN', 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+.fta-ai-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.8rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.35);
+  background: linear-gradient(90deg, rgba(129, 140, 248, 0.06), transparent);
+}
+
+.fta-ai-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.fta-ai-header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.fta-ai-badge {
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 11px;
+  background: rgba(148, 163, 184, 0.18);
+  color: #374151;
+}
+
+.fta-ai-badge.success {
+  background: rgba(34, 197, 94, 0.2);
+  color: #166534;
+}
+
+.fta-ai-badge.muted {
+  background: rgba(148, 163, 184, 0.12);
+  color: #6b7280;
+}
+
+.fta-ai-body {
+  padding: 0.55rem 0.8rem 0.7rem;
+  overflow: auto;
+  flex: 1;
+  font-size: 13px;
+}
+
+.fta-ai-empty {
+  color: #6b7280;
+  line-height: 1.5;
+}
+
+.fta-ai-error {
+  color: #b91c1c;
+  margin-bottom: 0.35rem;
+}
+
+.fta-ai-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.fta-ai-text {
+  margin: 0;
+  padding: 0.45rem 0.55rem;
+  background: #f9fafb;
+  border-radius: 0.5rem;
+  border: 1px solid var(--fta-border);
+  font-family: 'SourceHanSerifCN', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.fta-ai-issues {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 12px;
+  color: #374151;
+}
+
+.fta-ai-issue-item + .fta-ai-issue-item {
+  margin-top: 0.15rem;
+}
+
+.fta-ai-hide-btn {
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  color: #6b7280;
+  cursor: pointer;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+}
+
+.fta-ai-hide-btn:hover {
+  background: rgba(148, 163, 184, 0.18);
+  color: #111827;
+}
+
+.fta-ai-minimized {
+  position: fixed;
+  right: 1.5rem;
+  bottom: 1.5rem;
+  padding: 0.35rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--fta-border);
+  background: var(--fta-surface);
+  font-size: 12px;
+  color: var(--fta-text-main);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
+  cursor: pointer;
+}
+
+.fta-ai-minimized:hover {
+  background: #f1f5f9;
+}
+
+/* 夜间主题下 AI 窗口配色 */
+.fta-layout--dark .fta-ai-panel {
+  background: #020617;
+  border-color: #1f2937;
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.7);
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-ai-header {
+  border-bottom-color: #1f2937;
+  background: linear-gradient(90deg, rgba(148, 163, 184, 0.18), transparent);
+}
+
+.fta-layout--dark .fta-ai-title {
+  color: #f9fafb;
+}
+
+.fta-layout--dark .fta-ai-body {
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-ai-text {
+  background: #020617;
+  border-color: #1f2937;
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-ai-issues {
+  color: #d1d5db;
+}
+
+.fta-layout--dark .fta-ai-badge {
+  background: rgba(55, 65, 81, 0.8);
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-ai-badge.success {
+  background: rgba(34, 197, 94, 0.35);
+  color: #bbf7d0;
+}
+
+.fta-layout--dark .fta-ai-badge.muted {
+  background: rgba(75, 85, 99, 0.9);
+  color: #e5e7eb;
+}
+
+.fta-layout--dark .fta-ai-hide-btn {
+  color: #9ca3af;
+}
+
+.fta-layout--dark .fta-ai-hide-btn:hover {
+  background: rgba(55, 65, 81, 0.8);
+  color: #f9fafb;
+}
+
+.fta-layout--dark .fta-ai-minimized {
+  background: #020617;
+  border-color: #1f2937;
+  color: #e5e7eb;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
+}
+
+.fta-layout--dark .fta-ai-minimized:hover {
+  background: #111827;
+}

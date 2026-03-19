@@ -4,10 +4,19 @@ from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+import ai_validate
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 加载同目录下的 .env，确保 DASHSCOPE_API_KEY / LLM_MODEL 等环境变量生效
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / '.env')
 
 
 class GraphNode(BaseModel):
@@ -48,6 +57,8 @@ app.add_middleware(
   allow_methods=['*'],
   allow_headers=['*'],
 )
+
+app.include_router(ai_validate.router)
 
 
 def _issue(
@@ -372,14 +383,16 @@ async def export_fault_tree_image(req: ExportImageRequest) -> Response:
       except Exception:
         pass
 
-    # 隐藏画布上的交互控件（缩放按钮、缩略图、图例按钮、自动调整视图按钮等），
-    # 但保留页面其它结构（例如顶部 header、左侧 JSON 面板等）
+    # 隐藏画布上的交互控件（缩放按钮、缩略图、图例按钮、自动调整视图按钮等）
+    # 以及 AI 建议浮窗，但保留页面其它结构（例如顶部 header、左侧 JSON 面板等）
     await page.add_style_tag(
       content="""
       .react-flow__controls,
       .react-flow__minimap,
       .fta-legend-toggle,
-      .fta-fitview-btn {
+      .fta-fitview-btn,
+      .fta-ai-panel,
+      .fta-ai-minimized {
         display: none !important;
       }
       """,

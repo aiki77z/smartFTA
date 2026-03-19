@@ -97,6 +97,10 @@ function FaultTreePage() {
   const [validationLoading, setValidationLoading] = useState(false)
   const [validationError, setValidationError] = useState('')
   const [showValidationPanel, setShowValidationPanel] = useState(true)
+  const [aiValidation, setAiValidation] = useState(null)
+  const [aiLoading, setAiLoading] = useState(false)
+  const [aiError, setAiError] = useState('')
+  const [showAiPanel, setShowAiPanel] = useState(true)
   const [history, setHistory] = useState([])
   const [redoHistory, setRedoHistory] = useState([])
   const [theme, setTheme] = useState('light')
@@ -105,6 +109,7 @@ function FaultTreePage() {
   const canvasActionsRef = useRef(null)
 
   const VALIDATION_API_URL = 'http://localhost:8000/validate-fault-tree'
+  const AI_VALIDATION_API_URL = 'http://localhost:8000/ai-validate-fault-tree'
 
   useEffect(() => {
     if (!contextMenu) return
@@ -287,6 +292,46 @@ function FaultTreePage() {
       setError(e.message || '高保真图片导出失败')
     }
   }, [rawJsonText, theme])
+
+  const handleSubmit = useCallback(async () => {
+    if (!validation || validation.error_count > 0) return
+
+    setAiLoading(true)
+    setAiError('')
+    setAiValidation(null)
+
+    let treeJson = null
+    try {
+      treeJson = JSON.parse(rawJsonText)
+    } catch {
+      treeJson = null
+    }
+
+    try {
+      const res = await fetch(AI_VALIDATION_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tree_json: treeJson,
+          graph: graphData,
+          validation,
+        }),
+      })
+
+      if (!res.ok) {
+        throw new Error(`AI 校验服务返回错误状态：${res.status}`)
+      }
+
+      const data = await res.json()
+      setAiValidation(data)
+    } catch (err) {
+      console.error(err)
+      setAiError(err.message || '调用 AI 校验服务失败')
+      setAiValidation(null)
+    } finally {
+      setAiLoading(false)
+    }
+  }, [AI_VALIDATION_API_URL, graphData, rawJsonText, validation])
 
   const handleNodeContextMenu = useCallback(
     (event, rfNode) => {
@@ -823,6 +868,7 @@ function FaultTreePage() {
             type="button"
             className="fta-btn primary"
             disabled={!validation || validation.error_count > 0}
+            onClick={handleSubmit}
           >
             提交
           </button>
@@ -897,6 +943,23 @@ function FaultTreePage() {
         show={showValidationPanel}
         onToggle={() => setShowValidationPanel((v) => !v)}
       />
+
+      {showAiPanel ? (
+        <AiValidationPanel
+          result={aiValidation}
+          loading={aiLoading}
+          error={aiError}
+          onHide={() => setShowAiPanel(false)}
+        />
+      ) : (
+        <button
+          type="button"
+          className="fta-ai-minimized"
+          onClick={() => setShowAiPanel(true)}
+        >
+          AI 建议
+        </button>
+      )}
 
       {renderContextMenu()}
       {renderEdgeMenu()}
@@ -1198,20 +1261,20 @@ function ExportImageModal({ onClose, onSimple, onHiRes }) {
           <p style={{ marginBottom: '0.8rem', lineHeight: 1.5 }}>
             请选择导出图片的方式：
           </p>
-          <div className="fta-modal-actions" style={{ justifyContent: 'space-between' }}>
+          <div className="fta-modal-actions" style={{ justifyContent: 'space-around' }}>
             <button
               type="button"
               className="fta-btn ghost"
               onClick={onSimple}
             >
-              简易导出（当前页面渲染）
+              快速导出
             </button>
             <button
               type="button"
               className="fta-btn primary"
               onClick={onHiRes}
             >
-              高保真导出（服务器截图）
+              高保真导出
             </button>
           </div>
         </div>
@@ -1299,6 +1362,76 @@ function ValidationPanel({ validation, loading, error, show, onToggle }) {
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+function AiValidationPanel({ result, loading, error, onHide }) {
+  const hasContent =
+    !!result &&
+    (result.suggestions ||
+      (Array.isArray(result.issues) && result.issues.length > 0) ||
+      result.summary ||
+      result.text)
+
+  let displayText = ''
+  if (result) {
+    // 优先展示后端返回的完整建议文本，避免 summary 与正文重复显示
+    if (typeof result.suggestions === 'string') {
+      displayText = result.suggestions
+    } else if (typeof result.text === 'string') {
+      displayText = result.text
+    } else if (typeof result.summary === 'string') {
+      displayText = result.summary
+    }
+  }
+
+  return (
+    <div className="fta-ai-panel">
+      <div className="fta-ai-header">
+        <span className="fta-ai-title">AI 校验与优化建议</span>
+        <div className="fta-ai-header-right">
+          {loading && <span className="fta-ai-badge">生成中…</span>}
+          {!loading && !error && hasContent && (
+            <span className="fta-ai-badge success">已生成</span>
+          )}
+          {!loading && !error && !hasContent && (
+            <span className="fta-ai-badge muted">待提交</span>
+          )}
+          <button
+            type="button"
+            className="fta-ai-hide-btn"
+            onClick={onHide}
+          >
+            隐藏
+          </button>
+        </div>
+      </div>
+      <div className="fta-ai-body">
+        {error && <div className="fta-ai-error">AI 校验服务错误：{error}</div>}
+        {!error && !loading && !hasContent && (
+          <div className="fta-ai-empty">
+            通过逻辑校验后点击“提交”，将自动进行 AI 校验并生成优化建议。
+          </div>
+        )}
+        {!error && loading && (
+          <div className="fta-ai-empty">正在根据当前故障树进行 AI 分析，请稍候…</div>
+        )}
+        {!error && !loading && hasContent && (
+          <div className="fta-ai-content">
+            {displayText && <pre className="fta-ai-text">{displayText}</pre>}
+            {Array.isArray(result.issues) && result.issues.length > 0 && (
+              <ul className="fta-ai-issues">
+                {result.issues.map((iss, idx) => (
+                  <li key={idx} className="fta-ai-issue-item">
+                    {iss}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
