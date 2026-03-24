@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { markProjectReviewed } from '../utils/projectStore.js'
 import FaultTreeCanvas from '../components/fta/FaultTreeCanvas.jsx'
 import rawFtaSample from '../raw-FTA/raw-FTA-4.json'
 import { parseRawFtaJson, parseTreeDataJson } from '../utils/ftaParser.js'
@@ -56,6 +58,12 @@ function normalizeToGraph(raw) {
 }
 
 function FaultTreePage() {
+  const navigate = useNavigate()
+  const location = useLocation()
+  const projectIdFromQuery = useMemo(() => {
+    const params = new URLSearchParams(location.search)
+    return params.get('projectId') || ''
+  }, [location.search])
   const initialState = useMemo(() => {
     if (typeof window === 'undefined') {
       return {
@@ -822,60 +830,72 @@ function FaultTreePage() {
 
   return (
     <div className={`fta-layout${theme === 'dark' ? ' fta-layout--dark' : ''}`}>
-      <header className="fta-header">
-        <div>
-          <h1 className="fta-title">故障树可视化编辑</h1>
-          <p className="fta-subtitle">
-            右键节点可编辑 · 双击修改名称 · 操作自动同步 JSON
-          </p>
-        </div>
-        <div className="fta-header-actions">
-          <button
-            type="button"
-            className="fta-btn ghost"
-            onClick={() =>
-              setTheme((t) => (t === 'light' ? 'dark' : 'light'))
-            }
-          >
-            {theme === 'light' ? '夜间' : '日间'}
-          </button>
-          <button
-            type="button"
-            className="fta-btn ghost"
-            onClick={handleUndo}
-            disabled={history.length === 0}
-          >
-            撤销
-          </button>
-          <button
-            type="button"
-            className="fta-btn ghost"
-            onClick={handleRedo}
-            disabled={redoHistory.length === 0}
-          >
-            重做
-          </button>
-          <button type="button" className="fta-btn ghost" onClick={handleDownloadJson}>
-            下载 JSON
-          </button>
-          <button
-            type="button"
-            className="fta-btn ghost"
-            onClick={() => setExportModalOpen(true)}
-            disabled={!hasGraph}
-          >
-            导出图片
-          </button>
-          <button
-            type="button"
-            className="fta-btn primary"
-            disabled={!validation || validation.error_count > 0}
-            onClick={handleSubmit}
-          >
-            提交
-          </button>
-        </div>
-      </header>
+      <div className="fta-top-row">
+        <button
+          type="button"
+          className="fta-btn ghost fta-back-home-btn"
+          onClick={() => {
+            if (projectIdFromQuery) markProjectReviewed(projectIdFromQuery)
+            navigate(projectIdFromQuery ? `/project/${projectIdFromQuery}` : '/')
+          }}
+        >
+          返回
+        </button>
+        <header className="fta-header">
+          <div>
+            <h1 className="fta-title">故障树可视化编辑</h1>
+            <p className="fta-subtitle">
+              右键节点可编辑 · 双击修改名称 · 操作自动同步 JSON
+            </p>
+          </div>
+          <div className="fta-header-actions">
+            <button
+              type="button"
+              className="fta-btn ghost"
+              onClick={() =>
+                setTheme((t) => (t === 'light' ? 'dark' : 'light'))
+              }
+            >
+              {theme === 'light' ? '夜间' : '日间'}
+            </button>
+            <button
+              type="button"
+              className="fta-btn ghost"
+              onClick={handleUndo}
+              disabled={history.length === 0}
+            >
+              撤销
+            </button>
+            <button
+              type="button"
+              className="fta-btn ghost"
+              onClick={handleRedo}
+              disabled={redoHistory.length === 0}
+            >
+              重做
+            </button>
+            <button type="button" className="fta-btn ghost" onClick={handleDownloadJson}>
+              下载 JSON
+            </button>
+            <button
+              type="button"
+              className="fta-btn ghost"
+              onClick={() => setExportModalOpen(true)}
+              disabled={!hasGraph}
+            >
+              导出图片
+            </button>
+            <button
+              type="button"
+              className="fta-btn primary"
+              disabled={!validation || validation.error_count > 0}
+              onClick={handleSubmit}
+            >
+              提交
+            </button>
+          </div>
+        </header>
+      </div>
 
       <main className="fta-main">
         <section className="fta-side">
