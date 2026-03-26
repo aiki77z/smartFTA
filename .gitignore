@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env
+.env
+.env.*
+
+# IDE
+.idea/
+
+# Archives
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
