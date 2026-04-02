@@ -1,5 +1,5 @@
 /* Fault Tree - Error Level View
- * 用独立 CSS 方便灵活调整“严重/中等/轻微(其他)”颜色。
+ * 用独立 CSS 方便灵活调整“高/中/低(其他)”颜色。
  */
 
 .fta-errorLevel-bg--severe {

@@ -24,8 +24,8 @@ function getErrorLevelCategory(errorLevel) {
   if (!errorLevel) return 'mild'
   if (typeof errorLevel !== 'string') return 'mild'
   const lv = errorLevel.trim()
-  if (lv === '严重') return 'severe'
-  if (lv === '中等') return 'moderate'
+  if (lv === '高') return 'severe'
+  if (lv === '中') return 'moderate'
   return 'mild'
 }
 
@@ -386,9 +386,9 @@ function LegendPanel({ viewMode = 'type' }) {
                       paddingTop: '0.05rem',
                     }}
                   >
-                    <span>严重</span>
-                    <span>中等</span>
-                    <span>轻微</span>
+                    <span>高</span>
+                    <span>中</span>
+                    <span>低</span>
                   </div>
                 </div>
               </div>
