@@ -1,5 +1,5 @@
 """
-import_chunks.py —— 一次性把同学的JSON文件导入MongoDB
+import_chunks.py —— 一次性把JSON文件导入MongoDB
 
 用法：
   python import_chunks.py --file output_with_keywords.json

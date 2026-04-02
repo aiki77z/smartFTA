@@ -1,8 +1,8 @@
 """
-main.py —— FastAPI 接口入口（v2）
+main.py —— FastAPI 接口入口（v3）
 
 接口列表：
-  POST /api/tree/generate               生成故障树（含定向修复步骤）
+  POST /api/tree/generate               根据用户prompt自动提取顶事件并生成故障树
   GET  /api/tree/{tree_id}              获取当前版本故障树
   GET  /api/tree/{tree_id}/version/{v}  获取指定版本故障树
   POST /api/tree/{tree_id}/save         专家保存修改（自动触发差异学习）
@@ -17,16 +17,22 @@ import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from generator import generate_fault_tree
+
+from generator import generate_fault_tree, parse_user_prompt
 from validator import validate_full
 from database import (
-    create_tree, save_version, get_version,
-    rollback_version, get_version_list, get_tree_meta, get_chunk_by_id,
-    versions_col
+    create_tree,
+    save_version,
+    get_version,
+    rollback_version,
+    get_version_list,
+    get_tree_meta,
+    get_chunk_by_id,
+    versions_col,
 )
 from diff_analyzer import analyze_and_store, corrections_col, generate_change_description
 
-app = FastAPI(title="故障树智能生成系统", version="2.0.0")
+app = FastAPI(title="故障树智能生成系统", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,18 +42,13 @@ app.add_middleware(
 )
 
 
-# ─────────────────────────────────────────────
-# 请求体定义
-# ─────────────────────────────────────────────
-
 class GenerateRequest(BaseModel):
-    top_event:    str
-    requirements: str = ""
+    prompt: str
 
 
 class SaveRequest(BaseModel):
-    tree_data:   dict
-    editor:      str = "专家"
+    tree_data: dict
+    editor: str = "专家"
     description: str = "手动修改"
 
 
@@ -55,22 +56,35 @@ class ValidateRequest(BaseModel):
     tree_data: dict
 
 
-# ─────────────────────────────────────────────
-# 接口实现
-# ─────────────────────────────────────────────
-
 @app.post("/api/tree/generate")
 def api_generate(req: GenerateRequest):
     """
     生成故障树。
-    流程：检索chunks → LLM#1提取要素 → LLM#2生成草稿
-          → 节点级修正检索 → LLM#3定向修复（有记录时）→ 存版本1 → 返回
+
+    当前输入模式：
+    - 前端只传入一个 prompt
+    - 后端先从 prompt 中提取顶事件与额外要求
+    - 然后仅从数据库检索 chunks，不支持会话时直接上传 chunks
+
+    示例输入：
+      {"prompt": "我要生成一个顶事件为传感器故障的故障树"}
+      {"prompt": "传感器故障"}
+      {"prompt": "请分析驱动系统故障，生成3到5层故障树并保留溯源"}
     """
+    try:
+        parsed = parse_user_prompt(req.prompt)
+        top_event = parsed["top_event"]
+        requirements = parsed.get("requirements", "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"用户prompt解析失败：{str(e)}")
+
     tree_id = f"ft_{uuid.uuid4().hex[:8]}"
-    create_tree(tree_id, req.top_event)
+    create_tree(tree_id, top_event)
 
     try:
-        tree_data = generate_fault_tree(req.top_event, req.requirements)
+        tree_data = generate_fault_tree(top_event, requirements)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -80,14 +94,18 @@ def api_generate(req: GenerateRequest):
         tree_id=tree_id,
         tree_data=tree_data,
         editor="AI",
-        description="AI初始生成",
-        is_ai=True
+        description=f"AI初始生成（由prompt提取顶事件：{top_event}）",
+        is_ai=True,
     )
 
     return {
-        "tree_id":   tree_id,
-        "version":   version,
-        "tree_data": tree_data
+        "tree_id": tree_id,
+        "version": version,
+        "parsed_prompt": {
+            "top_event": top_event,
+            "requirements": requirements,
+        },
+        "tree_data": tree_data,
     }
 
 
@@ -109,27 +127,23 @@ def api_get_version(tree_id: str, version: int):
 
 @app.post("/api/tree/{tree_id}/save")
 def api_save(tree_id: str, req: SaveRequest):
-    """
-    专家保存修改。
-    若上一版本是AI生成，则触发差异分析，将修正模式持久化到 corrections 集合。
-    """
     meta = get_tree_meta(tree_id)
     if not meta:
         raise HTTPException(status_code=404, detail="故障树不存在")
 
-    # 结构校验，有ERROR不允许保存
     validation = validate_full(req.tree_data, skip_semantic=True)
     if not validation["passed"]:
         raise HTTPException(
             status_code=400,
             detail={
                 "message": "故障树存在结构错误，无法保存，请修正后重试",
-                "issues": [i for i in validation["issues"] if i["level"] == "ERROR"]
-            }
+                "issues": [i for i in validation["issues"] if i["level"] == "ERROR"],
+            },
         )
 
     prev_version_num = meta.get("current_version")
     prev_tree_data = None
+    prev_ver = None
     if prev_version_num:
         prev_ver = versions_col.find_one({"tree_id": tree_id, "version": prev_version_num})
         if prev_ver:
@@ -146,21 +160,14 @@ def api_save(tree_id: str, req: SaveRequest):
         tree_data=req.tree_data,
         editor=req.editor,
         description=description,
-        is_ai=False
+        is_ai=False,
     )
 
-    # 修正学习：仅在上一版本是AI生成时触发
     learned_count = 0
-    if prev_version_num:
-        if prev_ver and prev_ver.get("is_ai_generated"):
-            # analyze_and_store 现在直接返回写入条数（int）
-            learned_count = analyze_and_store(tree_id, prev_version_num, new_version)
+    if prev_version_num and prev_ver and prev_ver.get("is_ai_generated"):
+        learned_count = analyze_and_store(tree_id, prev_version_num, new_version)
 
-    return {
-        "success":       True,
-        "version":       new_version,
-        "learned_count": learned_count
-    }
+    return {"success": True, "version": new_version, "learned_count": learned_count}
 
 
 @app.post("/api/tree/{tree_id}/rollback/{target_version}")
@@ -195,14 +202,14 @@ def api_get_chunk(chunk_id: int):
 
 @app.get("/api/corrections/{tree_id}")
 def api_get_corrections(tree_id: str):
-    """查看某棵树积累的修正记录，便于调试和展示学习效果。"""
-    docs = list(corrections_col.find(
-        {"tree_id": tree_id},
-        {"_id": 0}
-    ).sort("created_at", -1))
+    docs = list(corrections_col.find({"tree_id": tree_id}, {"_id": 0}).sort("created_at", -1))
     return docs
 
 
 @app.get("/")
 def root():
-    return {"message": "故障树智能生成系统运行中", "docs": "/docs"}
+    return {
+        "message": "故障树智能生成系统运行中",
+        "docs": "/docs",
+        "generate_input_example": {"prompt": "请生成一个顶事件为传感器故障的故障树，并保留溯源"},
+    }
