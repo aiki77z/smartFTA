@@ -57,8 +57,7 @@ def _load_py_module(module_name: str, file_path: Path):
 _VALIDATOR_DIR = Path(__file__).resolve().parent / "validator-service"
 if _VALIDATOR_DIR.exists():
     try:
-        # Ensure `validator-service` local imports (e.g. `import ai_validate`) work.
-        # We load those modules dynamically, so we must temporarily extend sys.path.
+        # 动态加载 validator-service/main.py（规则校验、导出图片等）
         _validator_dir_str = str(_VALIDATOR_DIR)
         _had_validator_path = _validator_dir_str in sys.path
         if not _had_validator_path:
@@ -68,17 +67,10 @@ if _VALIDATOR_DIR.exists():
             "validator_service_main",
             _VALIDATOR_DIR / "main.py",
         )
-        _validator_ai = _load_py_module(
-            "validator_service_ai_validate",
-            _VALIDATOR_DIR / "ai_validate.py",
-        )
 
         # Re-export legacy endpoints for existing frontend compatibility:
         # - POST /validate-fault-tree
-        # - POST /ai-validate-fault-tree
         # - POST /export-fault-tree-image
-        app.include_router(_validator_ai.router)
-
         @app.post("/validate-fault-tree")
         def validate_fault_tree(payload: _validator_main.ValidateRequest):  # type: ignore[name-defined]
             return _validator_main.validate_fault_tree(payload)  # type: ignore[attr-defined]
