@@ -14,12 +14,16 @@ main.py —— FastAPI 接口入口（v3）
 """
 
 import uuid
+import importlib.util
+import sys
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from generator import generate_fault_tree, parse_user_prompt
-from validator import validate_full
+from validator import validate_full, validate_semantics
 from database import (
     create_tree,
     save_version,
@@ -41,6 +45,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _load_py_module(module_name: str, file_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载模块：{module_name}（path={file_path}）")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+# ---- Optional: merge validator-service into this backend (same uvicorn port) ----
+_VALIDATOR_DIR = Path(__file__).resolve().parent / "validator-service"
+if _VALIDATOR_DIR.exists():
+    try:
+        # Ensure `validator-service` local imports (e.g. `import ai_validate`) work.
+        # We load those modules dynamically, so we must temporarily extend sys.path.
+        _validator_dir_str = str(_VALIDATOR_DIR)
+        _had_validator_path = _validator_dir_str in sys.path
+        if not _had_validator_path:
+            sys.path.insert(0, _validator_dir_str)
+
+        _validator_main = _load_py_module(
+            "validator_service_main",
+            _VALIDATOR_DIR / "main.py",
+        )
+        _validator_ai = _load_py_module(
+            "validator_service_ai_validate",
+            _VALIDATOR_DIR / "ai_validate.py",
+        )
+
+        # Re-export legacy endpoints for existing frontend compatibility:
+        # - POST /validate-fault-tree
+        # - POST /ai-validate-fault-tree
+        # - POST /export-fault-tree-image
+        app.include_router(_validator_ai.router)
+
+        @app.post("/validate-fault-tree")
+        def validate_fault_tree(payload: _validator_main.ValidateRequest):  # type: ignore[name-defined]
+            return _validator_main.validate_fault_tree(payload)  # type: ignore[attr-defined]
+
+        @app.post("/export-fault-tree-image")
+        async def export_fault_tree_image(payload: _validator_main.ExportImageRequest):  # type: ignore[name-defined]
+            try:
+                return await _validator_main.export_fault_tree_image(payload)  # type: ignore[attr-defined]
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+    except Exception as e:
+        # Do not fail main backend if validator-service is present but broken.
+        # The core /api/tree/* routes should still work.
+        print(f"[warn] validator-service merge failed: {e}")
+    finally:
+        # Avoid permanently polluting sys.path in case other imports shadow.
+        try:
+            if "_validator_dir_str" in locals() and not locals().get("_had_validator_path", True):
+                sys.path = [p for p in sys.path if p != locals()["_validator_dir_str"]]
+        except Exception:
+            pass
+
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -55,6 +118,9 @@ class SaveRequest(BaseModel):
 class ValidateRequest(BaseModel):
     tree_data: dict
 
+
+class SemanticValidateRequest(BaseModel):
+    tree_data: dict
 
 @app.post("/api/tree/generate")
 def api_generate(req: GenerateRequest):
@@ -189,6 +255,30 @@ def api_history(tree_id: str):
 @app.post("/api/tree/validate")
 def api_validate(req: ValidateRequest):
     return validate_full(req.tree_data)
+
+
+@app.post("/api/tree/validate/semantic")
+def api_validate_semantic(req: SemanticValidateRequest):
+    """
+    仅做 AI 语义校验（调用 validator.py 的 validate_semantics）。
+    前端用于“手动点击校验按钮后”刷新 AI 校验结果，不影响保存流程。
+    """
+    try:
+        issues = validate_semantics(req.tree_data) or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI语义校验失败：{str(e)}")
+
+    # validate_semantics 约束 level 主要为 WARNING/INFO；这里仍按通用格式统计
+    error_count = sum(1 for i in issues if getattr(i, "level", "") == "ERROR")
+    warning_count = sum(1 for i in issues if getattr(i, "level", "") == "WARNING")
+    info_count = sum(1 for i in issues if getattr(i, "level", "") == "INFO")
+    return {
+        "passed": error_count == 0,
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "info_count": info_count,
+        "issues": [i.to_dict() for i in issues],
+    }
 
 
 @app.get("/api/chunk/{chunk_id}")

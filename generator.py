@@ -21,7 +21,7 @@ from validator import validate_full
 client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 MAX_RETRY = 2
-MAX_CHUNKS_FOR_PROMPT = 8
+MAX_CHUNKS_FOR_PROMPT = 15
 MAX_CHUNK_CHARS = 280
 MAX_JSON_REPAIR_RETRY = 1
 
@@ -139,9 +139,9 @@ def extract_fault_elements(top_event: str, chunks: list) -> dict:
 顶事件：{top_event}
 
 ## 提取规则
-1. 顶事件（top_event）：即给定的故障现象，只有一个
-2. 中间事件（intermediate_event）：可以继续向下分解的中间原因
-3. 底事件（basic_event）：最根本原因，不可再分，必须是具体可检测的故障
+1. 顶事件（top_event）：即给定的故障现象，只有一个，必须要有子事件节点
+2. 中间事件（intermediate_event）：可以继续向下分解的中间原因，必须要有子事件节点。如果没有子事件节点就必须降级为 basic_event。
+3. 底事件（basic_event）：最根本原因，不可再分，必须是具体可检测的故障，不能有子事件节点
 4. gate=OR：任一子事件发生就导致父事件
 5. gate=AND：所有子事件同时发生才导致父事件
 6. rules：每个事件的触发条件，如"电流超过额定值""温度持续超过85℃"，无量化条件可描述文字
@@ -247,7 +247,7 @@ def build_fault_tree(top_event: str, elements: dict, chunks: list, requirements:
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=5200,
+        max_tokens=8192,
     )
     return _parse_json(response.choices[0].message.content)
 
@@ -292,7 +292,7 @@ def repair_fault_tree(draft_tree: dict, corrections_hint: str, chunks: list) -> 
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
-        max_tokens=5200,
+        max_tokens=8192,
     )
     return _parse_json(response.choices[0].message.content)
 
@@ -339,6 +339,22 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
             f"[生成] 草稿校验失败，ERROR={validation['error_count']}，"
             f"{'重试中...' if attempt <= MAX_RETRY else '已达最大重试次数'}"
         )
+        # 调试输出：打印 ERROR 级别的校验问题，便于定位生成失败原因
+        try:
+            err_issues = [i for i in (validation.get("issues") or []) if i.get("level") == "ERROR"]
+            if err_issues:
+                print("[生成] 草稿结构校验 ERROR 详情：")
+                for idx, iss in enumerate(err_issues, start=1):
+                    code = iss.get("code", "")
+                    msg = iss.get("message", "")
+                    node_id = iss.get("node_id", "") or iss.get("nodeId", "")
+                    node_name = iss.get("node_name", "") or iss.get("nodeName", "")
+                    where = " ".join([p for p in [node_name, node_id] if p])
+                    suffix = f"（{where}）" if where else ""
+                    print(f"  - [{idx}] {code}: {msg}{suffix}")
+        except Exception as _e:
+            # 避免调试输出影响主流程
+            pass
         previous_issues = validation["issues"]
 
     final_tree = draft_tree

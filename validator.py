@@ -19,6 +19,9 @@ from openai import OpenAI
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 import json
 import re
+import importlib.util
+import sys
+from pathlib import Path
 
 client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
@@ -30,6 +33,8 @@ class ValidationIssue:
     message:   str
     node_id:   str = ""
     node_name: str = ""
+    # 来源标记：logic=代码规则校验，ai=大模型语义校验
+    source:    Literal["logic", "ai"] = "logic"
 
     def to_dict(self):
         return {
@@ -37,9 +42,161 @@ class ValidationIssue:
             "code":      self.code,
             "message":   self.message,
             "node_id":   self.node_id,
-            "node_name": self.node_name
+            "node_name": self.node_name,
+            "source":    self.source,
         }
 
+
+def _load_py_module(module_name: str, file_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载模块：{module_name}（path={file_path}）")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _tree_to_validator_service_graph(tree_data: dict) -> dict:
+    """
+    将 {nodeList, linkList} 转成 validator-service `/validate-fault-tree` 的 graph 格式：
+      - 节点类型：top/intermediate/basic/gate
+      - 通过“合成 gate 节点”的方式表达 AND/OR（validator-service 规则依赖 gate 子节点）
+      - 边方向：child -> parent
+    """
+    node_list = tree_data.get("nodeList", []) or []
+    link_list = tree_data.get("linkList", []) or []
+
+    nodes_by_id = {str(n.get("id")): n for n in node_list if n.get("id") is not None}
+
+    def map_type(t: str) -> str:
+        if t == "top_event":
+            return "top"
+        if t == "intermediate_event":
+            return "intermediate"
+        if t == "basic_event":
+            return "basic"
+        # fallback：未知当中间事件处理
+        return "intermediate"
+
+    # 原始 child->parent 关系（事件节点之间）
+    parents_of = {}
+    children_of = {}
+    for l in link_list:
+        child = str(l.get("sourceId", ""))
+        parent = str(l.get("targetId", ""))
+        if not child or not parent:
+            continue
+        if child not in nodes_by_id or parent not in nodes_by_id:
+            continue
+        parents_of.setdefault(child, []).append(parent)
+        children_of.setdefault(parent, []).append(child)
+
+    graph_nodes = []
+    graph_edges = []
+
+    # 先放入事件节点（不含 gate）
+    for nid, n in nodes_by_id.items():
+        t = str(n.get("type") or "")
+        graph_nodes.append(
+            {
+                "id": nid,
+                "label": n.get("name") or nid,
+                "type": map_type(t),
+                # validator-service 的 event 完整性检查优先读 node.event，其次读 node.meta.event
+                "event": n.get("event"),
+                "meta": {"event": n.get("event")} if n.get("event") is not None else {},
+            }
+        )
+
+    # 为“确实有子事件”的非 basic 事件合成 gate 节点，并把 child->parent 改写为 child->gate、gate->parent
+    # validator-service 通过“是否存在 gate 子节点”判断逻辑门是否定义，因此必须合成。
+    # 注意：如果一个 intermediate 节点没有任何子事件，它必须在规则校验中报错（叶子必须是 basic），
+    # 因此这里不能给“无子事件”的 intermediate 强行合成 gate，否则会导致错误通过。
+    for nid, n in nodes_by_id.items():
+        t = str(n.get("type") or "")
+        if t == "basic_event":
+            continue
+
+        # 没有任何子事件时，不应创建 gate（保持 validator-service 的 leaf intermediate 报错能力）
+        if not (children_of.get(nid) or []):
+            continue
+
+        gate_value = n.get("gate")
+        gate_str = None
+        if isinstance(gate_value, str):
+            g = gate_value.strip().upper()
+            gate_str = g if g in ("AND", "OR") else "OR"
+        else:
+            # gate 可能是 None / 数字 / 其它，按 OR 兜底
+            gate_str = "OR"
+
+        gate_id = f"{nid}__gate"
+        graph_nodes.append({"id": gate_id, "label": gate_str, "type": "gate"})
+
+        # gate -> parent（在 validator-service 的 children_map 中 gate 作为 parent 的子节点）
+        graph_edges.append({"id": f"{gate_id}->{nid}", "source": gate_id, "target": nid})
+
+        # child -> gate
+        for child_id in children_of.get(nid, []) or []:
+            graph_edges.append(
+                {
+                    "id": f"{child_id}->{gate_id}",
+                    "source": child_id,
+                    "target": gate_id,
+                }
+            )
+
+    return {"nodes": graph_nodes, "edges": graph_edges}
+
+
+def validate_structure_via_validator_service(tree_data: dict) -> list:
+    """
+    使用 validator-service 的规则引擎进行结构/逻辑校验，返回 ValidationIssue 列表（source=logic）。
+    若 validator-service 不存在/加载失败，则回退到本文件内置的 validate_structure 规则。
+    """
+    base_dir = Path(__file__).resolve().parent
+    validator_dir = base_dir / "validator-service"
+    if not validator_dir.exists():
+        return validate_structure(tree_data)
+
+    # 动态加载 validator-service/main.py，并保证其 `import ai_validate` 可以成功
+    validator_dir_str = str(validator_dir)
+    had_path = validator_dir_str in sys.path
+    if not had_path:
+        sys.path.insert(0, validator_dir_str)
+    try:
+        mod = _load_py_module("validator_service_main_for_backend", validator_dir / "main.py")
+
+        graph = _tree_to_validator_service_graph(tree_data)
+        payload = {"graph": graph}
+
+        # 直接调用其校验函数（同步）
+        out = mod.validate_fault_tree(mod.ValidateRequest(**payload))
+        validation = out.get("validation") or {}
+        raw_issues = validation.get("issues") or []
+
+        issues = []
+        for it in raw_issues:
+            issues.append(
+                ValidationIssue(
+                    level=(it.get("level") or "WARNING"),
+                    code=(it.get("code") or "STRUCT_ISSUE"),
+                    message=(it.get("message") or ""),
+                    node_id="",
+                    node_name=",".join(it.get("node_ids") or []),
+                    source="logic",
+                )
+            )
+        return issues
+    except Exception:
+        # 出现任何问题都回退到内置规则，保证生成流程不断
+        return validate_structure(tree_data)
+    finally:
+        if not had_path:
+            try:
+                sys.path = [p for p in sys.path if p != validator_dir_str]
+            except Exception:
+                pass
 
 def validate_structure(tree_data: dict) -> list:
     issues = []
@@ -274,19 +431,27 @@ level只能是 WARNING 或 INFO。
                 level=i.get("level", "WARNING"),
                 code=i.get("code", "SEMANTIC_ISSUE"),
                 message=i.get("message", ""),
-                node_name=i.get("node_name", "")
+                node_name=i.get("node_name", ""),
+                source="ai",
             )
             for i in items
         ]
     except Exception as e:
-        return [ValidationIssue("INFO", "SEMANTIC_CHECK_FAILED",
-                                f"语义校验未能完成（{str(e)}），建议人工复查")]
+        return [
+            ValidationIssue(
+                "INFO",
+                "SEMANTIC_CHECK_FAILED",
+                f"语义校验未能完成（{str(e)}），建议人工复查",
+                source="ai",
+            )
+        ]
 
 
 def validate_full(tree_data: dict, skip_semantic: bool = False) -> dict:
     all_issues = []
 
-    struct_issues = validate_structure(tree_data)
+    # 结构/逻辑校验：优先使用 validator-service 的规则引擎（合并后同仓库），失败则回退到内置规则
+    struct_issues = validate_structure_via_validator_service(tree_data)
     all_issues.extend(struct_issues)
 
     has_error = any(i.level == "ERROR" for i in struct_issues)
