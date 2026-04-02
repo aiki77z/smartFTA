@@ -1,0 +1,611 @@
+{
+  "tree_id": "ft_4466e917",
+  "version": 1,
+  "is_ai_generated": true,
+  "created_at": "2026-04-02T20:12:53.119000",
+  "editor": "AI",
+  "description": "AI初始生成（由prompt提取顶事件：驱动系统故障）",
+  "tree_data": {
+    "nodeList": [
+      {
+        "type": "top_event",
+        "gate": "OR",
+        "name": "驱动系统故障",
+        "id": "node-1a2b3c4d",
+        "transfer": "",
+        "event": null
+      },
+      {
+        "type": "intermediate_event",
+        "gate": "OR",
+        "name": "控制单元(CU)故障",
+        "id": "node-5e6f7g8h",
+        "transfer": "",
+        "event": {
+          "id": "E001",
+          "name": "控制单元(CU)故障",
+          "description": "核心控制模块故障，涉及软件、通讯、安全监控等分支，导致系统无法正常接收指令或处理信号。",
+          "errorLevel": "高",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "CU状态字/故障代码",
+              "symbol": "!=",
+              "thresholds": [
+                "正常"
+              ],
+              "duration": "瞬时或持续"
+            }
+          ],
+          "investigateMethod": "检查软件状态、参数配置、通讯链路及安全监控信号。",
+          "documents": [
+            {
+              "chunk_id": 1,
+              "chunk_name": "CU故障分析核心中间事件节点",
+              "section_path": "1.1.0",
+              "source_page": 9
+            }
+          ]
+        }
+      },
+      {
+        "type": "intermediate_event",
+        "gate": "OR",
+        "name": "功率单元故障",
+        "id": "node-9i0j1k2l",
+        "transfer": "",
+        "event": {
+          "id": "E002",
+          "name": "功率单元故障",
+          "description": "承担电能转换与传输的硬件单元故障，可能导致系统停机或输出异常。",
+          "errorLevel": "高",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "功率单元故障标志",
+              "symbol": "==",
+              "thresholds": [
+                "激活"
+              ],
+              "duration": "瞬时或持续"
+            }
+          ],
+          "investigateMethod": "检查过流、过热、过载信号，测量功率器件状态。",
+          "documents": [
+            {
+              "chunk_id": 2,
+              "chunk_name": "功率单元故障",
+              "section_path": "1.1.0",
+              "source_page": 11
+            }
+          ]
+        }
+      },
+      {
+        "type": "intermediate_event",
+        "gate": "OR",
+        "name": "液压模块(HLA)故障",
+        "id": "node-3m4n5o6p",
+        "transfer": "",
+        "event": {
+          "id": "E003",
+          "name": "液压模块(HLA)故障",
+          "description": "液压驱动配置中的模块故障，导致断流阀控制或压力调节异常，引发执行机构动作异常。",
+          "errorLevel": "中",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "HLA故障状态/反馈信号",
+              "symbol": "==",
+              "thresholds": [
+                "异常"
+              ],
+              "duration": "瞬时或持续"
+            }
+          ],
+          "investigateMethod": "检查断流阀连接、控制信号及压力/位置反馈。",
+          "documents": [
+            {
+              "chunk_id": 4,
+              "chunk_name": "液压模块故障",
+              "section_path": "1.1.0",
+              "source_page": 15
+            }
+          ]
+        }
+      },
+      {
+        "type": "intermediate_event",
+        "gate": "OR",
+        "name": "参数配置异常",
+        "id": "node-7q8r9s0t",
+        "transfer": "",
+        "event": {
+          "id": "E004",
+          "name": "参数配置异常",
+          "description": "参数备份、复位、保存等操作不当导致参数丢失或配置错误，引发系统功能异常。",
+          "errorLevel": "中",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "参数校验结果",
+              "symbol": "==",
+              "thresholds": [
+                "不一致或错误"
+              ],
+              "duration": "持久"
+            }
+          ],
+          "investigateMethod": "核对关键参数设置与备份值，检查参数操作历史。",
+          "documents": [
+            {
+              "chunk_id": 14,
+              "chunk_name": "参数备份及复位",
+              "section_path": "1.2.0",
+              "source_page": 53
+            }
+          ]
+        }
+      },
+      {
+        "type": "intermediate_event",
+        "gate": "OR",
+        "name": "通讯交互故障",
+        "id": "node-u1v2w3x4",
+        "transfer": "",
+        "event": {
+          "id": "E005",
+          "name": "通讯交互故障",
+          "description": "CU与上位机或其他组件间通讯链路异常，导致指令无法接收或状态无法上报。",
+          "errorLevel": "中",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "通讯状态/错误计数器",
+              "symbol": ">",
+              "thresholds": [
+                "0"
+              ],
+              "duration": "持续"
+            }
+          ],
+          "investigateMethod": "利用诊断接口检查物理连接、协议配置及数据帧状态。",
+          "documents": [
+            {
+              "chunk_id": 17,
+              "chunk_name": "驱动系统诊断接口",
+              "section_path": "1.3.0",
+              "source_page": 73
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "软件运行故障",
+        "id": "node-y5z6a7b8",
+        "transfer": "",
+        "event": {
+          "id": "E006",
+          "name": "软件运行故障",
+          "description": "CU内部软件运行出错，如程序跑飞、死循环、任务超时等。",
+          "errorLevel": "高",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "软件状态标志/看门狗",
+              "symbol": "==",
+              "thresholds": [
+                "错误或触发"
+              ],
+              "duration": "瞬时"
+            }
+          ],
+          "investigateMethod": "查看CU软件运行状态字、看门狗状态。",
+          "documents": [
+            {
+              "chunk_id": 1,
+              "chunk_name": "CU故障分析核心中间事件节点",
+              "section_path": "1.1.0",
+              "source_page": 9
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "安全监控通道故障",
+        "id": "node-c9d0e1f2",
+        "transfer": "",
+        "event": {
+          "id": "E007",
+          "name": "安全监控通道故障",
+          "description": "CU负责的安全功能监控通道检测到异常，触发安全保护。",
+          "errorLevel": "高",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "安全通道状态",
+              "symbol": "==",
+              "thresholds": [
+                "故障"
+              ],
+              "duration": "瞬时或持续"
+            }
+          ],
+          "investigateMethod": "检查安全相关输入信号及安全逻辑处理单元状态。",
+          "documents": [
+            {
+              "chunk_id": 1,
+              "chunk_name": "CU故障分析核心中间事件节点",
+              "section_path": "1.1.0",
+              "source_page": 9
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "功率单元过流",
+        "id": "node-g3h4i5j6",
+        "transfer": "",
+        "event": {
+          "id": "E008",
+          "name": "功率单元过流",
+          "description": "功率单元输出电流超过硬件允许的额定值。",
+          "errorLevel": "高",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "输出电流",
+              "symbol": ">",
+              "thresholds": [
+                "额定电流"
+              ],
+              "duration": "超过保护延时"
+            }
+          ],
+          "investigateMethod": "测量电机相电流，检查电流传感器及负载状态。",
+          "documents": [
+            {
+              "chunk_id": 2,
+              "chunk_name": "功率单元故障",
+              "section_path": "1.1.0",
+              "source_page": 11
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "功率单元过热",
+        "id": "node-k7l8m9n0",
+        "transfer": "",
+        "event": {
+          "id": "E009",
+          "name": "功率单元过热",
+          "description": "功率单元散热器或关键元器件温度持续超过安全阈值。",
+          "errorLevel": "高",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "功率单元温度",
+              "symbol": ">",
+              "thresholds": [
+                "85℃（示例）"
+              ],
+              "duration": "持续"
+            }
+          ],
+          "investigateMethod": "检查散热风扇、风道，测量功率器件温度。",
+          "documents": [
+            {
+              "chunk_id": 2,
+              "chunk_name": "功率单元故障",
+              "section_path": "1.1.0",
+              "source_page": 11
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "功率电子元器件损坏",
+        "id": "node-o1p2q3r4",
+        "transfer": "",
+        "event": {
+          "id": "E010",
+          "name": "功率电子元器件损坏",
+          "description": "IGBT、二极管等功率开关器件因过压、过流、过热等原因发生物理损坏。",
+          "errorLevel": "高",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "器件电气特性",
+              "symbol": "==",
+              "thresholds": [
+                "开路、短路或参数超差"
+              ],
+              "duration": "持久"
+            }
+          ],
+          "investigateMethod": "使用万用表、示波器进行离线静态测试。",
+          "documents": [
+            {
+              "chunk_id": 2,
+              "chunk_name": "功率单元故障",
+              "section_path": "1.1.0",
+              "source_page": 11
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "断流阀连接故障",
+        "id": "node-s5t6u7v8",
+        "transfer": "",
+        "event": {
+          "id": "E011",
+          "name": "断流阀连接故障",
+          "description": "液压模块与断流阀之间的物理连接松动、断路或短路。",
+          "errorLevel": "中",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "连接电阻/通断性",
+              "symbol": "==",
+              "thresholds": [
+                "断路或短路"
+              ],
+              "duration": "持久"
+            }
+          ],
+          "investigateMethod": "检查控制电缆及接插件，进行通断性和绝缘测试。",
+          "documents": [
+            {
+              "chunk_id": 4,
+              "chunk_name": "液压模块故障",
+              "section_path": "1.1.0",
+              "source_page": 15
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "液压反馈信号异常",
+        "id": "node-w9x0y1z2",
+        "transfer": "",
+        "event": {
+          "id": "E012",
+          "name": "液压反馈信号异常",
+          "description": "液压模块接收到的压力、位置等反馈信号超出有效范围或信号丢失。",
+          "errorLevel": "中",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "反馈信号值",
+              "symbol": "<或>",
+              "thresholds": [
+                "量程下限",
+                "量程上限"
+              ],
+              "duration": "持续"
+            }
+          ],
+          "investigateMethod": "测量反馈传感器供电及信号输出值。",
+          "documents": [
+            {
+              "chunk_id": 4,
+              "chunk_name": "液压模块故障",
+              "section_path": "1.1.0",
+              "source_page": 15
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "参数保存操作不当(p0977=1)",
+        "id": "node-a3b4c5d6",
+        "transfer": "",
+        "event": {
+          "id": "E013",
+          "name": "参数保存操作不当(p0977=1)",
+          "description": "执行参数保存操作时发生中断、断电或操作错误，导致参数存储不完整。",
+          "errorLevel": "中",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "参数保存操作状态",
+              "symbol": "==",
+              "thresholds": [
+                "中断或异常完成"
+              ],
+              "duration": "瞬时"
+            }
+          ],
+          "investigateMethod": "检查参数备份记录，对比当前参数与标准备份。",
+          "documents": [
+            {
+              "chunk_id": 14,
+              "chunk_name": "参数备份及复位",
+              "section_path": "1.2.0",
+              "source_page": 53
+            }
+          ]
+        }
+      },
+      {
+        "type": "basic_event",
+        "gate": null,
+        "name": "诊断接口通讯故障",
+        "id": "node-e7f8g9h0",
+        "transfer": "",
+        "event": {
+          "id": "E014",
+          "name": "诊断接口通讯故障",
+          "description": "用于故障诊断的特定接口物理或协议层通讯中断。",
+          "errorLevel": "低",
+          "priority": 0,
+          "probability": 1e-8,
+          "showProbability": 0.000001,
+          "rules": [
+            {
+              "deviceTypeId": "",
+              "measurePointName": "诊断接口链路状态",
+              "symbol": "==",
+              "thresholds": [
+                "断开"
+              ],
+              "duration": "持续"
+            }
+          ],
+          "investigateMethod": "检查诊断接口电缆、连接器，使用协议分析工具。",
+          "documents": [
+            {
+              "chunk_id": 17,
+              "chunk_name": "驱动系统诊断接口",
+              "section_path": "1.3.0",
+              "source_page": 73
+            }
+          ]
+        }
+      }
+    ],
+    "linkList": [
+      {
+        "type": "link",
+        "sourceId": "node-5e6f7g8h",
+        "targetId": "node-1a2b3c4d",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-9i0j1k2l",
+        "targetId": "node-1a2b3c4d",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-3m4n5o6p",
+        "targetId": "node-1a2b3c4d",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-y5z6a7b8",
+        "targetId": "node-5e6f7g8h",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-c9d0e1f2",
+        "targetId": "node-5e6f7g8h",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-7q8r9s0t",
+        "targetId": "node-5e6f7g8h",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-u1v2w3x4",
+        "targetId": "node-5e6f7g8h",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-g3h4i5j6",
+        "targetId": "node-9i0j1k2l",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-k7l8m9n0",
+        "targetId": "node-9i0j1k2l",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-o1p2q3r4",
+        "targetId": "node-9i0j1k2l",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-s5t6u7v8",
+        "targetId": "node-3m4n5o6p",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-w9x0y1z2",
+        "targetId": "node-3m4n5o6p",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-a3b4c5d6",
+        "targetId": "node-7q8r9s0t",
+        "isCondition": false
+      },
+      {
+        "type": "link",
+        "sourceId": "node-e7f8g9h0",
+        "targetId": "node-u1v2w3x4",
+        "isCondition": false
+      }
+    ]
+  }
+}

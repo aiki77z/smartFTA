@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
+import { generateTree } from '../api/ftaBackend.js'
 import {
   clearProjectReviewed,
   DEFAULT_WORKSPACE_MESSAGES,
@@ -151,6 +152,8 @@ function HomePage() {
   const [resultItems, setResultItems] = useState([])
   const [workspaceReady, setWorkspaceReady] = useState(false)
   const [previewModalOpen, setPreviewModalOpen] = useState(false)
+  const [generating, setGenerating] = useState(false)
+  const [generateError, setGenerateError] = useState('')
   const skipTitleBlurRef = useRef(false)
   /** 仅内存：上传的 File 对象，用于本地预览；不写入 localStorage */
   const fileObjectStoreRef = useRef(new Map())
@@ -301,27 +304,50 @@ function HomePage() {
     handleProjectNameSave()
   }
 
-  const handleSend = () => {
+  const handleSend = async () => {
     const text = chatInput.trim()
     if (!text) return
 
-    const topEvent = extractTopEvent(text)
-    const faultTreeId = `ft-${Date.now()}`
-    const assistantReply = `已为您生成顶事件为${topEvent}的故障树`
     const now = Date.now()
 
     clearProjectReviewed(projectId)
 
-    setMessages((prev) => [
-      ...prev,
-      { id: `u-${now}`, role: 'user', content: text, at: now },
-      { id: `a-${now + 1}`, role: 'assistant', content: assistantReply },
-    ])
-    setResultItems((prev) => [
-      { id: `r-${now}`, faultTreeId, title: topEvent, createdAt: now },
-      ...prev,
-    ])
-    setChatInput('')
+    setGenerating(true)
+    setGenerateError('')
+    setMessages((prev) => [...prev, { id: `u-${now}`, role: 'user', content: text, at: now }])
+
+    try {
+      const resp = await generateTree({ prompt: text })
+      const topEvent = resp?.parsed_prompt?.top_event || extractTopEvent(text)
+      const treeId = resp?.tree_id || `ft-${Date.now()}`
+      const assistantReply = `已为您生成顶事件为${topEvent}的故障树（ID：${treeId}）`
+
+      setMessages((prev) => [
+        ...prev,
+        { id: `a-${now + 1}`, role: 'assistant', content: assistantReply },
+      ])
+      setResultItems((prev) => [
+        { id: `r-${now}`, faultTreeId: treeId, title: topEvent, createdAt: now },
+        ...prev,
+      ])
+      setChatInput('')
+    } catch (e) {
+      const topEvent = extractTopEvent(text)
+      const faultTreeId = `ft-${Date.now()}`
+      const assistantReply = `后端生成失败，已为您创建演示用结果（顶事件：${topEvent}）。`
+      setGenerateError(e?.message || '后端生成失败')
+      setMessages((prev) => [
+        ...prev,
+        { id: `a-${now + 1}`, role: 'assistant', content: assistantReply },
+      ])
+      setResultItems((prev) => [
+        { id: `r-${now}`, faultTreeId, title: topEvent, createdAt: now },
+        ...prev,
+      ])
+      setChatInput('')
+    } finally {
+      setGenerating(false)
+    }
   }
 
   return (
@@ -482,11 +508,18 @@ function HomePage() {
               onChange={(e) => setChatInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSend()}
               placeholder="请输入你的需求..."
+              disabled={generating}
             />
-            <button type="button" className="home-send-btn" onClick={handleSend}>
-              发送
+            <button
+              type="button"
+              className="home-send-btn"
+              onClick={handleSend}
+              disabled={generating || !chatInput.trim()}
+            >
+              {generating ? '生成中…' : '发送'}
             </button>
           </div>
+          {generateError && <div className="home-chat-error">后端错误：{generateError}</div>}
         </section>
 
         <section className="home-panel home-panel--right">

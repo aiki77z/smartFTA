@@ -419,6 +419,18 @@ export function changeEventDescription(graphData, nodeId, newDescription) {
   return { ...graphData, nodes, edges: graphData.edges }
 }
 
+export function patchEventFields(graphData, nodeId, patch = {}) {
+  const nodes = graphData.nodes.map((n) => {
+    if (n.id !== nodeId) return n
+    if (n.type === 'gate') return n
+    const meta = n.meta ? { ...n.meta } : {}
+    const event = meta.event ? { ...meta.event } : {}
+    meta.event = { ...event, ...patch }
+    return { ...n, meta }
+  })
+  return { ...graphData, nodes, edges: graphData.edges }
+}
+
 export function insertGate(graphData, parentId, gateType = 'OR') {
   let nodes = [...graphData.nodes]
   let edges = [...graphData.edges]

@@ -494,6 +494,18 @@ button.home-file-card {
   gap: 0.45rem;
 }
 
+.home-chat-error {
+  margin-top: 0.55rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid rgba(244, 63, 94, 0.25);
+  background: rgba(244, 63, 94, 0.06);
+  color: #9f1239;
+  border-radius: 12px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
 .home-chat-input {
   flex: 1;
   border: 1px solid var(--home-border);
