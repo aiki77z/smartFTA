@@ -357,7 +357,11 @@ async def export_fault_tree_image(req: ExportImageRequest) -> Response:
     )
     page = await context.new_page()
 
-    await page.goto(req.url, wait_until='networkidle')
+    # 先加载页面并记录 HTTP 状态，避免 431 等错误导致页面未渲染。
+    # 这里尽量给足时间，React + 资源加载仍可能较慢。
+    goto_resp = await page.goto(req.url, wait_until='networkidle', timeout=30000)
+    if goto_resp is not None and goto_resp.status >= 400:
+      raise RuntimeError(f'访问 {req.url} 失败，HTTP {goto_resp.status}')
 
     # 根据请求主题强制设置前端模式（保持与当前 Web 一致），
     # 直接修改根元素的 class，避免依赖按钮文案或默认状态。
@@ -400,6 +404,17 @@ async def export_fault_tree_image(req: ExportImageRequest) -> Response:
 
     # 默认只截取故障树画布容器（.fta-canvas-wrapper），并隐藏内部交互控件
     target_selector = req.selector or '.fta-canvas-wrapper'
+    # React 页面是前端渲染，wait_until='networkidle' 不能保证目标节点已挂载完成。
+    # 这里显式等待容器出现，避免“未找到选择器”导致截图失败。
+    try:
+      await page.wait_for_selector(target_selector, timeout=30000)
+    except Exception as exc:
+      await context.close()
+      await browser.close()
+      raise RuntimeError(
+        f'未找到选择器 {target_selector} 对应的元素（url={req.url}）: {exc}'
+      ) from exc
+
     el = await page.query_selector(target_selector)
     if not el:
       await context.close()

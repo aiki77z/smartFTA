@@ -14,6 +14,123 @@ import '../styles/home.css'
 
 const DEFAULT_TOP_EVENT = '示例设备总故障'
 
+function getPreviewKind(fileName, mimeType = '') {
+  const lower = (fileName || '').toLowerCase()
+  if (lower.endsWith('.txt') || mimeType === 'text/plain') return 'txt'
+  if (lower.endsWith('.pdf') || mimeType === 'application/pdf') return 'pdf'
+  return 'unsupported'
+}
+
+function FileContentPreview({ fileMeta, fileObject, hasAnyFiles, variant = 'inline' }) {
+  const [textContent, setTextContent] = useState('')
+  const [textError, setTextError] = useState('')
+  const [textLoading, setTextLoading] = useState(false)
+  const [pdfObjectUrl, setPdfObjectUrl] = useState('')
+  const isModal = variant === 'modal'
+
+  const kind = useMemo(
+    () => getPreviewKind(fileMeta?.name, fileObject?.type),
+    [fileMeta?.name, fileObject?.type],
+  )
+
+  useEffect(() => {
+    setTextContent('')
+    setTextError('')
+    setTextLoading(false)
+    setPdfObjectUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return ''
+    })
+
+    if (!fileMeta || !fileObject) return undefined
+
+    if (kind === 'txt') {
+      setTextLoading(true)
+      const reader = new FileReader()
+      reader.onload = () => {
+        setTextContent(typeof reader.result === 'string' ? reader.result : '')
+        setTextLoading(false)
+      }
+      reader.onerror = () => {
+        setTextError('无法读取该文本文件')
+        setTextLoading(false)
+      }
+      reader.readAsText(fileObject, 'UTF-8')
+      return undefined
+    }
+
+    if (kind === 'pdf') {
+      const url = URL.createObjectURL(fileObject)
+      setPdfObjectUrl(url)
+      return () => {
+        URL.revokeObjectURL(url)
+      }
+    }
+
+    return undefined
+  }, [fileMeta?.id, fileObject, kind])
+
+  const phCls = `home-file-preview-placeholder${isModal ? ' home-file-preview-placeholder--modal' : ''}`
+  const errCls = `home-file-preview-error${isModal ? ' home-file-preview-error--modal' : ''}`
+
+  if (!fileMeta) {
+    return (
+      <div className={phCls}>
+        {hasAnyFiles
+          ? '请点击上方某个文件查看内容。'
+          : '请先上传文件，再点击列表中的文件即可在此预览（支持 .txt / .pdf）。'}
+      </div>
+    )
+  }
+
+  if (!fileObject) {
+    return (
+      <div className={phCls}>
+        该文件仅有记录（例如刷新页面后从本地恢复），无法预览原文。请重新上传该文件后再试。
+      </div>
+    )
+  }
+
+  if (kind === 'unsupported') {
+    return (
+      <div className={phCls}>
+        暂不支持预览此格式。当前仅支持 <strong>.txt</strong> 与 <strong>.pdf</strong>。
+      </div>
+    )
+  }
+
+  if (kind === 'txt') {
+    if (textLoading) {
+      return <div className={phCls}>正在加载文本…</div>
+    }
+    if (textError) {
+      return <div className={errCls}>{textError}</div>
+    }
+    return (
+      <pre
+        className={`home-file-preview-text${isModal ? ' home-file-preview-text--modal' : ''}`}
+      >
+        {textContent || '（文件为空）'}
+      </pre>
+    )
+  }
+
+  if (kind === 'pdf') {
+    if (!pdfObjectUrl) {
+      return <div className={phCls}>正在加载 PDF…</div>
+    }
+    return (
+      <iframe
+        title={`PDF 预览：${fileMeta.name}`}
+        className={`home-file-preview-iframe${isModal ? ' home-file-preview-iframe--modal' : ''}`}
+        src={`${pdfObjectUrl}#view=FitH`}
+      />
+    )
+  }
+
+  return null
+}
+
 function extractTopEvent(input) {
   const text = input.trim()
   if (!text) return DEFAULT_TOP_EVENT
@@ -26,17 +143,23 @@ function HomePage() {
   const navigate = useNavigate()
   const { projectId = '' } = useParams()
   const [files, setFiles] = useState([])
+  const [selectedFileId, setSelectedFileId] = useState(null)
   const [chatInput, setChatInput] = useState('')
   const [projectName, setProjectName] = useState('')
   const [editingProjectName, setEditingProjectName] = useState(false)
   const [messages, setMessages] = useState([...DEFAULT_WORKSPACE_MESSAGES])
   const [resultItems, setResultItems] = useState([])
   const [workspaceReady, setWorkspaceReady] = useState(false)
+  const [previewModalOpen, setPreviewModalOpen] = useState(false)
   const skipTitleBlurRef = useRef(false)
+  /** 仅内存：上传的 File 对象，用于本地预览；不写入 localStorage */
+  const fileObjectStoreRef = useRef(new Map())
 
   useEffect(() => {
     if (!projectId) return
     setWorkspaceReady(false)
+    fileObjectStoreRef.current = new Map()
+    setSelectedFileId(null)
     ensureProject(projectId)
     const proj = getProjectById(projectId)
     if (proj) setProjectName(proj.name)
@@ -57,9 +180,30 @@ function HomePage() {
   }, [projectId])
 
   useEffect(() => {
+    if (!selectedFileId) return
+    if (!files.some((f) => f.id === selectedFileId)) {
+      setSelectedFileId(null)
+    }
+  }, [files, selectedFileId])
+
+  useEffect(() => {
     if (!projectId || !workspaceReady) return
     saveWorkspace(projectId, { files, messages, resultItems })
   }, [projectId, workspaceReady, files, messages, resultItems])
+
+  useEffect(() => {
+    if (!previewModalOpen) return undefined
+    const onKey = (e) => {
+      if (e.key === 'Escape') setPreviewModalOpen(false)
+    }
+    document.addEventListener('keydown', onKey)
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.body.style.overflow = prevOverflow
+    }
+  }, [previewModalOpen])
 
   useEffect(() => {
     if (!files.length) return
@@ -97,21 +241,36 @@ function HomePage() {
     const selected = Array.from(event.target.files || [])
     if (!selected.length) return
     const wasEmpty = files.length === 0
-    const incoming = selected.map((file, idx) => ({
-      id: `${Date.now()}-${idx}`,
-      name: file.name,
-      size: file.size,
-      uploadProgress: 0,
-      parseProgress: 0,
-      status: 'processing',
-    }))
+    const batchId = Date.now()
+    const incoming = selected.map((file, idx) => {
+      const id = `${batchId}-${idx}`
+      fileObjectStoreRef.current.set(id, file)
+      return {
+        id,
+        name: file.name,
+        size: file.size,
+        uploadProgress: 0,
+        parseProgress: 0,
+        status: 'processing',
+      }
+    })
     setFiles((prev) => [...incoming, ...prev])
+    setSelectedFileId(incoming[0].id)
     if (wasEmpty && incoming.length && projectId) {
       const updated = renameProjectFromFirstFile(projectId, incoming[0].name)
       if (updated) setProjectName(updated.name)
     }
     event.target.value = ''
   }
+
+  const selectedFileMeta = useMemo(
+    () => files.find((f) => f.id === selectedFileId) || null,
+    [files, selectedFileId],
+  )
+
+  const selectedFileObject = selectedFileMeta
+    ? fileObjectStoreRef.current.get(selectedFileMeta.id) || null
+    : null
 
   const handleProjectNameSave = () => {
     const updated = renameProject(projectId, projectName)
@@ -232,7 +391,14 @@ function HomePage() {
               <div className="home-empty">暂无文件。请先上传设备资料。</div>
             )}
             {files.map((file) => (
-              <article key={file.id} className="home-file-card">
+              <button
+                key={file.id}
+                type="button"
+                className={`home-file-card${
+                  file.id === selectedFileId ? ' home-file-card--selected' : ''
+                }`}
+                onClick={() => setSelectedFileId(file.id)}
+              >
                 <div className="home-file-head">
                   <span className="home-file-name">{file.name}</span>
                   <span className="home-file-size">
@@ -259,8 +425,34 @@ function HomePage() {
                     style={{ width: `${file.parseProgress}%` }}
                   />
                 </div>
-              </article>
+              </button>
             ))}
+          </div>
+
+          <div
+            className="home-file-preview-section home-file-preview-section--expandable"
+            role="button"
+            tabIndex={0}
+            aria-label="文件内容预览，点击放大查看"
+            onClick={() => setPreviewModalOpen(true)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                setPreviewModalOpen(true)
+              }
+            }}
+          >
+            <h3 className="home-file-preview-title">文件内容预览</h3>
+            <p className="home-file-preview-hint">
+              支持 .txt 与 .pdf；下方可滚动查看全文。点击本区域可放大查看。
+            </p>
+            <div className="home-file-preview-body">
+              <FileContentPreview
+                fileMeta={selectedFileMeta}
+                fileObject={selectedFileObject}
+                hasAnyFiles={files.length > 0}
+              />
+            </div>
           </div>
         </section>
 
@@ -327,6 +519,49 @@ function HomePage() {
           </div>
         </section>
       </main>
+
+      {previewModalOpen && (
+        <div
+          className="home-preview-modal-overlay"
+          role="presentation"
+          onClick={() => setPreviewModalOpen(false)}
+        >
+          <div
+            className="home-preview-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="home-preview-modal-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="home-preview-modal-header">
+              <h2 className="home-preview-modal-title" id="home-preview-modal-title">
+                文件预览
+                {selectedFileMeta?.name
+                  ? ` — ${selectedFileMeta.name}`
+                  : ''}
+              </h2>
+              <button
+                type="button"
+                className="home-preview-modal-close"
+                aria-label="关闭预览"
+                onClick={() => setPreviewModalOpen(false)}
+              >
+                ×
+              </button>
+            </header>
+            <div className="home-preview-modal-body">
+              <div className="home-preview-modal-inner">
+                <FileContentPreview
+                  variant="modal"
+                  fileMeta={selectedFileMeta}
+                  fileObject={selectedFileObject}
+                  hasAnyFiles={files.length > 0}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

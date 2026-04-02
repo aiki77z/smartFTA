@@ -15,6 +15,44 @@ const STRING_TYPE_LABEL_MAP = {
   basic_event: 'basic',
 }
 
+function normalizeEventTypeFromRaw(node) {
+  const t = node?.type
+  if (typeof t === 'string') {
+    const key = t.trim()
+    if (STRING_TYPE_LABEL_MAP[key]) return STRING_TYPE_LABEL_MAP[key]
+    // 兼容旧格式：type 是 "1"/"2"/"3" 这样的数字字符串
+    const asNum = Number(key)
+    if (Number.isFinite(asNum)) {
+      return TYPE_LABEL_MAP[asNum] || 'event'
+    }
+    const lower = key.toLowerCase()
+    if (lower === 'top_event') return 'top'
+    if (lower === 'intermediate_event') return 'intermediate'
+    if (lower === 'basic_event') return 'basic'
+    return 'event'
+  }
+  const typeCode = Number(t)
+  return TYPE_LABEL_MAP[typeCode] || 'event'
+}
+
+function normalizeGateLabelFromRaw(node) {
+  const g = node?.gate
+  if (g === null || g === undefined || g === '') return ''
+  if (typeof g === 'string') {
+    const trimmed = g.trim()
+    const u = trimmed.toUpperCase()
+    if (u === 'AND' || u === 'OR') return u
+    // 兼容旧格式：gate 是 "1"/"2" 这样的数字字符串
+    const asNum = Number(trimmed)
+    if (Number.isFinite(asNum)) {
+      return GATE_LABEL_MAP[asNum] || ''
+    }
+    return ''
+  }
+  const gateCode = Number(g)
+  return GATE_LABEL_MAP[gateCode] || ''
+}
+
 function buildGraphWithGates(baseNodes, baseEdges) {
   const nodesById = new Map(baseNodes.map((n) => [n.id, n]))
   const incomingByTarget = new Map()
@@ -101,9 +139,8 @@ export function parseRawFtaJson(raw) {
   const { nodeList, linkList } = raw
 
   const baseNodes = nodeList.map((node) => {
-    const typeCode = Number(node.type)
-    const gateCode = Number(node.gate)
-    const gateLabel = GATE_LABEL_MAP[gateCode] || ''
+    const type = normalizeEventTypeFromRaw(node)
+    const gateLabel = normalizeGateLabelFromRaw(node)
 
     const x = typeof node.x === 'number' ? node.x : 0
     const y = typeof node.y === 'number' ? node.y : 0
@@ -111,18 +148,31 @@ export function parseRawFtaJson(raw) {
     const baseLabel = node.name || (node.event && node.event.name) || node.id
     const label = baseLabel
 
+    // gateCode：兼容 number / 数字字符串 / AND|OR 字符串
+    const rawGate = node.gate
+    const gateCode = (() => {
+      if (typeof rawGate === 'number') return rawGate
+      if (typeof rawGate === 'string') {
+        const n = Number(rawGate.trim())
+        if (Number.isFinite(n)) return n
+      }
+      if (gateLabel === 'AND') return 1
+      if (gateLabel === 'OR') return 2
+      return null
+    })()
+
     return {
       id: String(node.id),
       label,
-      type: TYPE_LABEL_MAP[typeCode] || 'event',
+      type,
       position: { x, y },
       gate: gateLabel,
       meta: {
         rawType: node.type,
-        gateCode: node.gate,
+        gateCode,
         gateLabel,
         event: node.event,
-        transfer: node.transfer,
+        transfer: node.transfer ?? '',
         raw: node,
       },
     }

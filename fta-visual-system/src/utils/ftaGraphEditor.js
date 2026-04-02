@@ -618,7 +618,27 @@ export function deleteEdgeById(graphData, edgeId) {
   return { nodes, edges }
 }
 
-export function graphToRawJson(graphData, attr) {
+function resolveStringStyleGate(n, gateNode) {
+  if (n.type === 'basic') return null
+  if (gateNode && (gateNode.label === 'AND' || gateNode.label === 'OR')) {
+    return gateNode.label
+  }
+  const rawG = n.meta?.raw?.gate
+  if (rawG === null || rawG === undefined || rawG === '') {
+    return 'OR'
+  }
+  if (typeof rawG === 'string') {
+    const u = rawG.trim().toUpperCase()
+    return u === 'AND' || u === 'OR' ? u : 'OR'
+  }
+  const code = Number(rawG)
+  if (code === 1) return 'AND'
+  if (code === 2) return 'OR'
+  return 'OR'
+}
+
+export function graphToRawJson(graphData, attr, options = {}) {
+  const stringEventTypes = options.stringEventTypes === true
   const { nodes, edges } = graphData
   const eventNodes = nodes.filter((n) => n.type !== 'gate')
   const gateNodes = nodes.filter((n) => n.type === 'gate')
@@ -633,15 +653,23 @@ export function graphToRawJson(graphData, attr) {
 
   const nodeList = eventNodes.map((n) => {
     const gate = gateForEvent.get(n.id)
-    const gateCode = gate
-      ? GATE_TO_CODE[gate.label] || '2'
-      : n.meta?.gateCode || '2'
+    let typeField
+    let gateField
+    if (stringEventTypes) {
+      typeField = STRING_TYPE_FROM_LABEL[n.type] || 'basic_event'
+      gateField = resolveStringStyleGate(n, gate)
+    } else {
+      typeField = TYPE_TO_CODE[n.type] || '3'
+      gateField = gate
+        ? GATE_TO_CODE[gate.label] || '2'
+        : n.meta?.gateCode || '2'
+    }
 
     return {
-      type: TYPE_TO_CODE[n.type] || '3',
-      gate: gateCode,
+      type: typeField,
+      gate: gateField,
       name: n.label.replace(/^\[(AND|OR)\]\s*/, ''),
-      event: n.meta?.event || null,
+      event: n.meta?.event ?? null,
       x: Math.round(n.position?.x || 0),
       y: Math.round(n.position?.y || 0),
       id: n.id,

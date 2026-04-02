@@ -1498,6 +1498,25 @@
   background: #f1f5f9;
 }
 
+/* ── High-res export disabled hint ── */
+.fta-hires-disabled-hint {
+  margin-top: 0.7rem;
+  font-size: 0.72rem;
+  color: #6b7280;
+  line-height: 1.4;
+  word-break: break-word;
+  padding: 0.4rem 0.6rem;
+  border-radius: 10px;
+  background: rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+}
+
+.fta-layout--dark .fta-hires-disabled-hint {
+  color: #d1d5db;
+  background: rgba(31, 41, 55, 0.5);
+  border-color: rgba(31, 41, 55, 0.9);
+}
+
 /* 夜间主题下 AI 窗口配色 */
 .fta-layout--dark .fta-ai-panel {
   background: #020617;

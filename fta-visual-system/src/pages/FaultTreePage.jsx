@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { markProjectReviewed } from '../utils/projectStore.js'
 import FaultTreeCanvas from '../components/fta/FaultTreeCanvas.jsx'
-import rawFtaSample from '../raw-FTA/raw-FTA-4.json'
+import rawFtaSample from '../raw-FTA/raw-FTA-new.json'
 import { parseRawFtaJson, parseTreeDataJson } from '../utils/ftaParser.js'
 import {
   addChildNode,
@@ -27,9 +27,19 @@ import '../styles/fta-error-level.css'
 
 const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '基本事件' }
 const EVENT_TYPES = ['top', 'intermediate', 'basic']
+// 当快照 JSON 文本过长时，/fta-viewer?snapshot=... 可能触发 Vite 431（Request Header Fields Too Large）
+// 这里先用“文本长度”做前置限制，避免高保真导出直接失败。
+const MAX_HIRES_SNAPSHOT_JSON_LEN = 7000
 
 function normalizeToGraph(raw) {
   if (!raw) return { nodes: [], edges: [] }
+  if (
+    raw.tree_data &&
+    Array.isArray(raw.tree_data.nodeList) &&
+    Array.isArray(raw.tree_data.linkList)
+  ) {
+    return parseRawFtaJson(raw.tree_data)
+  }
   if (Array.isArray(raw.nodeList) && Array.isArray(raw.linkList)) {
     return parseRawFtaJson(raw)
   }
@@ -121,6 +131,37 @@ function FaultTreePage() {
   const VALIDATION_API_URL = 'http://localhost:8000/validate-fault-tree'
   const AI_VALIDATION_API_URL = 'http://localhost:8000/ai-validate-fault-tree'
 
+  // 高保真导出需要把故障树 JSON 放在 querystring 里（/fta-viewer?snapshot=...），
+  // 为避免 JSON 太长触发 431，这里只保留“渲染所需”的最小字段，删除 description/message 等无关内容。
+  const hiResSnapshotText = useMemo(() => {
+    const snapshot = {
+      nodes: (graphData.nodes || []).map((n) => {
+        const out = {
+          id: String(n.id),
+          label: n.label,
+          type: n.type || 'event',
+        }
+        const err =
+          n?.meta?.event?.errorLevel ??
+          n?.meta?.errorLevel ??
+          n?.meta?.level ??
+          undefined
+        if (err !== undefined) out.meta = { event: { errorLevel: err } }
+        return out
+      }),
+      edges: (graphData.edges || []).map((e, idx) => ({
+        id: e.id ? String(e.id) : `e-${idx}`,
+        source: String(e.source),
+        target: String(e.target),
+      })),
+    }
+    try {
+      return JSON.stringify(snapshot)
+    } catch {
+      return ''
+    }
+  }, [graphData.nodes, graphData.edges])
+
   useEffect(() => {
     if (!contextMenu) return
     const dismiss = () => setContextMenu(null)
@@ -144,18 +185,35 @@ function FaultTreePage() {
   const parsedInfo = useMemo(() => {
     try {
       const parsed = JSON.parse(rawJsonText)
+      if (
+        parsed.tree_data &&
+        Array.isArray(parsed.tree_data.nodeList) &&
+        Array.isArray(parsed.tree_data.linkList)
+      ) {
+        return {
+          parsed,
+          kind: 'rawFta',
+          attr: parsed.attr,
+          wrapper: parsed,
+        }
+      }
       if (Array.isArray(parsed.nodeList) && Array.isArray(parsed.linkList)) {
-        return { parsed, kind: 'rawFta', attr: parsed.attr }
+        return {
+          parsed,
+          kind: 'rawFta',
+          attr: parsed.attr,
+          wrapper: null,
+        }
       }
       if (parsed.tree_data && parsed.tree_data.nodes) {
-        return { parsed, kind: 'treeData', attr: undefined }
+        return { parsed, kind: 'treeData', attr: undefined, wrapper: null }
       }
       if (Array.isArray(parsed.nodes) && Array.isArray(parsed.edges)) {
-        return { parsed, kind: 'graph', attr: undefined }
+        return { parsed, kind: 'graph', attr: undefined, wrapper: null }
       }
-      return { parsed, kind: 'unknown', attr: undefined }
+      return { parsed, kind: 'unknown', attr: undefined, wrapper: null }
     } catch {
-      return { parsed: null, kind: 'invalid', attr: undefined }
+      return { parsed: null, kind: 'invalid', attr: undefined, wrapper: null }
     }
   }, [rawJsonText])
 
@@ -166,7 +224,22 @@ function FaultTreePage() {
       setGraphData(newGraphData)
       let nextJson
       if (parsedInfo.kind === 'rawFta' && parsedInfo.parsed) {
-        nextJson = graphToRawJson(newGraphData, parsedInfo.attr)
+        const core = graphToRawJson(newGraphData, parsedInfo.attr, {
+          stringEventTypes: !!parsedInfo.wrapper,
+        })
+        if (parsedInfo.wrapper) {
+          const w = parsedInfo.wrapper
+          nextJson = {
+            ...w,
+            tree_data: {
+              ...w.tree_data,
+              nodeList: core.nodeList,
+              linkList: core.linkList,
+            },
+          }
+        } else {
+          nextJson = core
+        }
       } else if (parsedInfo.kind === 'treeData' && parsedInfo.parsed) {
         nextJson = graphToTreeDataJson(newGraphData, parsedInfo.parsed)
       } else if (parsedInfo.kind === 'graph' && parsedInfo.parsed) {
@@ -273,7 +346,8 @@ function FaultTreePage() {
   const handleDownloadHiResImage = useCallback(async () => {
     try {
       const origin = window.location.origin
-      const snapParam = encodeURIComponent(rawJsonText)
+      // 高保真导出使用“修剪后的 snapshot”，避免把 description/message 等无关字段塞进 URL 导致 431
+      const snapParam = encodeURIComponent(hiResSnapshotText)
       const url = `${origin}/fta-viewer?snapshot=${snapParam}`
       const resp = await fetch('http://localhost:8000/export-fault-tree-image', {
         method: 'POST',
@@ -301,7 +375,7 @@ function FaultTreePage() {
       console.error(e)
       setError(e.message || '高保真图片导出失败')
     }
-  }, [rawJsonText, theme])
+  }, [hiResSnapshotText, theme])
 
   const handleSubmit = useCallback(async () => {
     if (!validation || validation.error_count > 0) return
@@ -571,6 +645,8 @@ function FaultTreePage() {
     () => graphData.nodes.length > 0,
     [graphData.nodes.length],
   )
+
+  const hiResDisabled = hiResSnapshotText.length > MAX_HIRES_SNAPSHOT_JSON_LEN
 
   const selectedMeta = selectedNode?.data?.meta
 
@@ -1026,6 +1102,8 @@ function FaultTreePage() {
             setExportModalOpen(false)
             handleDownloadHiResImage()
           }}
+          disableHiRes={hiResDisabled}
+          hiResHint={`当前故障树快照过长（修剪后长度 ${hiResSnapshotText.length} > ${MAX_HIRES_SNAPSHOT_JSON_LEN}），高保真导出可能失败。建议减少节点信息或使用“快速导出”。`}
         />
       )}
     </div>
@@ -1302,7 +1380,13 @@ function RenameModal({ initialValue, onConfirm, onCancel }) {
   )
 }
 
-function ExportImageModal({ onClose, onSimple, onHiRes }) {
+function ExportImageModal({
+  onClose,
+  onSimple,
+  onHiRes,
+  disableHiRes = false,
+  hiResHint = '',
+}) {
   return (
     <div className="fta-modal-overlay" onClick={onClose}>
       <div className="fta-modal" onClick={(e) => e.stopPropagation()}>
@@ -1323,10 +1407,14 @@ function ExportImageModal({ onClose, onSimple, onHiRes }) {
               type="button"
               className="fta-btn primary"
               onClick={onHiRes}
+              disabled={disableHiRes}
             >
               高保真导出
             </button>
           </div>
+          {disableHiRes && hiResHint && (
+            <div className="fta-hires-disabled-hint">{hiResHint}</div>
+          )}
         </div>
         <div className="fta-modal-actions" style={{ marginTop: '0.8rem' }}>
           <button type="button" className="fta-btn ghost" onClick={onClose}>
