@@ -1,42 +1,63 @@
-"""
-main.py —— FastAPI 接口入口（v3）
+from __future__ import annotations
 
-接口列表：
-  POST /api/tree/generate               根据用户prompt自动提取顶事件并生成故障树
-  GET  /api/tree/{tree_id}              获取当前版本故障树
-  GET  /api/tree/{tree_id}/version/{v}  获取指定版本故障树
-  POST /api/tree/{tree_id}/save         专家保存修改（自动触发差异学习）
-  POST /api/tree/{tree_id}/rollback/{v} 撤回到指定版本
-  GET  /api/tree/{tree_id}/history      获取版本历史列表
-  POST /api/tree/validate               单独校验一棵树（调试用）
-  GET  /api/chunk/{chunk_id}            根据id查chunk（前端溯源用）
-  GET  /api/corrections/{tree_id}       查看某棵树的修正记录（调试用）
-"""
-
-import uuid
 import importlib.util
+import os
 import sys
+import threading
+import time
+import uuid
 from pathlib import Path
+from queue import Empty, Queue
+from typing import Dict, List, Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
 from pydantic import BaseModel
 
-from generator import generate_fault_tree, parse_user_prompt
-from validator import validate_full, validate_semantics
 from database import (
+    claim_generation_job_item,
+    create_generation_job,
+    create_generation_job_item,
     create_tree,
-    save_version,
-    get_version,
-    rollback_version,
-    get_version_list,
-    get_tree_meta,
+    find_active_job_item_by_top_event,
+    find_tree_by_top_event,
     get_chunk_by_id,
+    get_generation_job,
+    get_generation_job_item,
+    get_tree_meta,
+    get_version,
+    get_version_list,
+    list_all_chunks,
+    list_generation_job_items,
+    refresh_generation_job,
+    resolve_top_event_catalog,
+    rollback_version,
+    save_version,
+    top_event_catalog_col,
+    try_mark_job_completion_logged,
+    update_generation_job_item,
+    update_tree_status,
+    upsert_top_event_catalog_entry,
     versions_col,
 )
 from diff_analyzer import analyze_and_store, corrections_col, generate_change_description
+from generator import (
+    build_top_event_normalized_candidates,
+    discover_top_events_from_chunks,
+    generate_fault_tree_with_progress,
+    normalize_top_event_name,
+    parse_user_prompt,
+)
+from validator import validate_full, validate_semantics
 
-app = FastAPI(title="故障树智能生成系统", version="3.0.0")
+MAX_GENERATION_WORKERS = max(1, int(os.getenv("MAX_GENERATION_WORKERS", "2")))
+RESERVED_SINGLE_WORKERS = 1 if MAX_GENERATION_WORKERS > 1 else 0
+SHARED_WORKERS = max(1, MAX_GENERATION_WORKERS - RESERVED_SINGLE_WORKERS)
+single_generation_queue: Queue[str] = Queue()
+batch_generation_queue: Queue[str] = Queue()
+generation_worker_threads: List[threading.Thread] = []
+
+app = FastAPI(title="故障树智能生成系统", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,32 +66,539 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 def _load_py_module(module_name: str, file_path: Path):
     spec = importlib.util.spec_from_file_location(module_name, str(file_path))
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"无法加载模块：{module_name}（path={file_path}）")
+        raise RuntimeError(f"无法加载模块: {module_name} ({file_path})")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _dedupe_keep_order(values: Optional[List[str]]) -> List[str]:
+    result: List[str] = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _ensure_catalog_entry(name: str, aliases: Optional[List[str]] = None, source_chunk_ids: Optional[List[int]] = None):
+    canonical_name = normalize_top_event_name(name)
+    if not canonical_name:
+        raise ValueError("顶事件不能为空")
+
+    raw_aliases = _dedupe_keep_order((aliases or []) + [name])
+    normalized_candidates = build_top_event_normalized_candidates(canonical_name, raw_aliases)
+    existing = resolve_top_event_catalog(normalized_candidates=normalized_candidates)
+
+    if existing:
+        final_name = existing["name"]
+        normalized_name = existing["normalized_name"]
+        merged_aliases = _dedupe_keep_order((existing.get("aliases") or []) + raw_aliases)
+        merged_normalized_aliases = _dedupe_keep_order(
+            (existing.get("normalized_aliases") or [])
+            + [candidate for candidate in normalized_candidates if candidate != normalized_name]
+        )
+        merged_source_chunk_ids = list(dict.fromkeys((existing.get("source_chunk_ids") or []) + (source_chunk_ids or [])))
+        return upsert_top_event_catalog_entry(
+            name=final_name,
+            normalized_name=normalized_name,
+            aliases=merged_aliases,
+            normalized_aliases=merged_normalized_aliases,
+            source_chunk_ids=merged_source_chunk_ids,
+        )
+
+    normalized_name = canonical_name
+    normalized_aliases = [candidate for candidate in normalized_candidates if candidate != normalized_name]
+    return upsert_top_event_catalog_entry(
+        name=canonical_name,
+        normalized_name=normalized_name,
+        aliases=raw_aliases,
+        normalized_aliases=normalized_aliases,
+        source_chunk_ids=source_chunk_ids or [],
+    )
+
+
+def _serialize_job(job_id: str) -> Dict:
+    refresh_generation_job(job_id)
+    job = get_generation_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return job
+
+
+def _worker_loop(worker_name: str, allow_batch: bool):
+    while True:
+        queue_ref = None
+        item_id = None
+
+        try:
+            item_id = single_generation_queue.get(timeout=0.5)
+            queue_ref = single_generation_queue
+        except Empty:
+            if allow_batch:
+                try:
+                    item_id = batch_generation_queue.get(timeout=0.5)
+                    queue_ref = batch_generation_queue
+                except Empty:
+                    continue
+            else:
+                continue
+
+        try:
+            _run_generation_item(item_id, execution_owner=f"queue:{worker_name}:{item_id}")
+        except Exception as exc:
+            print(f"[scheduler] worker={worker_name} item={item_id} failed: {exc}")
+        finally:
+            if queue_ref is not None:
+                queue_ref.task_done()
+
+
+def _start_generation_workers():
+    if generation_worker_threads:
+        return
+
+    for index in range(RESERVED_SINGLE_WORKERS):
+        thread = threading.Thread(
+            target=_worker_loop,
+            args=(f"single-{index + 1}", False),
+            daemon=True,
+        )
+        thread.start()
+        generation_worker_threads.append(thread)
+
+    for index in range(SHARED_WORKERS):
+        thread = threading.Thread(
+            target=_worker_loop,
+            args=(f"shared-{index + 1}", True),
+            daemon=True,
+        )
+        thread.start()
+        generation_worker_threads.append(thread)
+
+
+def _submit_generation_item(item_id: str, queue_type: str):
+    if queue_type == "single":
+        single_generation_queue.put(item_id)
+    else:
+        batch_generation_queue.put(item_id)
+
+
+def _start_dedicated_generation_thread(item_id: str, mirror_item_ids: Optional[List[str]] = None):
+    thread = threading.Thread(
+        target=_run_generation_item,
+        kwargs={
+            "item_id": item_id,
+            "execution_owner": f"dedicated:{item_id}:{uuid.uuid4().hex[:6]}",
+            "mirror_item_ids": mirror_item_ids or [],
+        },
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _log_item_duration(item_id: str):
+    item = get_generation_job_item(item_id)
+    if not item:
+        return
+
+    duration = item.get("duration_seconds")
+    duration_text = f"{duration:.3f}s" if isinstance(duration, (int, float)) else "unknown"
+    print(
+        f"[timing] item={item_id} top_event={item.get('top_event')} "
+        f"status={item.get('status')} duration={duration_text}"
+    )
+
+
+def _log_job_duration_once(job_id: str):
+    job = refresh_generation_job(job_id)
+    if not job or job.get("status") not in {"completed", "partial_failed", "failed"}:
+        return
+    if not try_mark_job_completion_logged(job_id):
+        return
+
+    duration = job.get("duration_seconds")
+    duration_text = f"{duration:.3f}s" if isinstance(duration, (int, float)) else "unknown"
+    print(
+        f"[timing] job={job_id} type={job.get('job_type')} status={job.get('status')} "
+        f"total={job.get('total')} success={job.get('success')} failed={job.get('failed')} "
+        f"duration={duration_text}"
+    )
+
+
+_start_generation_workers()
+
+
+def _sync_mirror_items(mirror_item_ids: Optional[List[str]], **kwargs):
+    for mirror_item_id in mirror_item_ids or []:
+        update_generation_job_item(mirror_item_id, **kwargs)
+
+
+def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mirror_item_ids: Optional[List[str]] = None):
+    item = get_generation_job_item(item_id)
+    if not item:
+        return
+
+    if execution_owner:
+        claimed = claim_generation_job_item(
+            item_id,
+            execution_owner=execution_owner,
+            allowed_statuses=["pending"],
+            progress=5,
+            stage="prepare",
+            message="Preparing generation task",
+        )
+        if claimed:
+            item = claimed
+        else:
+            latest_item = get_generation_job_item(item_id)
+            if not latest_item:
+                return
+            if latest_item.get("status") in {"success", "failed"}:
+                return
+            if latest_item.get("execution_owner") != execution_owner:
+                return
+            item = latest_item
+    else:
+        if item.get("status") not in {"pending", "running"}:
+            return
+
+    wall_started = time.perf_counter()
+    job_id = item["job_id"]
+    top_event = item["top_event"]
+    normalized_top_event = item["normalized_top_event"]
+    aliases = _dedupe_keep_order(item.get("aliases") or [])
+    requirements = item.get("requirements") or ""
+    tree_id = None
+
+    try:
+        reused = find_tree_by_top_event(
+            top_event=top_event,
+            normalized_top_event=normalized_top_event,
+            aliases=aliases,
+            catalog_name=top_event,
+        )
+        if reused:
+            update_generation_job_item(
+                item_id,
+                status="success",
+                progress=100,
+                stage="reuse",
+                message="Reused existing tree",
+                tree_id=reused["tree_id"],
+                reused=True,
+                version=reused["version"],
+            )
+            _sync_mirror_items(
+                mirror_item_ids,
+                status="success",
+                progress=100,
+                stage="reuse",
+                message="Reused existing tree",
+                tree_id=reused["tree_id"],
+                reused=True,
+                version=reused["version"],
+                error=None,
+            )
+            _log_item_duration(item_id)
+            for mirror_item_id in mirror_item_ids or []:
+                _log_item_duration(mirror_item_id)
+            _log_job_duration_once(job_id)
+            for mirror_item_id in mirror_item_ids or []:
+                mirror_item = get_generation_job_item(mirror_item_id)
+                if mirror_item:
+                    _log_job_duration_once(mirror_item["job_id"])
+            return
+
+        tree_id = f"ft_{uuid.uuid4().hex[:8]}"
+        create_tree(
+            tree_id=tree_id,
+            top_event=top_event,
+            catalog_name=top_event,
+            normalized_top_event=normalized_top_event,
+            aliases=aliases,
+            source_chunk_ids=item.get("source_chunk_ids") or [],
+            job_id=job_id,
+            job_item_id=item_id,
+        )
+
+        update_generation_job_item(
+            item_id,
+            status="running",
+            progress=15,
+            stage="tree_record",
+            message="Tree record created",
+            tree_id=tree_id,
+        )
+        _sync_mirror_items(
+            mirror_item_ids,
+            tree_id=tree_id,
+            progress=15,
+            stage="tree_record",
+            message="Tree record created",
+        )
+
+        def progress_callback(progress: int, stage: str, message: str):
+            update_generation_job_item(
+                item_id,
+                status="running",
+                progress=progress,
+                stage=stage,
+                message=message,
+                tree_id=tree_id,
+            )
+            _sync_mirror_items(
+                mirror_item_ids,
+                status="running",
+                progress=progress,
+                stage=stage,
+                message=message,
+                tree_id=tree_id,
+            )
+
+        tree_data = generate_fault_tree_with_progress(
+            top_event=top_event,
+            requirements=requirements,
+            progress_callback=progress_callback,
+        )
+
+        version = save_version(
+            tree_id=tree_id,
+            tree_data=tree_data,
+            editor="AI",
+            description=f"AI initial generation for top event: {top_event}",
+            is_ai=True,
+        )
+
+        update_generation_job_item(
+            item_id,
+            status="success",
+            progress=100,
+            stage="completed",
+            message="Tree generated",
+            tree_id=tree_id,
+            version=version,
+            worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
+        )
+        _sync_mirror_items(
+            mirror_item_ids,
+            status="success",
+            progress=100,
+            stage="completed",
+            message="Tree generated",
+            tree_id=tree_id,
+            version=version,
+            error=None,
+            worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
+        )
+        _log_item_duration(item_id)
+        for mirror_item_id in mirror_item_ids or []:
+            _log_item_duration(mirror_item_id)
+        _log_job_duration_once(job_id)
+        for mirror_item_id in mirror_item_ids or []:
+            mirror_item = get_generation_job_item(mirror_item_id)
+            if mirror_item:
+                _log_job_duration_once(mirror_item["job_id"])
+    except ValueError as exc:
+        if tree_id:
+            update_tree_status(tree_id, "failed", error=str(exc))
+        update_generation_job_item(
+            item_id,
+            status="failed",
+            progress=100,
+            stage="failed",
+            message="Generation failed",
+            tree_id=tree_id,
+            error=str(exc),
+            worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
+        )
+        _sync_mirror_items(
+            mirror_item_ids,
+            status="failed",
+            progress=100,
+            stage="failed",
+            message="Generation failed",
+            tree_id=tree_id,
+            error=str(exc),
+            worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
+        )
+        _log_item_duration(item_id)
+        for mirror_item_id in mirror_item_ids or []:
+            _log_item_duration(mirror_item_id)
+        _log_job_duration_once(job_id)
+        for mirror_item_id in mirror_item_ids or []:
+            mirror_item = get_generation_job_item(mirror_item_id)
+            if mirror_item:
+                _log_job_duration_once(mirror_item["job_id"])
+    except Exception as exc:
+        if tree_id:
+            update_tree_status(tree_id, "failed", error=str(exc))
+        update_generation_job_item(
+            item_id,
+            status="failed",
+            progress=100,
+            stage="failed",
+            message="Generation failed",
+            tree_id=tree_id,
+            error=str(exc),
+            worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
+        )
+        _sync_mirror_items(
+            mirror_item_ids,
+            status="failed",
+            progress=100,
+            stage="failed",
+            message="Generation failed",
+            tree_id=tree_id,
+            error=str(exc),
+            worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
+        )
+        _log_item_duration(item_id)
+        for mirror_item_id in mirror_item_ids or []:
+            _log_item_duration(mirror_item_id)
+        _log_job_duration_once(job_id)
+        for mirror_item_id in mirror_item_ids or []:
+            mirror_item = get_generation_job_item(mirror_item_id)
+            if mirror_item:
+                _log_job_duration_once(mirror_item["job_id"])
+
+
+def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: str) -> Dict:
+    catalog = _ensure_catalog_entry(parsed_top_event, aliases=[parsed_top_event])
+    aliases = _dedupe_keep_order((catalog.get("aliases") or []) + [parsed_top_event])
+
+    reused = find_tree_by_top_event(
+        top_event=catalog["name"],
+        normalized_top_event=catalog["normalized_name"],
+        aliases=aliases,
+        catalog_name=catalog["name"],
+    )
+    if reused:
+        return {
+            "mode": "reuse",
+            "tree_id": reused["tree_id"],
+            "version": reused["version"],
+            "parsed_prompt": {
+                "top_event": parsed_top_event,
+                "catalog_top_event": catalog["name"],
+                "requirements": requirements,
+            },
+            "tree_data": reused["tree_data"],
+        }
+
+    active_item = find_active_job_item_by_top_event(catalog["normalized_name"])
+    if active_item:
+        active_job = get_generation_job(active_item["job_id"])
+        if active_item["status"] == "pending" and active_job and active_job.get("job_type") == "batch":
+            batch_claim_owner = f"accelerated-batch:{uuid.uuid4().hex[:8]}"
+            claimed_batch_item = claim_generation_job_item(
+                active_item["item_id"],
+                execution_owner=batch_claim_owner,
+                allowed_statuses=["pending"],
+                progress=1,
+                stage="accelerated",
+                message="Accelerated by single request",
+            )
+            if claimed_batch_item:
+                job = create_generation_job(
+                    job_type="single",
+                    total=1,
+                    top_event=catalog["name"],
+                    metadata={
+                        "requested_prompt": prompt,
+                        "source": "/api/tree/generate",
+                        "accelerated_batch_item_id": claimed_batch_item["item_id"],
+                    },
+                )
+                item = create_generation_job_item(
+                    job_id=job["job_id"],
+                    top_event=catalog["name"],
+                    normalized_top_event=catalog["normalized_name"],
+                    aliases=aliases,
+                    source_chunk_ids=catalog.get("source_chunk_ids") or [],
+                    requirements=requirements,
+                    metadata={
+                        "requested_prompt": prompt,
+                        "query_top_event": parsed_top_event,
+                        "accelerated_batch_item_id": claimed_batch_item["item_id"],
+                    },
+                )
+                _start_dedicated_generation_thread(item["item_id"], mirror_item_ids=[claimed_batch_item["item_id"]])
+                return {
+                    "mode": "queued",
+                    "dispatch": "dedicated_worker",
+                    "job_id": job["job_id"],
+                    "item_id": item["item_id"],
+                    "status": item["status"],
+                    "progress": item["progress"],
+                    "accelerated_batch_job_id": claimed_batch_item["job_id"],
+                    "accelerated_batch_item_id": claimed_batch_item["item_id"],
+                    "parsed_prompt": {
+                        "top_event": parsed_top_event,
+                        "catalog_top_event": catalog["name"],
+                        "requirements": requirements,
+                    },
+                }
+
+        return {
+            "mode": "queued",
+            "job_id": active_item["job_id"],
+            "item_id": active_item["item_id"],
+            "status": active_item["status"],
+            "progress": active_item["progress"],
+            "parsed_prompt": {
+                "top_event": parsed_top_event,
+                "catalog_top_event": catalog["name"],
+                "requirements": requirements,
+            },
+        }
+
+    job = create_generation_job(
+        job_type="single",
+        total=1,
+        top_event=catalog["name"],
+        metadata={"requested_prompt": prompt, "source": "/api/tree/generate"},
+    )
+    item = create_generation_job_item(
+        job_id=job["job_id"],
+        top_event=catalog["name"],
+        normalized_top_event=catalog["normalized_name"],
+        aliases=aliases,
+        source_chunk_ids=catalog.get("source_chunk_ids") or [],
+        requirements=requirements,
+        metadata={"requested_prompt": prompt, "query_top_event": parsed_top_event},
+    )
+    _submit_generation_item(item["item_id"], "single")
+
+    return {
+        "mode": "queued",
+        "job_id": job["job_id"],
+        "item_id": item["item_id"],
+        "status": item["status"],
+        "progress": item["progress"],
+        "parsed_prompt": {
+            "top_event": parsed_top_event,
+            "catalog_top_event": catalog["name"],
+            "requirements": requirements,
+        },
+    }
+
 
 # ---- Optional: merge validator-service into this backend (same uvicorn port) ----
 _VALIDATOR_DIR = Path(__file__).resolve().parent / "validator-service"
 if _VALIDATOR_DIR.exists():
     try:
-        # 动态加载 validator-service/main.py（规则校验、导出图片等）
         _validator_dir_str = str(_VALIDATOR_DIR)
         _had_validator_path = _validator_dir_str in sys.path
         if not _had_validator_path:
             sys.path.insert(0, _validator_dir_str)
 
-        _validator_main = _load_py_module(
-            "validator_service_main",
-            _VALIDATOR_DIR / "main.py",
-        )
+        _validator_main = _load_py_module("validator_service_main", _VALIDATOR_DIR / "main.py")
 
-        # Re-export legacy endpoints for existing frontend compatibility:
-        # - POST /validate-fault-tree
-        # - POST /export-fault-tree-image
         @app.post("/validate-fault-tree")
         def validate_fault_tree(payload: _validator_main.ValidateRequest):  # type: ignore[name-defined]
             return _validator_main.validate_fault_tree(payload)  # type: ignore[attr-defined]
@@ -81,18 +609,15 @@ if _VALIDATOR_DIR.exists():
                 return await _validator_main.export_fault_tree_image(payload)  # type: ignore[attr-defined]
             except HTTPException:
                 raise
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=str(exc))
 
-    except Exception as e:
-        # Do not fail main backend if validator-service is present but broken.
-        # The core /api/tree/* routes should still work.
-        print(f"[warn] validator-service merge failed: {e}")
+    except Exception as exc:
+        print(f"[warn] validator-service merge failed: {exc}")
     finally:
-        # Avoid permanently polluting sys.path in case other imports shadow.
         try:
             if "_validator_dir_str" in locals() and not locals().get("_had_validator_path", True):
-                sys.path = [p for p in sys.path if p != locals()["_validator_dir_str"]]
+                sys.path = [path for path in sys.path if path != locals()["_validator_dir_str"]]
         except Exception:
             pass
 
@@ -114,57 +639,122 @@ class ValidateRequest(BaseModel):
 class SemanticValidateRequest(BaseModel):
     tree_data: dict
 
+
 @app.post("/api/tree/generate")
 def api_generate(req: GenerateRequest):
-    """
-    生成故障树。
-
-    当前输入模式：
-    - 前端只传入一个 prompt
-    - 后端先从 prompt 中提取顶事件与额外要求
-    - 然后仅从数据库检索 chunks，不支持会话时直接上传 chunks
-
-    示例输入：
-      {"prompt": "我要生成一个顶事件为传感器故障的故障树"}
-      {"prompt": "传感器故障"}
-      {"prompt": "请分析驱动系统故障，生成3到5层故障树并保留溯源"}
-    """
     try:
         parsed = parse_user_prompt(req.prompt)
         top_event = parsed["top_event"]
         requirements = parsed.get("requirements", "")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"用户prompt解析失败：{str(e)}")
-
-    tree_id = f"ft_{uuid.uuid4().hex[:8]}"
-    create_tree(tree_id, top_event)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Prompt parse failed: {exc}")
 
     try:
-        tree_data = generate_fault_tree(top_event, requirements)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"生成失败：{str(e)}")
+        return _queue_single_generation(req.prompt, top_event, requirements)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Queue generation failed: {exc}")
 
-    version = save_version(
-        tree_id=tree_id,
-        tree_data=tree_data,
-        editor="AI",
-        description=f"AI初始生成（由prompt提取顶事件：{top_event}）",
-        is_ai=True,
+
+@app.post("/api/batch/generate-all")
+def api_batch_generate_all():
+    chunks = list_all_chunks()
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No chunks found, please import knowledge chunks first")
+
+    discovered = discover_top_events_from_chunks(chunks)
+    if not discovered:
+        raise HTTPException(status_code=400, detail="No top events were discovered from chunks")
+
+    catalog_entries = []
+    for item in discovered:
+        try:
+            entry = _ensure_catalog_entry(
+                item["name"],
+                aliases=item.get("aliases") or [],
+                source_chunk_ids=item.get("source_chunk_ids") or [],
+            )
+        except ValueError:
+            continue
+        catalog_entries.append(entry)
+
+    existing_count = 0
+    active_count = 0
+    queued_entries = []
+    for entry in catalog_entries:
+        aliases = entry.get("aliases") or []
+        reused = find_tree_by_top_event(
+            top_event=entry["name"],
+            normalized_top_event=entry["normalized_name"],
+            aliases=aliases,
+            catalog_name=entry["name"],
+        )
+        if reused:
+            existing_count += 1
+            continue
+
+        active_item = find_active_job_item_by_top_event(entry["normalized_name"])
+        if active_item:
+            active_count += 1
+            continue
+
+        queued_entries.append(entry)
+
+    job = create_generation_job(
+        job_type="batch",
+        total=len(queued_entries),
+        metadata={
+            "discovered_total": len(discovered),
+            "catalog_total": len(catalog_entries),
+            "existing_count": existing_count,
+            "active_count": active_count,
+            "source": "/api/batch/generate-all",
+        },
     )
 
+    queued_item_ids = []
+    for entry in queued_entries:
+        item = create_generation_job_item(
+            job_id=job["job_id"],
+            top_event=entry["name"],
+            normalized_top_event=entry["normalized_name"],
+            aliases=entry.get("aliases") or [],
+            source_chunk_ids=entry.get("source_chunk_ids") or [],
+            requirements="",
+            metadata={"source": "batch_generate_all"},
+        )
+        queued_item_ids.append(item["item_id"])
+        _submit_generation_item(item["item_id"], "batch")
+
+    refresh_generation_job(job["job_id"])
     return {
-        "tree_id": tree_id,
-        "version": version,
-        "parsed_prompt": {
-            "top_event": top_event,
-            "requirements": requirements,
-        },
-        "tree_data": tree_data,
+        "job_id": job["job_id"],
+        "status": get_generation_job(job["job_id"])["status"],
+        "discovered_total": len(discovered),
+        "catalog_total": len(catalog_entries),
+        "existing_count": existing_count,
+        "active_count": active_count,
+        "queued_count": len(queued_entries),
+        "queued_item_ids": queued_item_ids,
     }
+
+
+@app.get("/api/batch/job/{job_id}")
+def api_get_batch_job(job_id: str):
+    job = _serialize_job(job_id)
+    items = list_generation_job_items(job_id)
+    return {"job": job, "items": items}
+
+
+@app.get("/api/batch/job-item/{item_id}")
+def api_get_batch_job_item(item_id: str):
+    item = get_generation_job_item(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="任务项不存在")
+    return item
 
 
 @app.get("/api/tree/{tree_id}")
@@ -195,7 +785,7 @@ def api_save(tree_id: str, req: SaveRequest):
             status_code=400,
             detail={
                 "message": "故障树存在结构错误，无法保存，请修正后重试",
-                "issues": [i for i in validation["issues"] if i["level"] == "ERROR"],
+                "issues": [issue for issue in validation["issues"] if issue["level"] == "ERROR"],
             },
         )
 
@@ -232,8 +822,8 @@ def api_save(tree_id: str, req: SaveRequest):
 def api_rollback(tree_id: str, target_version: int):
     try:
         rollback_version(tree_id, target_version)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     ver = get_version(tree_id, target_version)
     return {"success": True, "version": target_version, "tree_data": ver["tree_data"]}
@@ -251,25 +841,20 @@ def api_validate(req: ValidateRequest):
 
 @app.post("/api/tree/validate/semantic")
 def api_validate_semantic(req: SemanticValidateRequest):
-    """
-    仅做 AI 语义校验（调用 validator.py 的 validate_semantics）。
-    前端用于“手动点击校验按钮后”刷新 AI 校验结果，不影响保存流程。
-    """
     try:
         issues = validate_semantics(req.tree_data) or []
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI语义校验失败：{str(e)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AI semantic validation failed: {exc}")
 
-    # validate_semantics 约束 level 主要为 WARNING/INFO；这里仍按通用格式统计
-    error_count = sum(1 for i in issues if getattr(i, "level", "") == "ERROR")
-    warning_count = sum(1 for i in issues if getattr(i, "level", "") == "WARNING")
-    info_count = sum(1 for i in issues if getattr(i, "level", "") == "INFO")
+    error_count = sum(1 for issue in issues if getattr(issue, "level", "") == "ERROR")
+    warning_count = sum(1 for issue in issues if getattr(issue, "level", "") == "WARNING")
+    info_count = sum(1 for issue in issues if getattr(issue, "level", "") == "INFO")
     return {
         "passed": error_count == 0,
         "error_count": error_count,
         "warning_count": warning_count,
         "info_count": info_count,
-        "issues": [i.to_dict() for i in issues],
+        "issues": [issue.to_dict() for issue in issues],
     }
 
 
@@ -288,10 +873,17 @@ def api_get_corrections(tree_id: str):
     return docs
 
 
+@app.get("/api/catalog/top-events")
+def api_list_catalog_top_events():
+    docs = list(top_event_catalog_col.find({}, {"_id": 0}).sort("name", 1))
+    return {"items": docs, "total": len(docs)}
+
+
 @app.get("/")
 def root():
     return {
-        "message": "故障树智能生成系统运行中",
+        "message": "Fault tree generation system is running",
         "docs": "/docs",
-        "generate_input_example": {"prompt": "请生成一个顶事件为传感器故障的故障树，并保留溯源"},
+        "generate_input_example": {"prompt": "请分析控制单元过热，并生成故障树"},
+        "batch_endpoint": "/api/batch/generate-all",
     }

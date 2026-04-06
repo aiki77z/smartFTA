@@ -11,7 +11,7 @@ generator.py —— 故障树生成模块（v3）
 
 import json
 import re
-from typing import Dict, List
+from typing import Callable, Dict, List, Optional
 
 from openai import OpenAI
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
@@ -24,6 +24,74 @@ MAX_RETRY = 2
 MAX_CHUNKS_FOR_PROMPT = 15
 MAX_CHUNK_CHARS = 280
 MAX_JSON_REPAIR_RETRY = 1
+
+TOP_EVENT_SIGNAL_WORDS = (
+    "故障",
+    "异常",
+    "过热",
+    "停机",
+    "报警",
+    "出错",
+    "错误",
+    "失效",
+    "失败",
+    "失步",
+    "中断",
+    "超时",
+    "触发",
+)
+
+GENERIC_COMPONENT_TERMS = (
+    "控制单元",
+    "功率单元",
+    "电机模块",
+    "液压模块",
+    "编码器模块",
+    "传感器",
+    "编码器",
+    "端子模块",
+    "通讯组件",
+    "辅助组件",
+    "驱动系统",
+)
+
+TOP_EVENT_NOISE_PATTERNS = (
+    r"\b[pr]\d{3,5}(?:\[\d+\.\.\.\d+\])?\b",
+    r"(PROFINET|PROFIBUS|PROFIsafe|PROFIdrive|DRIVE-CLiQ|SIMATIC|NAMUR)",
+    r"(GLOBAL|LOCAL|OFF\d?|ROM)",
+    r"故障值",
+    r"报警值",
+    r"参数",
+    r"协议",
+    r"接口$",
+    r"组件$",
+)
+
+TOP_EVENT_NOISE_TERMS = (
+    "分析",
+    "诊断",
+    "处理",
+    "指南",
+    "流程",
+    "节点",
+    "日志",
+    "文件",
+    "连接状态",
+    "连接接口",
+    "核心",
+    "中间事件",
+    "通用说明",
+)
+
+TOP_EVENT_GENERIC_EVENTS = {
+    "一般驱动故障",
+    "硬件/软件故障",
+    "未明确故障",
+    "SI故障",
+    "安全功能故障",
+    "SI安全功能故障",
+    "无明确驱动对象故障",
+}
 
 FORMAT_EXAMPLE = """
 {
@@ -381,6 +449,231 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
     final_validation = validate_full(final_tree, skip_semantic=False)
     final_tree["validation"] = final_validation
     return final_tree
+
+
+def normalize_top_event_name(text: str) -> str:
+    value = (text or "").strip()
+    if not value:
+        return ""
+
+    value = value.replace("（", "(").replace("）", ")")
+    value = value.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    value = re.sub(r"\s+", "", value)
+    value = value.strip("\"'[]{}<>")
+    value = re.sub(r"^(针对|关于|分析|处理|诊断|排查|检查)", "", value)
+    value = re.sub(r"^故障代码", "", value)
+    value = re.sub(r"^[FA]\d{5}(?:\([A-Z]\))?", "", value, flags=re.IGNORECASE)
+    value = value.lstrip("_-:：")
+    value = re.sub(r"_\d+$", "", value)
+    value = value.replace("STOPA", "STOP A").replace("STOPF", "STOP F")
+    value = re.sub(r"^某一", "", value)
+
+    code_alias = re.match(r"^([FA]\d{5}(?:\([A-Z]\))?)\(([^()]+)\)$", value, flags=re.IGNORECASE)
+    if code_alias:
+        value = code_alias.group(2)
+
+    value = re.sub(
+        r"(故障处理指南|故障处理逻辑|故障处理流程|故障处理|故障分析|故障诊断|troubleshooting|fault)$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    colon_parts = re.split(r"[:：]", value, maxsplit=1)
+    if len(colon_parts) == 2:
+        prefix, suffix = colon_parts[0].strip(), colon_parts[1].strip()
+        if re.fullmatch(r"[A-Z0-9() /_-]{1,16}", prefix):
+            value = suffix
+        elif prefix in GENERIC_COMPONENT_TERMS:
+            value = suffix if suffix.startswith(prefix) else f"{prefix}{suffix}"
+
+    value = re.sub(r"[（(](含[^()]*|关联[^()]*|间接[^()]*|设备内部[^()]*|十进制[^()]*|二进制[^()]*)[)）]$", "", value)
+    value = value.strip(",:：，。；;")
+
+    if value.endswith("故障") and any(word in value[:-2] for word in TOP_EVENT_SIGNAL_WORDS if word != "故障"):
+        value = value[:-2]
+    if value.endswith("报警") and any(word in value[:-2] for word in TOP_EVENT_SIGNAL_WORDS if word != "报警"):
+        value = value[:-2]
+
+    if value.startswith("SI") and len(value) <= 6:
+        return ""
+
+    if value == "RAM写失败":
+        value = "写RAM失败"
+
+    return value.strip()
+
+
+def build_top_event_normalized_candidates(name: str, aliases: Optional[List[str]] = None) -> List[str]:
+    normalized = []
+
+    def add_candidate(value: str):
+        if value and value not in normalized:
+            normalized.append(value)
+
+    for value in [name] + (aliases or []):
+        candidate = normalize_top_event_name(value)
+        if not candidate:
+            continue
+
+        add_candidate(candidate)
+
+        semantic_variants = {
+            candidate.replace("出错", "故障"),
+            candidate.replace("错误", "故障"),
+            candidate.replace("失败", "故障"),
+            candidate.replace("异常", "故障"),
+        }
+        if candidate.endswith("故障"):
+            semantic_variants.add(candidate[:-2])
+        for variant in semantic_variants:
+            variant = normalize_top_event_name(variant)
+            if variant:
+                add_candidate(variant)
+
+    return normalized
+
+
+def is_valid_top_event_candidate(text: str) -> bool:
+    candidate = normalize_top_event_name(text)
+    if not candidate or len(candidate) < 2 or len(candidate) > 40:
+        return False
+
+    if not any(word in candidate for word in TOP_EVENT_SIGNAL_WORDS):
+        return False
+
+    if candidate in TOP_EVENT_SIGNAL_WORDS:
+        return False
+
+    if candidate in TOP_EVENT_GENERIC_EVENTS:
+        return False
+
+    if candidate.startswith("故障") or candidate.endswith("检测"):
+        return False
+
+    if re.fullmatch(r"[FA]\d{5}(?:\([A-Z]\))?", candidate, flags=re.IGNORECASE):
+        return False
+
+    for pattern in TOP_EVENT_NOISE_PATTERNS:
+        if re.search(pattern, candidate, flags=re.IGNORECASE):
+            return False
+
+    if any(term in candidate for term in TOP_EVENT_NOISE_TERMS):
+        return False
+
+    if candidate.startswith("关联"):
+        return False
+
+    for component in GENERIC_COMPONENT_TERMS:
+        if candidate == component:
+            return False
+        if candidate in {f"{component}故障", f"{component}异常", f"{component}报警"}:
+            return False
+
+    return True
+
+
+def extract_top_event_candidates_from_chunk(chunk: dict) -> List[dict]:
+    chunk_id = chunk.get("id")
+    chunk_name = str(chunk.get("chunk_name") or "").strip()
+    content = str(chunk.get("content") or "")
+    collected: Dict[str, dict] = {}
+
+    def add_candidate(name: str, aliases: Optional[List[str]] = None):
+        canonical = normalize_top_event_name(name)
+        if not is_valid_top_event_candidate(canonical):
+            return
+
+        entry = collected.setdefault(
+            canonical,
+            {
+                "name": canonical,
+                "aliases": [],
+                "source_chunk_ids": [],
+            },
+        )
+
+        if chunk_id is not None and chunk_id not in entry["source_chunk_ids"]:
+            entry["source_chunk_ids"].append(chunk_id)
+
+        for alias in (aliases or []) + [name]:
+            alias_text = str(alias or "").strip()
+            if alias_text and alias_text != canonical and alias_text not in entry["aliases"]:
+                entry["aliases"].append(alias_text)
+
+    if chunk_name:
+        add_candidate(chunk_name, aliases=[chunk_name])
+
+    for match in re.finditer(r'以["“]?([^"”]+?)["”]?为顶事件', content):
+        add_candidate(match.group(1), aliases=[chunk_name, match.group(0)])
+
+    for match in re.finditer(
+        r"故障代码\s*([FA]\d{5}(?:\([A-Z]\))?)[:：].*?故障现象为([^。；\n]+)",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        code = match.group(1).strip()
+        phenomenon = normalize_top_event_name(match.group(2))
+        if phenomenon:
+            add_candidate(
+                phenomenon,
+                aliases=[chunk_name, match.group(2).strip(), f"{code}({phenomenon})"],
+            )
+
+    for match in re.finditer(r"针对\s*([FA]\d{5}(?:\([A-Z]\))?)\(([^()]+)\)故障", content, flags=re.IGNORECASE):
+        code = match.group(1).strip()
+        phenomenon = normalize_top_event_name(match.group(2))
+        if phenomenon:
+            add_candidate(phenomenon, aliases=[chunk_name, f"{code}({phenomenon})"])
+
+    for match in re.finditer(r"\(([^(^)]+?)\)故障", chunk_name):
+        add_candidate(match.group(1), aliases=[chunk_name])
+
+    return list(collected.values())
+
+
+def discover_top_events_from_chunks(chunks: List[dict]) -> List[dict]:
+    catalog: Dict[str, dict] = {}
+
+    for chunk in chunks or []:
+        for item in extract_top_event_candidates_from_chunk(chunk):
+            key = item["name"]
+            target = catalog.setdefault(
+                key,
+                {
+                    "name": key,
+                    "aliases": [],
+                    "source_chunk_ids": [],
+                },
+            )
+
+            for alias in item.get("aliases", []):
+                if alias not in target["aliases"] and alias != key:
+                    target["aliases"].append(alias)
+
+            for chunk_id in item.get("source_chunk_ids", []):
+                if chunk_id not in target["source_chunk_ids"]:
+                    target["source_chunk_ids"].append(chunk_id)
+
+    return sorted(catalog.values(), key=lambda item: item["name"])
+
+
+def generate_fault_tree_with_progress(
+    top_event: str,
+    requirements: str = "",
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+) -> dict:
+    if progress_callback:
+        progress_callback(10, "prepare", "Preparing generation request")
+        progress_callback(25, "knowledge_search", "Collecting related knowledge chunks")
+        progress_callback(40, "generation_pipeline", "Running fault tree generation pipeline")
+
+    tree_data = generate_fault_tree(top_event, requirements)
+
+    if progress_callback:
+        progress_callback(90, "persistence", "Generation completed, persisting result")
+
+    return tree_data
 
 
 def _extract_keywords(text: str) -> List[str]:
