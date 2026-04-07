@@ -17,7 +17,7 @@ import { toPng } from 'html-to-image'
 import 'reactflow/dist/style.css'
 
 const EVENT_NODE_W = 140
-const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '基本事件' }
+const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '底事件' }
 const FITVIEW_PADDING = 0.15
 
 function getErrorLevelCategory(errorLevel) {
@@ -212,7 +212,7 @@ function buildLayout(nodes, edges) {
 
   // 对于未从根可达的节点（多个连通分量、孤立节点），
   // 在主树下方按“类型分行、同类型横向排布”的方式尽量分散：
-  // 顶事件一排、中间事件一排、基本事件一排。
+  // 顶事件一排、中间事件一排，底事件一排。
   const placedIds = new Set(centerMap.keys())
   if (placedIds.size < nodes.length) {
     let maxCy = 0
@@ -341,10 +341,17 @@ function FitViewButton({ resetLayout, onResetViewFlag }) {
   )
 }
 
-function LegendPanel({ viewMode = 'type' }) {
+function LegendPanel({ viewMode = 'type', position = 'bottom-left' }) {
   const [open, setOpen] = useState(false)
+  const panelStyle =
+    position === 'top-left'
+      ? {
+          marginTop: 92, // 避开 ReactFlow 左上角 Controls
+          marginLeft: 8,
+        }
+      : undefined
   return (
-    <Panel position="bottom-left">
+    <Panel position={position} style={panelStyle}>
       {open && (
         <div className="fta-legend">
           <div className="fta-legend-title">图例</div>
@@ -404,7 +411,7 @@ function LegendPanel({ viewMode = 'type' }) {
                 </div>
                 <div className="fta-legend-item">
                   <span className="fta-legend-icon fta-legend-icon--basic" />
-                  <span>基本事件</span>
+                  <span>底事件</span>
                 </div>
               </>
             )}
@@ -459,6 +466,7 @@ function CanvasInner({
   canvasActionsRef,
   theme = 'light',
   viewMode = 'type',
+  legendPosition = 'bottom-left',
 }) {
   const init = useMemo(() => {
     const layout = buildLayout(graphData.nodes || [], graphData.edges || [])
@@ -478,6 +486,7 @@ function CanvasInner({
   const [nodes, setNodes] = useState(init.rfNodes)
   const [edges, setEdges] = useState(init.rfEdges)
   const [userAdjustedView, setUserAdjustedView] = useState(false)
+  const [miniMapOpen, setMiniMapOpen] = useState(true)
   const { getNodes, fitView } = useReactFlow()
 
   useEffect(() => {
@@ -585,7 +594,30 @@ function CanvasInner({
       />
       {showChrome && (
         <>
-          <MiniMap nodeColor={() => '#818cf8'} maskColor="rgba(255,255,255,0.7)" />
+          {miniMapOpen ? (
+            <MiniMap
+              nodeColor={() => '#818cf8'}
+              maskColor={
+                theme === 'dark'
+                  ? 'rgba(15, 23, 42, 0.72)'
+                  : 'rgba(255, 255, 255, 0.7)'
+              }
+              style={{
+                backgroundColor: theme === 'dark' ? '#0f172a' : '#f8fafc',
+              }}
+            />
+          ) : null}
+          <Panel position="bottom-right" style={{ marginRight: 8, marginBottom: 8 }}>
+            <button
+              type="button"
+              className="fta-minimap-toggle"
+              onClick={() => setMiniMapOpen((v) => !v)}
+              title={miniMapOpen ? '隐藏小地图' : '展开小地图'}
+              aria-label={miniMapOpen ? '隐藏小地图' : '展开小地图'}
+            >
+              {miniMapOpen ? '▦' : '▣'}
+            </button>
+          </Panel>
           <Controls showInteractive={false} position="top-left" />
           <FitViewButton
             resetLayout={() => {
@@ -594,7 +626,7 @@ function CanvasInner({
             }}
             onResetViewFlag={() => setUserAdjustedView(false)}
           />
-          <LegendPanel viewMode={viewMode} />
+          <LegendPanel viewMode={viewMode} position={legendPosition} />
         </>
       )}
     </ReactFlow>
@@ -605,6 +637,7 @@ export default function FaultTreeCanvas({
   canvasActionsRef,
   theme = 'light',
   viewMode = 'type',
+  legendPosition = 'bottom-left',
   ...props
 }) {
   return (
@@ -614,6 +647,7 @@ export default function FaultTreeCanvas({
         canvasActionsRef={canvasActionsRef}
         theme={theme}
         viewMode={viewMode}
+        legendPosition={legendPosition}
       />
     </ReactFlowProvider>
   )

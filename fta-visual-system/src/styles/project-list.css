@@ -7,6 +7,19 @@
   box-sizing: border-box;
 }
 
+.project-hero-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.project-hero-icon {
+  width: 42px;
+  height: 42px;
+  flex-shrink: 0;
+  display: block;
+}
+
 .project-hero-title {
   margin: 0;
   font-size: clamp(1.75rem, 4.2vw, 2.35rem);
@@ -31,6 +44,13 @@
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
+}
+
+.project-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-shrink: 0;
 }
 
 .project-section-label {
@@ -201,4 +221,71 @@
 
 .project-empty--wide {
   grid-column: 1 / -1;
+}
+
+/* 夜间主题 */
+[data-theme='dark'] .project-page {
+  background: #0b1120;
+  color: #e5e7eb;
+}
+
+[data-theme='dark'] .project-hero-title {
+  color: #f1f5f9;
+}
+
+[data-theme='dark'] .project-hero-desc {
+  color: #94a3b8;
+}
+
+[data-theme='dark'] .project-section-label {
+  color: #cbd5e1;
+}
+
+[data-theme='dark'] .project-card {
+  border-color: #334155;
+  background: #0f172a;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35);
+}
+
+[data-theme='dark'] .project-card:hover {
+  border-color: #818cf8;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+
+[data-theme='dark'] .project-card-name {
+  color: #f1f5f9;
+}
+
+[data-theme='dark'] .project-card-row dt {
+  color: #64748b;
+}
+
+[data-theme='dark'] .project-card-row dd {
+  color: #cbd5e1;
+}
+
+[data-theme='dark'] .project-empty {
+  border-color: #475569;
+  color: #94a3b8;
+  background: rgba(15, 23, 42, 0.55);
+}
+
+[data-theme='dark'] .project-status--upload {
+  background: #1e293b;
+  color: #94a3b8;
+}
+
+[data-theme='dark'] .project-status--build {
+  background: rgba(99, 102, 241, 0.25);
+  color: #c7d2fe;
+}
+
+[data-theme='dark'] .project-status--review {
+  background: rgba(251, 146, 60, 0.2);
+  color: #fdba74;
+}
+
+[data-theme='dark'] .project-status--done {
+  background: rgba(34, 197, 94, 0.18);
+  color: #86efac;
 }

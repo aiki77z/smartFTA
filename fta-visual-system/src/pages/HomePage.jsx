@@ -1,6 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { generateTree } from '../api/ftaBackend.js'
+import {
+  generateAllTrees,
+  generateTree,
+  pollBatchJob,
+  pollGenerationJobItem,
+} from '../api/ftaBackend.js'
+import GenerationTaskPanel from '../components/GenerationTaskPanel.jsx'
 import {
   clearProjectReviewed,
   DEFAULT_WORKSPACE_MESSAGES,
@@ -11,6 +17,8 @@ import {
   renameProjectFromFirstFile,
   saveWorkspace,
 } from '../utils/projectStore.js'
+import { IconChevronLeft } from '../components/icons.jsx'
+import ThemeToggle from '../components/ThemeToggle.jsx'
 import '../styles/home.css'
 
 const DEFAULT_TOP_EVENT = '示例设备总故障'
@@ -140,6 +148,36 @@ function extractTopEvent(input) {
   return DEFAULT_TOP_EVENT
 }
 
+/**
+ * 与本地存储兼容：旧数据无 status；
+ * 任务恢复策略：queued/running 不再直接判定为失败，而是在页面加载后自动恢复轮询。
+ */
+function normalizeStoredResultItems(items) {
+  if (!Array.isArray(items)) return []
+  return items
+    .filter(Boolean)
+    .map((it) => {
+      if (!it.status) {
+        return {
+          ...it,
+          status: 'completed',
+          progress: 100,
+          promptPreview: it.promptPreview || it.title || '',
+        }
+      }
+      if (it.status === 'queued' || it.status === 'running') {
+        return {
+          ...it,
+          // 保持原状态，提示用户正在恢复（具体进度会由恢复轮询覆盖）
+          message: it.message || '正在恢复任务进度…',
+          stage: it.stage || 'resume',
+          error: null,
+        }
+      }
+      return it
+    })
+}
+
 function HomePage() {
   const navigate = useNavigate()
   const { projectId = '' } = useParams()
@@ -152,11 +190,17 @@ function HomePage() {
   const [resultItems, setResultItems] = useState([])
   const [workspaceReady, setWorkspaceReady] = useState(false)
   const [previewModalOpen, setPreviewModalOpen] = useState(false)
-  const [generating, setGenerating] = useState(false)
-  const [generateError, setGenerateError] = useState('')
+  const [batchGenerating, setBatchGenerating] = useState(false)
   const skipTitleBlurRef = useRef(false)
+  const executionQueueRef = useRef([])
+  const drainingRef = useRef(false)
+  const resumePollersRef = useRef(new Map())
   /** 仅内存：上传的 File 对象，用于本地预览；不写入 localStorage */
   const fileObjectStoreRef = useRef(new Map())
+
+  const patchResultTask = useCallback((taskId, patch) => {
+    setResultItems((prev) => prev.map((t) => (t.id === taskId ? { ...t, ...patch } : t)))
+  }, [])
 
   useEffect(() => {
     if (!projectId) return
@@ -173,7 +217,7 @@ function HomePage() {
       setMessages(
         ws.messages?.length ? ws.messages : [...DEFAULT_WORKSPACE_MESSAGES],
       )
-      setResultItems(ws.resultItems || [])
+      setResultItems(normalizeStoredResultItems(ws.resultItems || []))
     } else {
       setFiles([])
       setMessages([...DEFAULT_WORKSPACE_MESSAGES])
@@ -193,6 +237,129 @@ function HomePage() {
     if (!projectId || !workspaceReady) return
     saveWorkspace(projectId, { files, messages, resultItems })
   }, [projectId, workspaceReady, files, messages, resultItems])
+
+  // 任务轮询恢复：切换项目/离开页面时终止；在任务列表变化时按需启动新的轮询
+  useEffect(() => {
+    if (!projectId || !workspaceReady) return undefined
+    return () => {
+      resumePollersRef.current.forEach((controller) => controller.abort())
+      resumePollersRef.current = new Map()
+    }
+  }, [projectId, workspaceReady])
+
+  useEffect(() => {
+    if (!projectId || !workspaceReady) return
+
+    const startResume = (task) => {
+      if (!task?.id) return
+      if (resumePollersRef.current.has(task.id)) return
+      if (task.status !== 'queued' && task.status !== 'running') return
+      const hasItem = Boolean(task.itemId)
+      const hasJob = Boolean(task.jobId)
+      if (!hasItem && !hasJob) return
+
+      const controller = new AbortController()
+      resumePollersRef.current.set(task.id, controller)
+
+      patchResultTask(task.id, {
+        status: 'running',
+        error: null,
+        message: task.message || '正在恢复任务进度…',
+        stage: task.stage || 'resume',
+      })
+
+      ;(async () => {
+        try {
+          if (hasItem) {
+            const finalItem = await pollGenerationJobItem({
+              itemId: task.itemId,
+              signal: controller.signal,
+              onUpdate: (item) => {
+                patchResultTask(task.id, {
+                  progress: item.progress ?? 0,
+                  stage: item.stage || item.status || '',
+                  message: item.message || '',
+                  title: item.top_event || task.title || '',
+                })
+              },
+            })
+            if (finalItem.status === 'success') {
+              patchResultTask(task.id, {
+                status: 'completed',
+                progress: 100,
+                faultTreeId: finalItem.tree_id || task.faultTreeId || null,
+                stage: 'completed',
+                message: finalItem.message || '生成完成',
+                error: null,
+              })
+            } else if (finalItem.status === 'failed') {
+              patchResultTask(task.id, {
+                status: 'failed',
+                progress: finalItem.progress ?? 100,
+                faultTreeId: finalItem.tree_id || task.faultTreeId || null,
+                stage: finalItem.stage || 'failed',
+                message: finalItem.message || '生成失败',
+                error: finalItem.error || '生成失败',
+              })
+            }
+          } else if (hasJob) {
+            const finalJob = await pollBatchJob({
+              jobId: task.jobId,
+              signal: controller.signal,
+              onUpdate: (job) => {
+                const total = Number(job?.total)
+                const success = Number(job?.success)
+                const failed = Number(job?.failed)
+                const done =
+                  (Number.isFinite(success) ? success : 0) + (Number.isFinite(failed) ? failed : 0)
+                const progress =
+                  Number.isFinite(total) && total > 0 ? Math.round((done / total) * 100) : 0
+                patchResultTask(task.id, {
+                  progress,
+                  stage: job?.stage || job?.status || '',
+                  message:
+                    job?.message ||
+                    (Number.isFinite(total)
+                      ? `批量生成中：${done}/${total}（成功 ${success || 0}，失败 ${failed || 0}）`
+                      : task.message || ''),
+                })
+              },
+            })
+            const st = String(finalJob?.status || '').toLowerCase()
+            if (st === 'failed') {
+              patchResultTask(task.id, {
+                status: 'failed',
+                stage: finalJob?.stage || 'failed',
+                message: finalJob?.message || '批量任务失败',
+                error: finalJob?.error || '批量任务失败',
+              })
+            } else {
+              patchResultTask(task.id, {
+                status: 'completed',
+                progress: 100,
+                stage: finalJob?.stage || 'completed',
+                message: finalJob?.message || '批量生成任务已完成',
+                error: null,
+              })
+            }
+          }
+        } catch (e) {
+          if (e?.name === 'AbortError') return
+          patchResultTask(task.id, {
+            status: 'failed',
+            stage: 'failed',
+            message: '任务进度恢复失败',
+            error: e?.message || '任务进度恢复失败',
+          })
+        } finally {
+          // 任务结束后允许重新启动（例如用户刷新后再次恢复）
+          resumePollersRef.current.delete(task.id)
+        }
+      })()
+    }
+
+    resultItems.forEach(startResume)
+  }, [projectId, workspaceReady, resultItems, patchResultTask])
 
   useEffect(() => {
     if (!previewModalOpen) return undefined
@@ -291,6 +458,202 @@ function HomePage() {
     setEditingProjectName(false)
   }
 
+  const runGenerationTask = useCallback(
+    async ({ taskId, userPrompt }) => {
+      patchResultTask(taskId, {
+        status: 'running',
+        message: '正在连接后端…',
+        progress: 0,
+        stage: 'prepare',
+      })
+
+      let resp
+      try {
+        resp = await generateTree({ prompt: userPrompt })
+      } catch (e) {
+        if (e?.name === 'AbortError') return
+        const topEvent = extractTopEvent(userPrompt)
+        const faultTreeId = `ft-${Date.now()}`
+        patchResultTask(taskId, {
+          status: 'completed',
+          progress: 100,
+          faultTreeId,
+          title: topEvent,
+          stage: 'demo',
+          message: '演示数据（后端不可用）',
+          error: null,
+        })
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `a-${Date.now()}`,
+            role: 'assistant',
+            content: `后端生成失败，已为您创建演示用结果（顶事件：${topEvent}）。`,
+          },
+        ])
+        return
+      }
+
+      const topEvent = resp?.parsed_prompt?.top_event || extractTopEvent(userPrompt)
+
+      if (resp.mode === 'reuse') {
+        const treeId = resp.tree_id
+        patchResultTask(taskId, {
+          status: 'completed',
+          progress: 100,
+          faultTreeId: treeId,
+          title: topEvent,
+          stage: 'reuse',
+          message: '已复用已有故障树',
+          error: null,
+        })
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `a-${Date.now()}`,
+            role: 'assistant',
+            content: `已为您生成顶事件为${topEvent}的故障树（ID：${treeId}）`,
+          },
+        ])
+        return
+      }
+
+      if (resp.mode === 'queued') {
+        const itemId = resp.item_id
+        if (!itemId) {
+          patchResultTask(taskId, {
+            status: 'failed',
+            progress: 0,
+            stage: 'failed',
+            message: '无法跟踪进度',
+            error: '后端未返回 item_id',
+          })
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `a-${Date.now()}`,
+              role: 'assistant',
+              content: '生成任务已提交，但后端未返回任务标识，无法展示进度。',
+            },
+          ])
+          return
+        }
+        patchResultTask(taskId, {
+          jobId: resp.job_id,
+          itemId,
+          title: topEvent,
+          progress: resp.progress ?? 0,
+          stage: 'queued',
+          message: '任务已提交，等待执行…',
+        })
+        let finalItem
+        try {
+          finalItem = await pollGenerationJobItem({
+            itemId,
+            onUpdate: (item) => {
+              patchResultTask(taskId, {
+                progress: item.progress ?? 0,
+                stage: item.stage || '',
+                message: item.message || '',
+                title: item.top_event || topEvent,
+              })
+            },
+          })
+        } catch (pollErr) {
+          if (pollErr?.name === 'AbortError') return
+          patchResultTask(taskId, {
+            status: 'failed',
+            progress: 0,
+            stage: 'failed',
+            message: '无法获取任务进度',
+            error: pollErr?.message || '轮询任务失败',
+          })
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `a-${Date.now()}`,
+              role: 'assistant',
+              content: `任务进度查询失败：${pollErr?.message || '未知错误'}`,
+            },
+          ])
+          return
+        }
+
+        if (finalItem.status === 'success') {
+          const tid = finalItem.tree_id
+          patchResultTask(taskId, {
+            status: 'completed',
+            progress: 100,
+            faultTreeId: tid,
+            title: finalItem.top_event || topEvent,
+            stage: 'completed',
+            message: finalItem.message || '生成完成',
+            error: null,
+          })
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `a-${Date.now()}`,
+              role: 'assistant',
+              content: `已为您生成顶事件为${finalItem.top_event || topEvent}的故障树（ID：${tid}）`,
+            },
+          ])
+        } else {
+          patchResultTask(taskId, {
+            status: 'failed',
+            progress: finalItem.progress ?? 100,
+            faultTreeId: finalItem.tree_id || null,
+            stage: finalItem.stage || 'failed',
+            message: finalItem.message || '生成失败',
+            error: finalItem.error || '生成失败',
+          })
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `a-${Date.now()}`,
+              role: 'assistant',
+              content: `生成失败：${finalItem.error || '未知错误'}`,
+            },
+          ])
+        }
+        return
+      }
+
+      patchResultTask(taskId, {
+        status: 'failed',
+        progress: 0,
+        stage: 'failed',
+        message: '无法解析后端响应',
+        error: resp?.mode ? `未知的生成响应：${resp.mode}` : '未知的生成响应',
+      })
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          content: '后端返回了无法识别的生成结果，请检查接口版本。',
+        },
+      ])
+    },
+    [patchResultTask],
+  )
+
+  const drainGenerationQueue = useCallback(async () => {
+    if (drainingRef.current) return
+    drainingRef.current = true
+    try {
+      while (executionQueueRef.current.length > 0) {
+        const job = executionQueueRef.current.shift()
+        await runGenerationTask(job)
+      }
+    } finally {
+      drainingRef.current = false
+      if (executionQueueRef.current.length > 0) {
+        void drainGenerationQueue()
+      }
+    }
+  }, [runGenerationTask])
+
   const handleTitleBlur = () => {
     if (skipTitleBlurRef.current) {
       skipTitleBlurRef.current = false
@@ -304,50 +667,127 @@ function HomePage() {
     handleProjectNameSave()
   }
 
-  const handleSend = async () => {
+  const handleSend = () => {
     const text = chatInput.trim()
     if (!text) return
 
     const now = Date.now()
+    const taskId = `task-${now}-${Math.random().toString(36).slice(2, 9)}`
+    const promptPreview = text.length > 80 ? `${text.slice(0, 80)}…` : text
 
     clearProjectReviewed(projectId)
 
-    setGenerating(true)
-    setGenerateError('')
     setMessages((prev) => [...prev, { id: `u-${now}`, role: 'user', content: text, at: now }])
+    setResultItems((prev) => [
+      {
+        id: taskId,
+        createdAt: now,
+        userPrompt: text,
+        promptPreview,
+        title: extractTopEvent(text),
+        faultTreeId: null,
+        status: 'queued',
+        progress: 0,
+        stage: 'queued',
+        message: '排队中',
+        error: null,
+        jobId: null,
+        itemId: null,
+      },
+      ...prev,
+    ])
+    setChatInput('')
+
+    executionQueueRef.current.push({ taskId, userPrompt: text })
+    void drainGenerationQueue()
+  }
+
+  const runGenerateAll = useCallback(async () => {
+    if (!projectId) return
+    if (batchGenerating) return
+    setBatchGenerating(true)
+    const now = Date.now()
+    const taskId = `batch-${now}-${Math.random().toString(36).slice(2, 9)}`
+    setResultItems((prev) => [
+      {
+        id: taskId,
+        createdAt: now,
+        userPrompt: '',
+        promptPreview: '批量生成当前知识库中可识别的全部顶事件故障树',
+        title: '批量生成全部故障树',
+        faultTreeId: null,
+        status: 'running',
+        progress: 0,
+        stage: 'queued',
+        message: '正在提交批量任务…',
+        error: null,
+        jobId: null,
+        itemId: null,
+      },
+      ...prev,
+    ])
 
     try {
-      const resp = await generateTree({ prompt: text })
-      const topEvent = resp?.parsed_prompt?.top_event || extractTopEvent(text)
-      const treeId = resp?.tree_id || `ft-${Date.now()}`
-      const assistantReply = `已为您生成顶事件为${topEvent}的故障树（ID：${treeId}）`
+      const resp = await generateAllTrees()
+      const jobId = resp?.job_id || resp?.jobId || ''
+      if (!jobId) throw new Error('后端未返回 job_id')
 
-      setMessages((prev) => [
-        ...prev,
-        { id: `a-${now + 1}`, role: 'assistant', content: assistantReply },
-      ])
-      setResultItems((prev) => [
-        { id: `r-${now}`, faultTreeId: treeId, title: topEvent, createdAt: now },
-        ...prev,
-      ])
-      setChatInput('')
+      patchResultTask(taskId, {
+        jobId,
+        progress: 0,
+        stage: resp?.status || 'queued',
+        message: `已发现 ${resp?.discovered_total ?? '—'} 个顶事件，入队 ${resp?.queued_count ?? '—'} 个`,
+      })
+
+      await pollBatchJob({
+        jobId,
+        onUpdate: (job) => {
+          const total = Number(job?.total)
+          const success = Number(job?.success)
+          const failed = Number(job?.failed)
+          const done = (Number.isFinite(success) ? success : 0) + (Number.isFinite(failed) ? failed : 0)
+          const pct = Number.isFinite(total) && total > 0 ? Math.round((done / total) * 100) : 0
+          patchResultTask(taskId, {
+            progress: pct,
+            stage: job?.stage || job?.status || '',
+            message:
+              job?.message ||
+              (Number.isFinite(total)
+                ? `批量生成中：${done}/${total}（成功 ${success || 0}，失败 ${failed || 0}）`
+                : `批量任务进行中（job_id: ${jobId}）`),
+          })
+        },
+      })
+
+      patchResultTask(taskId, {
+        status: 'completed',
+        progress: 100,
+        stage: 'completed',
+        message: '批量生成任务已完成（可在右侧任务条目中查看单树任务进度）',
+        error: null,
+      })
     } catch (e) {
-      const topEvent = extractTopEvent(text)
-      const faultTreeId = `ft-${Date.now()}`
-      const assistantReply = `后端生成失败，已为您创建演示用结果（顶事件：${topEvent}）。`
-      setGenerateError(e?.message || '后端生成失败')
+      if (e?.name === 'AbortError') return
+      patchResultTask(taskId, {
+        status: 'failed',
+        progress: 0,
+        stage: 'failed',
+        message: '批量任务提交失败',
+        error: e?.message || '批量生成失败',
+      })
       setMessages((prev) => [
         ...prev,
-        { id: `a-${now + 1}`, role: 'assistant', content: assistantReply },
+        { id: `a-${Date.now()}`, role: 'assistant', content: `批量生成失败：${e?.message || '未知错误'}` },
       ])
-      setResultItems((prev) => [
-        { id: `r-${now}`, faultTreeId, title: topEvent, createdAt: now },
-        ...prev,
-      ])
-      setChatInput('')
     } finally {
-      setGenerating(false)
+      setBatchGenerating(false)
     }
+  }, [projectId, batchGenerating, patchResultTask])
+
+  const openFaultTree = (faultTreeId) => {
+    navigate(
+      `/fta-viewer?projectId=${encodeURIComponent(projectId)}&faultTreeId=${encodeURIComponent(faultTreeId)}`,
+    )
   }
 
   return (
@@ -356,9 +796,11 @@ function HomePage() {
         <button
           type="button"
           className="home-back-btn"
+          title="返回"
+          aria-label="返回"
           onClick={() => navigate('/')}
         >
-          返回
+          <IconChevronLeft />
         </button>
         <header className="home-header">
           <div>
@@ -393,6 +835,7 @@ function HomePage() {
             )}
             <p className="home-subtitle">知识库构建 · AI 对话生成 · 故障树编辑</p>
           </div>
+          <ThemeToggle />
         </header>
       </div>
 
@@ -508,47 +951,38 @@ function HomePage() {
               onChange={(e) => setChatInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSend()}
               placeholder="请输入你的需求..."
-              disabled={generating}
             />
             <button
               type="button"
               className="home-send-btn"
               onClick={handleSend}
-              disabled={generating || !chatInput.trim()}
+              disabled={!chatInput.trim()}
             >
-              {generating ? '生成中…' : '发送'}
+              发送
             </button>
           </div>
-          {generateError && <div className="home-chat-error">后端错误：{generateError}</div>}
         </section>
 
         <section className="home-panel home-panel--right">
-          <h2 className="home-panel-title">故障树</h2>
-          <p className="home-panel-desc">点击条目可进入故障树编辑画布页面。</p>
+          <h2 className="home-panel-title">生成任务与结果</h2>
+          <p className="home-panel-desc">
+            任务按队列依次执行；生成中也可继续发起新任务。完成后点击条目进入编辑画布。
+          </p>
+
+          <div style={{ display: 'flex', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="home-send-btn"
+              onClick={runGenerateAll}
+              disabled={batchGenerating}
+              title="调用 /api/batch/generate-all 批量生成"
+            >
+              批量生成全部故障树
+            </button>
+          </div>
 
           <div className="home-result-list">
-            {resultItems.length === 0 && (
-              <div className="home-empty">暂无结果。请在中间栏发起生成任务。</div>
-            )}
-            {resultItems.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                className="home-result-item"
-                onClick={() =>
-                  navigate(
-                    `/fta-viewer?projectId=${encodeURIComponent(projectId)}&faultTreeId=${encodeURIComponent(item.faultTreeId)}`,
-                  )
-                }
-              >
-                <span className="home-result-dot" />
-                <span className="home-result-text">
-                  {item.title}
-                  <span className="home-result-id">ID: {item.faultTreeId}</span>
-                </span>
-                <span className="home-result-link">进入编辑</span>
-              </button>
-            ))}
+            <GenerationTaskPanel tasks={resultItems} onOpenTree={openFaultTree} />
           </div>
         </section>
       </main>

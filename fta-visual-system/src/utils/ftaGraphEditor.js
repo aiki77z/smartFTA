@@ -115,7 +115,7 @@ export function addChildNode(
     // 现在语义改为“在其下添加子节点”：在 parent 与 gate 之间插入新事件：
     // 子事件们 -> gateChildId -> newNode -> parentId
 
-    // 强制新节点为中间事件，以避免“非叶基本事件”
+    // 强制新节点为中间事件，以避免“非叶底事件”
     nodes = nodes.map((n) =>
       n.id === newId
         ? {

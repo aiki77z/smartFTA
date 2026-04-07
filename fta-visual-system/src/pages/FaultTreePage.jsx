@@ -3,14 +3,30 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import { markProjectReviewed } from '../utils/projectStore.js'
 import FaultTreeCanvas from '../components/fta/FaultTreeCanvas.jsx'
 import rawFtaSample from '../raw-FTA/raw-FTA-new.json'
+import ExplodedViewer from '../components/ExplodedViewer.jsx'
 import {
   getTree,
+  getTreeHistory,
+  getTreeVersion,
   saveTree,
   validateFaultTreeGraph,
   validateTreeSemantic,
   getChunk,
 } from '../api/ftaBackend.js'
 import { parseRawFtaJson, parseTreeDataJson } from '../utils/ftaParser.js'
+import {
+  IconChevronLeft,
+  IconClose,
+  IconBraces,
+  IconCube,
+  IconMinus,
+  IconRedo,
+  IconUndo,
+} from '../components/icons.jsx'
+import { useTheme } from '../components/ThemeProvider.jsx'
+import ThemeToggle from '../components/ThemeToggle.jsx'
+import SaveDescriptionModal from '../components/SaveDescriptionModal.jsx'
+import VersionSelect from '../components/VersionSelect.jsx'
 import {
   addChildNode,
   addChildUnderGate,
@@ -33,7 +49,7 @@ import {
 import '../styles/fta.css'
 import '../styles/fta-error-level.css'
 
-const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '基本事件' }
+const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '底事件' }
 const EVENT_TYPES = ['top', 'intermediate', 'basic']
 // 当快照 JSON 文本过长时，/fta-viewer?snapshot=... 可能触发 Vite 431（Request Header Fields Too Large）
 // 这里先用“文本长度”做前置限制，避免高保真导出直接失败。
@@ -154,7 +170,20 @@ function splitEmbeddedValidation(obj) {
   }
 }
 
+function formatVersionDate(createdAt) {
+  if (createdAt == null) return '—'
+  if (typeof createdAt === 'string') {
+    const d = new Date(createdAt)
+    return Number.isNaN(d.getTime()) ? createdAt : d.toLocaleString()
+  }
+  if (typeof createdAt === 'object' && createdAt.$date != null) {
+    return new Date(createdAt.$date).toLocaleString()
+  }
+  return '—'
+}
+
 function FaultTreePage() {
+  const { theme } = useTheme()
   const navigate = useNavigate()
   const location = useLocation()
   const projectIdFromQuery = useMemo(() => {
@@ -234,10 +263,23 @@ function FaultTreePage() {
   const [showAiPanel, setShowAiPanel] = useState(true)
   const [history, setHistory] = useState([])
   const [redoHistory, setRedoHistory] = useState([])
-  const [theme, setTheme] = useState('light')
   const [exportModalOpen, setExportModalOpen] = useState(false)
+  /** 后端返回的版本元数据列表（不含 tree_data） */
+  const [versionList, setVersionList] = useState([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState('')
+  const [jsonPanelOpen, setJsonPanelOpen] = useState(true)
+  const [explodedPanelOpen, setExplodedPanelOpen] = useState(false)
+  const [backendMeta, setBackendMeta] = useState({
+    editor: '',
+    created_at: null,
+    description: '',
+    is_ai_generated: false,
+  })
   const canvasRef = useRef(null)
   const canvasActionsRef = useRef(null)
+
+  const sidePanelOpen = jsonPanelOpen || explodedPanelOpen
 
   // 高保真导出需要把故障树 JSON 放在 querystring 里（/fta-viewer?snapshot=...），
   // 为避免 JSON 太长触发 431，这里只保留“渲染所需”的最小字段，删除 description/message 等无关内容。
@@ -300,6 +342,78 @@ function FaultTreePage() {
   const hasUnsavedChanges = useMemo(
     () => canonicalJsonString(rawJsonText) !== canonicalJsonString(baselineJsonText),
     [rawJsonText, baselineJsonText],
+  )
+
+  const sortedVersionOptions = useMemo(() => {
+    if (!versionList.length) return []
+    return [...versionList].sort((a, b) => b.version - a.version)
+  }, [versionList])
+
+  const latestVersion = useMemo(() => {
+    if (!versionList.length) return null
+    return Math.max(...versionList.map((v) => v.version))
+  }, [versionList])
+
+  const viewingHistorical = useMemo(
+    () =>
+      Boolean(
+        backendVersion != null &&
+          latestVersion != null &&
+          backendVersion < latestVersion,
+      ),
+    [backendVersion, latestVersion],
+  )
+
+  const applyBackendVersionPayload = useCallback((ver) => {
+    const { trimmed, logic, ai } = splitEmbeddedValidation(ver)
+    const loadedText = JSON.stringify(trimmed, null, 2)
+    setRawJsonText(loadedText)
+    setBaselineJsonText(canonicalJsonString(loadedText))
+    setGraphData(normalizeToGraph(trimmed))
+    setBackendVersion(ver?.version ?? null)
+    setBackendMeta({
+      editor: ver?.editor || '',
+      created_at: ver?.created_at ?? null,
+      description: ver?.description || '',
+      is_ai_generated: !!ver?.is_ai_generated,
+    })
+    if (logic) setValidation(logic)
+    else setValidation(null)
+    if (ai) setAiEmbeddedValidation(ai)
+    else setAiEmbeddedValidation(null)
+    setHistory([])
+    setRedoHistory([])
+    setError('')
+    setAiSemanticLastSig('')
+    setAiSemanticValidation(null)
+    setAiSemanticNotice('')
+    setSelectedNode(null)
+    setChunkPanelOpen(false)
+    setChunkPanelChunkIds([])
+    setChunkPanelActiveId(null)
+    setChunkPanelData({})
+  }, [])
+
+  const handleVersionSelect = useCallback(
+    async (nextVersion) => {
+      if (!backendTreeId || !Number.isFinite(nextVersion)) return
+      if (nextVersion === backendVersion) return
+      setBackendLoading(true)
+      setError('')
+      try {
+        const ver = await getTreeVersion({ treeId: backendTreeId, version: nextVersion })
+        applyBackendVersionPayload(ver)
+      } catch (e) {
+        if (e?.name === 'AbortError') return
+        const msg = String(e?.message || '')
+        if (msg.toLowerCase().includes('aborted') || msg.toLowerCase().includes('signal is aborted')) return
+        console.error(e)
+        setError(e?.message || '加载该版本失败')
+      } finally {
+        setBackendLoading(false)
+      }
+    },
+    [backendTreeId, backendVersion, applyBackendVersionPayload],
   )
 
   useEffect(() => {
@@ -453,6 +567,7 @@ function FaultTreePage() {
   const handleCheck = useCallback(async () => {
     setError('')
     setNotice('')
+    setShowAiPanel(true)
     // 先刷新一次规则校验
     const v = await runRuleValidation()
     if (!v || v.error_count > 0) return
@@ -462,8 +577,7 @@ function FaultTreePage() {
       setAiSemanticNotice('没有新的修改。')
       return
     }
-    // 规则通过且有新修改后自动进行 AI 语义校验，并在右下角显示
-    setShowAiPanel(true)
+    // 规则通过且有新修改后自动进行 AI 语义校验，并在面板中显示
     await runSemanticValidation()
   }, [runRuleValidation, runSemanticValidation, aiSemanticLastSig, editSignature])
 
@@ -509,35 +623,39 @@ function FaultTreePage() {
     if (!treeIdFromQuery) return
     const controller = new AbortController()
     setBackendLoading(true)
+    setHistoryLoading(true)
     setError('')
     setNotice('')
+    setHistoryError('')
     ;(async () => {
       try {
-        const ver = await getTree({ treeId: treeIdFromQuery, signal: controller.signal })
+        const [ver, hist] = await Promise.all([
+          getTree({ treeId: treeIdFromQuery, signal: controller.signal }),
+          getTreeHistory({ treeId: treeIdFromQuery, signal: controller.signal }).catch((e) => {
+            console.error(e)
+            setHistoryError(e?.message || '加载版本列表失败')
+            return []
+          }),
+        ])
+        if (controller.signal.aborted) return
         setBackendTreeId(treeIdFromQuery)
-        setBackendVersion(ver?.version ?? null)
-        // 剪下生成时附带的 validation，避免左侧 JSON 面板过长，并用于左右下角面板展示
-        const { trimmed, logic, ai } = splitEmbeddedValidation(ver)
-        const loadedText = JSON.stringify(trimmed, null, 2)
-        setRawJsonText(loadedText)
-        setBaselineJsonText(canonicalJsonString(loadedText))
-        setGraphData(normalizeToGraph(trimmed))
-        if (logic) setValidation(logic)
-        if (ai) setAiEmbeddedValidation(ai)
+        setVersionList(Array.isArray(hist) ? hist : [])
+        applyBackendVersionPayload(ver)
       } catch (e) {
-        // React Dev StrictMode 下 effect 可能被执行两次，第一次会在 cleanup 里 abort，
-        // 这类 AbortError 不应展示为“真实错误”。
         if (e?.name === 'AbortError') return
         const msg = String(e?.message || '')
         if (msg.toLowerCase().includes('aborted')) return
         setError(e?.message || '从后端加载故障树失败')
       } finally {
-        setBackendLoading(false)
+        if (!controller.signal.aborted) {
+          setBackendLoading(false)
+          setHistoryLoading(false)
+        }
       }
     })()
 
     return () => controller.abort()
-  }, [treeIdFromQuery])
+  }, [treeIdFromQuery, applyBackendVersionPayload])
 
   const handleJsonChange = useCallback((e) => {
     setRawJsonText(e.target.value)
@@ -629,7 +747,7 @@ function FaultTreePage() {
     }
   }, [hiResSnapshotText, theme])
 
-  const handleSubmit = useCallback(async () => {
+  const doSubmit = useCallback(async (descriptionInput) => {
     setError('')
     setNotice('')
     // 提交前强制刷新一次规则校验结果（validator-service）
@@ -641,18 +759,38 @@ function FaultTreePage() {
       return
     }
 
+    const desc = (descriptionInput || '').trim() || '前端保存'
+
     setAiLoading(true)
     setAiError('')
     setAiValidation(null)
     try {
       const treeData = extractTreeDataForBackend({ rawJsonText, graphData, parsedInfo })
-      const resp = await saveTree({ treeId: backendTreeId, treeData, editor: '专家', description: '前端保存' })
+      const resp = await saveTree({ treeId: backendTreeId, treeData, editor: '专家', description: desc })
       setBackendVersion(resp?.version ?? backendVersion)
       setAiValidation({
         suggestions: `已保存为版本 ${resp?.version ?? ''}。学习条目数：${resp?.learned_count ?? 0}`,
       })
       setNotice(`已保存到后端（tree_id=${backendTreeId}，version=${resp?.version ?? ''}）`)
       setBaselineJsonText(canonicalJsonString(rawJsonText))
+      try {
+        const hist = await getTreeHistory({ treeId: backendTreeId })
+        setVersionList(Array.isArray(hist) ? hist : [])
+        const vnum = resp?.version
+        if (vnum != null && Array.isArray(hist)) {
+          const row = hist.find((x) => x?.version === vnum)
+          if (row) {
+            setBackendMeta({
+              editor: row?.editor || '',
+              created_at: row?.created_at ?? null,
+              description: row?.description || '',
+              is_ai_generated: !!row?.is_ai_generated,
+            })
+          }
+        }
+      } catch {
+        /* 刷新版本列表失败不影响保存结果 */
+      }
     } catch (e) {
       console.error(e)
       setAiError(e?.message || '保存失败')
@@ -661,6 +799,10 @@ function FaultTreePage() {
       setAiLoading(false)
     }
   }, [backendTreeId, backendVersion, graphData, parsedInfo, rawJsonText, runRuleValidation])
+
+  const handleSubmit = useCallback(() => {
+    setModal({ type: 'saveDesc', value: '' })
+  }, [])
 
   const handleNodeContextMenu = useCallback(
     (event, rfNode) => {
@@ -711,10 +853,10 @@ function FaultTreePage() {
   const doAddChildUnderGate = useCallback(
     (gateId) => {
       const existing = graphData.nodes.filter((n) =>
-        typeof n.label === 'string' && n.label.startsWith('新基本事件'),
+        typeof n.label === 'string' && n.label.startsWith('新底事件'),
       )
       const nextIndex = existing.length + 1
-      const name = `新基本事件${nextIndex}`
+      const name = `新底事件${nextIndex}`
       applyEdit(addChildUnderGate(graphData, gateId, name, 'basic'))
       setSelectedNode(null)
     },
@@ -758,6 +900,16 @@ function FaultTreePage() {
   const doChangeType = useCallback(
     (nodeId, newType) => {
       applyEdit(changeEventType(graphData, nodeId, newType))
+      setSelectedNode((sel) => {
+        if (!sel || sel.id !== nodeId) return sel
+        return {
+          ...sel,
+          data: {
+            ...sel.data,
+            type: newType,
+          },
+        }
+      })
     },
     [graphData, applyEdit],
   )
@@ -840,7 +992,7 @@ function FaultTreePage() {
           ? '新顶事件'
           : eventType === 'intermediate'
             ? '新中间事件'
-            : '新基本事件'
+            : '新底事件'
       const existing = graphData.nodes.filter(
         (n) => typeof n.label === 'string' && n.label.startsWith(baseLabel),
       )
@@ -1133,7 +1285,11 @@ function FaultTreePage() {
       top: Math.min(y, window.innerHeight - MENU_MAX_HEIGHT - 8),
     }
     return (
-      <div className="fta-context-menu" style={menuStyle}>
+      <div
+        className="fta-context-menu"
+        style={menuStyle}
+        onMouseLeave={() => setEdgeMenu(null)}
+      >
         <button
           className="fta-context-menu-item fta-context-menu-item--danger"
           onClick={() => doDeleteEdge(edgeId)}
@@ -1167,7 +1323,7 @@ function FaultTreePage() {
           onClick={() => doAddStandaloneNode('basic')}
         >
           <span className="fta-ctx-icon">●</span>
-          新建基本事件
+          新建底事件
         </button>
       </div>
     )
@@ -1189,6 +1345,19 @@ function FaultTreePage() {
       )
     }
 
+    if (modal.type === 'saveDesc') {
+      return (
+        <SaveDescriptionModal
+          initialValue={modal.value || ''}
+          onConfirm={(desc) => {
+            setModal(null)
+            doSubmit(desc)
+          }}
+          onCancel={() => setModal(null)}
+        />
+      )
+    }
+
     return null
   }
 
@@ -1198,52 +1367,68 @@ function FaultTreePage() {
         <button
           type="button"
           className="fta-btn ghost fta-back-home-btn"
+          title="返回"
+          aria-label="返回"
           onClick={() => {
             if (projectIdFromQuery) markProjectReviewed(projectIdFromQuery)
             navigate(projectIdFromQuery ? `/project/${projectIdFromQuery}` : '/')
           }}
         >
-          返回
+          <IconChevronLeft />
         </button>
         <header className="fta-header">
-          <div>
-            <h1 className="fta-title">故障树可视化编辑</h1>
+          <div className="fta-header-text">
+            <div className="fta-header-title-row">
+              <h1 className="fta-title">故障树可视化编辑</h1>
+              {backendTreeId && sortedVersionOptions.length > 0 && (
+                <div className="fta-version-right">
+                  <div className="fta-version-toolbar">
+                    <label htmlFor="fta-version-select" className="fta-version-label">
+                      切换版本
+                    </label>
+                    <VersionSelect
+                      id="fta-version-select"
+                      value={backendVersion}
+                      options={sortedVersionOptions}
+                      disabled={backendLoading || historyLoading}
+                      onChange={handleVersionSelect}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
             <p className="fta-subtitle">
               右键节点可编辑 · 双击修改名称 · 操作自动同步 JSON
             </p>
             {backendTreeId && (
-              <p className="fta-subtitle" style={{ marginTop: '0.25rem' }}>
-                后端树：<strong>{backendTreeId}</strong>
-                {backendVersion ? ` · 当前版本 ${backendVersion}` : ''}
-                {backendLoading ? ' · 加载中…' : ''}
-              </p>
+              <>
+                <p className="fta-subtitle" style={{ marginTop: '0.25rem' }}>
+                  后端树：<strong>{backendTreeId}</strong>
+                </p>
+              </>
             )}
           </div>
           <div className="fta-header-actions">
+            <ThemeToggle variant="fta" />
             <button
               type="button"
-              className="fta-btn ghost"
-              onClick={() =>
-                setTheme((t) => (t === 'light' ? 'dark' : 'light'))
-              }
-            >
-              {theme === 'light' ? '夜间' : '日间'}
-            </button>
-            <button
-              type="button"
-              className="fta-btn ghost"
+              className="fta-btn ghost fta-header-icon-btn"
               onClick={handleUndo}
               disabled={history.length === 0}
+              title="撤销"
+              aria-label="撤销"
             >
-              撤销
+              <IconUndo />
             </button>
             <button
               type="button"
-              className="fta-btn ghost"
+              className="fta-btn ghost fta-header-icon-btn"
               onClick={handleRedo}
               disabled={redoHistory.length === 0}
+              title="重做"
+              aria-label="重做"
             >
-              重做
+              <IconRedo />
             </button>
             <button type="button" className="fta-btn ghost" onClick={handleDownloadJson}>
               下载 JSON
@@ -1256,20 +1441,37 @@ function FaultTreePage() {
             >
               导出图片
             </button>
-            <button
-              type="button"
-              className="fta-btn ghost"
-              onClick={handleCheck}
-              disabled={
-                !hasGraph ||
-                validationLoading ||
-                (validation && validation.error_count > 0) ||
-                backendLoading
-              }
-              title="调用规则校验服务 /validate-fault-tree"
-            >
-              校验
-            </button>
+            <div className="fta-ai-anchor">
+              <button
+                type="button"
+                className="fta-btn ghost"
+                onClick={handleCheck}
+                disabled={
+                  !hasGraph ||
+                  validationLoading ||
+                  (validation && validation.error_count > 0) ||
+                  backendLoading
+                }
+                title="调用AI校验服务"
+              >
+                AI校验
+              </button>
+              {showAiPanel && (
+                <AiValidationPanel
+                  anchored
+                  result={aiValidation}
+                  embeddedValidation={aiEmbeddedValidation}
+                  semanticValidation={aiSemanticValidation}
+                  semanticLoading={aiSemanticLoading}
+                  semanticError={aiSemanticError}
+                  semanticNotice={aiSemanticNotice}
+                  semanticStale={aiSemanticStale}
+                  loading={aiLoading}
+                  error={aiError}
+                  onHide={() => setShowAiPanel(false)}
+                />
+              )}
+            </div>
             <button
               type="button"
               className="fta-btn primary"
@@ -1289,26 +1491,128 @@ function FaultTreePage() {
         </header>
       </div>
 
-      <main className="fta-main">
-        <section className="fta-side">
-          <h2 className="fta-section-title">故障树 JSON</h2>
-          <p className="fta-section-desc">
-            画布编辑自动同步此处。也可粘贴 JSON 后点击"应用到画布"。
-          </p>
-          <textarea
-            className="fta-json-input"
-            value={rawJsonText}
-            onChange={handleJsonChange}
-            spellCheck={false}
-          />
-          <button type="button" className="fta-btn full" onClick={handleApplyJson}>
-            应用到画布
-          </button>
-          {notice && <p className="fta-notice-text">{notice}</p>}
-          {error && <p className="fta-error-text">{error}</p>}
-        </section>
+      <main
+        className={`fta-main${sidePanelOpen ? '' : ' fta-main--json-collapsed'}${
+          explodedPanelOpen ? ' fta-main--exploded-open' : ''
+        }`}
+      >
+        {sidePanelOpen ? (
+          <section className="fta-side fta-side--multi">
+            <div className="fta-side-panels">
+              {explodedPanelOpen ? (
+                <div className="fta-side-panel fta-side-panel--exploded">
+                  <div className="fta-side-head">
+                    <h2 className="fta-section-title" style={{ margin: 0 }}>
+                      设备爆炸图
+                    </h2>
+                    <button
+                      type="button"
+                      className="fta-json-collapse"
+                      title="关闭爆炸图面板"
+                      aria-label="关闭爆炸图面板"
+                      onClick={() => setExplodedPanelOpen(false)}
+                    >
+                      <IconClose />
+                    </button>
+                  </div>
+                  <p className="fta-section-desc">后续将支持“事件 ↔ 部件”映射与闪烁联动。</p>
+                  <div className="fta-exploded-wrap">
+                    <ExplodedViewer />
+                  </div>
+                </div>
+              ) : null}
+
+              {jsonPanelOpen ? (
+                <div
+                  className={`fta-side-panel${
+                    !explodedPanelOpen ? ' fta-side-panel--json-solo' : ''
+                  }`}
+                >
+                  <div className="fta-side-head">
+                    <h2 className="fta-section-title" style={{ margin: 0 }}>
+                      故障树 JSON
+                    </h2>
+                    <button
+                      type="button"
+                      className="fta-json-collapse"
+                      title="关闭 JSON 面板"
+                      aria-label="关闭 JSON 面板"
+                      onClick={() => setJsonPanelOpen(false)}
+                    >
+                      <IconClose />
+                    </button>
+                  </div>
+                  <p className="fta-section-desc">
+                    画布编辑自动同步此处。也可粘贴 JSON 后点击&quot;应用到画布&quot;。
+                  </p>
+                  <div className="fta-json-editor">
+                    <textarea
+                      className="fta-json-input"
+                      value={rawJsonText}
+                      onChange={handleJsonChange}
+                      spellCheck={false}
+                    />
+                    <div className="fta-json-editor-footer">
+                      <button type="button" className="fta-btn primary" onClick={handleApplyJson}>
+                        应用到画布
+                      </button>
+                    </div>
+                  </div>
+                  {notice && <p className="fta-notice-text">{notice}</p>}
+                  {error && <p className="fta-error-text">{error}</p>}
+                </div>
+              ) : null}
+            </div>
+          </section>
+        ) : null}
 
         <section className="fta-canvas-section">
+          {!sidePanelOpen && (
+            <div className="fta-side-expand-stack" aria-hidden={false}>
+              <button
+                type="button"
+                className="fta-json-expand"
+                title="展开 JSON 面板"
+                aria-label="展开 JSON 面板"
+                onClick={() => setJsonPanelOpen(true)}
+              >
+                <IconBraces />
+              </button>
+              <button
+                type="button"
+                className="fta-json-expand fta-json-expand--exploded"
+                title="展开设备爆炸图"
+                aria-label="展开设备爆炸图"
+                onClick={() => setExplodedPanelOpen(true)}
+              >
+                <IconCube />
+              </button>
+            </div>
+          )}
+
+          {sidePanelOpen && !jsonPanelOpen && (
+            <button
+              type="button"
+              className="fta-json-expand"
+              title="展开 JSON 面板"
+              aria-label="展开 JSON 面板"
+              onClick={() => setJsonPanelOpen(true)}
+            >
+              <IconBraces />
+            </button>
+          )}
+
+          {sidePanelOpen && !explodedPanelOpen && (
+            <button
+              type="button"
+              className="fta-json-expand fta-json-expand--exploded"
+              title="展开设备爆炸图"
+              aria-label="展开设备爆炸图"
+              onClick={() => setExplodedPanelOpen(true)}
+            >
+              <IconCube />
+            </button>
+          )}
           <div className="fta-canvas-toolbar">
             <h2 className="fta-section-title" style={{ margin: 0 }}>
               故障树画布
@@ -1360,6 +1664,7 @@ function FaultTreePage() {
                 canvasActionsRef={canvasActionsRef}
                 theme={theme}
                 viewMode={viewMode}
+                legendPosition={jsonPanelOpen ? 'bottom-left' : 'top-left'}
                 showChrome
               />
             </div>
@@ -1370,14 +1675,6 @@ function FaultTreePage() {
                 }`}
               >
                 <div className="fta-right-dock fta-right-dock--node">
-                  <button
-                    type="button"
-                    className="fta-dock-arrow"
-                    title="关闭节点详情"
-                    onClick={() => setSelectedNode(null)}
-                  >
-                    ◀
-                  </button>
                   <NodeInfoPanel
                     selectedNode={selectedNode}
                     selectedMeta={selectedMeta}
@@ -1415,36 +1712,13 @@ function FaultTreePage() {
       </main>
 
       <ValidationPanel
-        title="逻辑校验（规则引擎）"
+        title="逻辑校验"
         validation={validation}
         loading={validationLoading}
         error={validationError}
         show={showValidationPanel}
         onToggle={() => setShowValidationPanel((v) => !v)}
       />
-
-      {showAiPanel ? (
-        <AiValidationPanel
-          result={aiValidation}
-          embeddedValidation={aiEmbeddedValidation}
-          semanticValidation={aiSemanticValidation}
-          semanticLoading={aiSemanticLoading}
-          semanticError={aiSemanticError}
-          semanticNotice={aiSemanticNotice}
-          semanticStale={aiSemanticStale}
-          loading={aiLoading}
-          error={aiError}
-          onHide={() => setShowAiPanel(false)}
-        />
-      ) : (
-        <button
-          type="button"
-          className="fta-ai-minimized"
-          onClick={() => setShowAiPanel(true)}
-        >
-          AI 建议
-        </button>
-      )}
 
       {renderContextMenu()}
       {renderEdgeMenu()}
@@ -1624,8 +1898,14 @@ function NodeInfoPanel({
             )}
           </div>
         </div>
-        <button type="button" className="fta-btn ghost" onClick={onClose}>
-          关闭
+        <button
+          type="button"
+          className="fta-btn ghost fta-node-panel-close-btn"
+          title="关闭"
+          aria-label="关闭"
+          onClick={onClose}
+        >
+          <IconClose />
         </button>
       </div>
 
@@ -2164,6 +2444,7 @@ function ValidationPanel({ title = '逻辑校验', validation, loading, error, s
 }
 
 function AiValidationPanel({
+  anchored = false,
   result,
   embeddedValidation,
   semanticValidation,
@@ -2205,7 +2486,7 @@ function AiValidationPanel({
   }
 
   return (
-    <div className="fta-ai-panel">
+    <div className={`fta-ai-panel${anchored ? ' fta-ai-panel--anchored' : ''}`}>
       <div className="fta-ai-header">
         <span className="fta-ai-title">AI 校验与优化建议</span>
         <div className="fta-ai-header-right">
@@ -2219,9 +2500,11 @@ function AiValidationPanel({
           <button
             type="button"
             className="fta-ai-hide-btn"
+            title="隐藏"
+            aria-label="隐藏"
             onClick={onHide}
           >
-            隐藏
+            <IconMinus />
           </button>
         </div>
       </div>

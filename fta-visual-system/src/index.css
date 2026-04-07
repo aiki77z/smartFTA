@@ -10,6 +10,12 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+[data-theme='dark'] {
+  color-scheme: dark;
+  color: #e5e7eb;
+  background-color: #0b1120;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -19,6 +25,11 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background-color: #f8fafc;
+}
+
+[data-theme='dark'] body {
+  background-color: #0b1120;
+  color: #e5e7eb;
 }
 
 h1 {

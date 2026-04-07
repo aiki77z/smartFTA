@@ -28,5 +28,9 @@ venv/
 .venv/
 env/
 
+# 3D 模型 GLB 文件
+exploded/
+*.tsx
+
 # validator-service
 __pycache__/*

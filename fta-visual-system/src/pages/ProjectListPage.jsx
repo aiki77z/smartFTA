@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import ThemeToggle from '../components/ThemeToggle.jsx'
 import { createProject, listProjectsSortedForListPage } from '../utils/projectStore.js'
 import '../styles/project-list.css'
 
@@ -29,22 +30,33 @@ function ProjectListPage() {
 
   return (
     <div className="project-page">
-      <h1 className="project-hero-title">故障树智能构建系统</h1>
+      <div className="project-hero-row">
+        <img
+          className="project-hero-icon"
+          src="/故障树分析.svg"
+          alt="故障树分析"
+          aria-hidden="true"
+        />
+        <h1 className="project-hero-title">故障树智能构建系统</h1>
+      </div>
       <p className="project-hero-desc">
         一轮数据上传 → AI 故障树构建 → 专家修改与审核，全流程以「项目」组织
       </p>
 
       <div className="project-toolbar">
         <h2 className="project-section-label">我的项目</h2>
-        <button
-          type="button"
-          className="project-fab"
-          title="新建项目"
-          aria-label="新建项目"
-          onClick={handleCreate}
-        >
-          +
-        </button>
+        <div className="project-toolbar-actions">
+          <ThemeToggle />
+          <button
+            type="button"
+            className="project-fab"
+            title="新建项目"
+            aria-label="新建项目"
+            onClick={handleCreate}
+          >
+            +
+          </button>
+        </div>
       </div>
 
       <div className="project-grid">
