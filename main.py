@@ -28,6 +28,7 @@ from database import (
     get_version,
     get_version_list,
     list_all_chunks,
+    list_entity_reverse_index,
     list_generation_job_items,
     refresh_generation_job,
     resolve_top_event_catalog,
@@ -43,7 +44,8 @@ from database import (
 from diff_analyzer import analyze_and_store, corrections_col, generate_change_description
 from generator import (
     build_top_event_normalized_candidates,
-    discover_top_events_from_chunks,
+    discover_top_events,
+    discover_top_events_from_entity_index,
     generate_fault_tree_with_progress,
     normalize_top_event_name,
     parse_user_prompt,
@@ -661,11 +663,17 @@ def api_generate(req: GenerateRequest):
 
 @app.post("/api/batch/generate-all")
 def api_batch_generate_all():
-    chunks = list_all_chunks()
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No chunks found, please import knowledge chunks first")
+    entity_index_entries = list_entity_reverse_index()
+    if entity_index_entries:
+        discovered = discover_top_events_from_entity_index(entity_index_entries)
+        discovery_source = "entity_reverse_index"
+    else:
+        chunks = list_all_chunks()
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No chunks found, please import knowledge chunks first")
+        discovered = discover_top_events(chunks)
+        discovery_source = "chunks"
 
-    discovered = discover_top_events_from_chunks(chunks)
     if not discovered:
         raise HTTPException(status_code=400, detail="No top events were discovered from chunks")
 
@@ -711,6 +719,7 @@ def api_batch_generate_all():
             "catalog_total": len(catalog_entries),
             "existing_count": existing_count,
             "active_count": active_count,
+            "discovery_source": discovery_source,
             "source": "/api/batch/generate-all",
         },
     )
@@ -737,6 +746,7 @@ def api_batch_generate_all():
         "catalog_total": len(catalog_entries),
         "existing_count": existing_count,
         "active_count": active_count,
+        "discovery_source": discovery_source,
         "queued_count": len(queued_entries),
         "queued_item_ids": queued_item_ids,
     }
@@ -859,7 +869,7 @@ def api_validate_semantic(req: SemanticValidateRequest):
 
 
 @app.get("/api/chunk/{chunk_id}")
-def api_get_chunk(chunk_id: int):
+def api_get_chunk(chunk_id: str):
     chunk = get_chunk_by_id(chunk_id)
     if not chunk:
         raise HTTPException(status_code=404, detail=f"chunk {chunk_id} 不存在")

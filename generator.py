@@ -11,11 +11,11 @@ generator.py —— 故障树生成模块（v3）
 
 import json
 import re
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from openai import OpenAI
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
-from database import search_chunks_by_keywords
+from database import search_chunks_by_entity_names, search_chunks_by_keywords
 from validator import validate_full
 
 client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
@@ -255,7 +255,7 @@ def build_fault_tree(top_event: str, elements: dict, chunks: list, requirements:
 
     chunks_ref = [
         {
-            "chunk_id": c["id"],
+            "chunk_id": _get_chunk_identifier(c),
             "chunk_name": c.get("chunk_name", ""),
             "section_path": c.get("section_path", ""),
             "source_page": c.get("source", ""),
@@ -324,7 +324,7 @@ def repair_fault_tree(draft_tree: dict, corrections_hint: str, chunks: list) -> 
     draft_text = json.dumps(draft_tree, ensure_ascii=False, indent=2)
     chunks_ref = [
         {
-            "chunk_id": c["id"],
+            "chunk_id": _get_chunk_identifier(c),
             "chunk_name": c.get("chunk_name", ""),
             "section_path": c.get("section_path", ""),
             "source_page": c.get("source", ""),
@@ -366,16 +366,35 @@ def repair_fault_tree(draft_tree: dict, corrections_hint: str, chunks: list) -> 
 
 
 def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
-    keywords = _extract_keywords(top_event)
-    if top_event not in keywords:
-        keywords = [top_event] + keywords
+    recall_candidates = build_top_event_normalized_candidates(top_event, [top_event])
+    if top_event not in recall_candidates:
+        recall_candidates = [top_event] + recall_candidates
 
-    chunks = search_chunks_by_keywords(keywords)
+    keywords = list(recall_candidates)
+    recall_source = "entity_reverse_index"
+    chunks = search_chunks_by_entity_names(recall_candidates)
+    if chunks:
+        print(
+            f"[召回] 顶事件 '{top_event}' 使用 entity_reverse_index 直接召回 {len(chunks)} 个 chunks，"
+            f"候选实体：{recall_candidates}"
+        )
+    else:
+        recall_source = "keyword_search_fallback"
+        keywords = _extract_keywords(top_event)
+        for candidate in recall_candidates:
+            if candidate not in keywords:
+                keywords.append(candidate)
+        chunks = search_chunks_by_keywords(keywords)
+        print(
+            f"[召回] 顶事件 '{top_event}' 未命中 entity_reverse_index，改用关键词兜底召回 {len(chunks)} 个 chunks，"
+            f"关键词：{keywords}"
+        )
+
     if not chunks:
         raise ValueError(f"未找到与'{top_event}'相关的知识，请检查chunks数据是否已导入")
 
     print(f"[生成] 顶事件：{top_event}")
-    print(f"[生成] 检索到 {len(chunks)} 个相关chunks，关键词：{keywords}")
+    print(f"[生成] 召回来源：{recall_source}，相关chunks数：{len(chunks)}")
 
     print("[生成] LLM#1：提取故障要素...")
     elements = extract_fault_elements(top_event, chunks)
@@ -534,6 +553,32 @@ def build_top_event_normalized_candidates(name: str, aliases: Optional[List[str]
     return normalized
 
 
+def _get_chunk_identifier(chunk: Optional[dict]) -> Any:
+    if not chunk:
+        return None
+    return chunk.get("id", chunk.get("chunk_id"))
+
+
+def _merge_top_event_catalog_item(catalog: Dict[str, dict], item: dict):
+    key = item["name"]
+    target = catalog.setdefault(
+        key,
+        {
+            "name": key,
+            "aliases": [],
+            "source_chunk_ids": [],
+        },
+    )
+
+    for alias in item.get("aliases", []):
+        if alias not in target["aliases"] and alias != key:
+            target["aliases"].append(alias)
+
+    for chunk_id in item.get("source_chunk_ids", []):
+        if chunk_id not in target["source_chunk_ids"]:
+            target["source_chunk_ids"].append(chunk_id)
+
+
 def is_valid_top_event_candidate(text: str) -> bool:
     candidate = normalize_top_event_name(text)
     if not candidate or len(candidate) < 2 or len(candidate) > 40:
@@ -573,8 +618,115 @@ def is_valid_top_event_candidate(text: str) -> bool:
     return True
 
 
+def is_valid_top_event_entity_candidate(text: str) -> bool:
+    candidate = normalize_top_event_name(text)
+    if not candidate or len(candidate) < 2 or len(candidate) > 60:
+        return False
+
+    if candidate in TOP_EVENT_SIGNAL_WORDS:
+        return False
+
+    if candidate in TOP_EVENT_GENERIC_EVENTS:
+        return False
+
+    if candidate.startswith("故障") or candidate.endswith("检测"):
+        return False
+
+    if re.fullmatch(r"[FA]\d{5}(?:\([A-Z]\))?", candidate, flags=re.IGNORECASE):
+        return False
+
+    if re.fullmatch(r"\d+", candidate):
+        return False
+
+    if re.fullmatch(r"[0-9A-F]{3,4}", candidate, flags=re.IGNORECASE):
+        return False
+
+    if re.fullmatch(r"\d+\s*[~\\-]\s*\d+", candidate):
+        return False
+
+    if not re.search(r"[\u4e00-\u9fff]", candidate):
+        if not candidate.startswith("STOP "):
+            return False
+
+    for pattern in TOP_EVENT_NOISE_PATTERNS:
+        if re.search(pattern, candidate, flags=re.IGNORECASE):
+            return False
+
+    if any(term in candidate for term in TOP_EVENT_NOISE_TERMS):
+        return False
+
+    if candidate.startswith("关联"):
+        return False
+
+    for component in GENERIC_COMPONENT_TERMS:
+        if candidate == component:
+            return False
+        if candidate in {f"{component}故障", f"{component}异常", f"{component}报警"}:
+            return False
+
+    return True
+
+
+def is_fault_phenomenon_entity(entity: dict) -> bool:
+    entity_name = str(entity.get("entity_name") or "").strip()
+    entity_type = str(entity.get("entity_type") or "").strip()
+
+    if not entity_name:
+        return False
+
+    if "故障现象" not in entity_type and "报警" not in entity_type:
+        return False
+
+    if re.fullmatch(r"[FA]\d{5}(?:\([A-Z]\))?", entity_name, flags=re.IGNORECASE):
+        return False
+
+    if re.fullmatch(r"\d+", entity_name):
+        return False
+
+    if re.fullmatch(r"[0-9A-F]{3,4}", entity_name, flags=re.IGNORECASE):
+        return False
+
+    return True
+
+
+def extract_top_event_candidates_from_entities(chunk: dict) -> List[dict]:
+    chunk_id = _get_chunk_identifier(chunk)
+    collected: Dict[str, dict] = {}
+
+    def add_candidate(name: str, aliases: Optional[List[str]] = None):
+        canonical = normalize_top_event_name(name)
+        if not is_valid_top_event_entity_candidate(canonical):
+            return
+
+        entry = collected.setdefault(
+            canonical,
+            {
+                "name": canonical,
+                "aliases": [],
+                "source_chunk_ids": [],
+            },
+        )
+
+        if chunk_id is not None and chunk_id not in entry["source_chunk_ids"]:
+            entry["source_chunk_ids"].append(chunk_id)
+
+        for alias in (aliases or []) + [name]:
+            alias_text = str(alias or "").strip()
+            if alias_text and alias_text != canonical and alias_text not in entry["aliases"]:
+                entry["aliases"].append(alias_text)
+
+    for entity in chunk.get("entities", []) or []:
+        if not isinstance(entity, dict) or not is_fault_phenomenon_entity(entity):
+            continue
+
+        entity_name = str(entity.get("entity_name") or "").strip()
+        add_candidate(entity_name)
+
+    return list(collected.values())
+
+
 def extract_top_event_candidates_from_chunk(chunk: dict) -> List[dict]:
-    chunk_id = chunk.get("id")
+    chunk_id = _get_chunk_identifier(chunk)
     chunk_name = str(chunk.get("chunk_name") or "").strip()
     content = str(chunk.get("content") or "")
     collected: Dict[str, dict] = {}
@@ -632,30 +784,53 @@ def extract_top_event_candidates_from_chunk(chunk: dict) -> List[dict]:
     return list(collected.values())
 
 
+def discover_top_events_from_chunk_entities(chunks: List[dict]) -> List[dict]:
+    catalog: Dict[str, dict] = {}
+
+    for chunk in chunks or []:
+        for item in extract_top_event_candidates_from_entities(chunk):
+            _merge_top_event_catalog_item(catalog, item)
+
+    return sorted(catalog.values(), key=lambda item: item["name"])
+
+
+def discover_top_events_from_entity_index(entries: List[dict]) -> List[dict]:
+    catalog: Dict[str, dict] = {}
+
+    for entry in entries or []:
+        if not isinstance(entry, dict) or not is_fault_phenomenon_entity(entry):
+            continue
+
+        name = str(entry.get("entity_name") or "").strip()
+        canonical = normalize_top_event_name(name)
+        if not is_valid_top_event_entity_candidate(canonical):
+            continue
+
+        item = {
+            "name": canonical,
+            "aliases": [name] if name and name != canonical else [],
+            "source_chunk_ids": [chunk_id for chunk_id in (entry.get("chunk_ids") or []) if chunk_id not in (None, "")],
+        }
+        _merge_top_event_catalog_item(catalog, item)
+
+    return sorted(catalog.values(), key=lambda item: item["name"])
+
+
 def discover_top_events_from_chunks(chunks: List[dict]) -> List[dict]:
     catalog: Dict[str, dict] = {}
 
     for chunk in chunks or []:
         for item in extract_top_event_candidates_from_chunk(chunk):
-            key = item["name"]
-            target = catalog.setdefault(
-                key,
-                {
-                    "name": key,
-                    "aliases": [],
-                    "source_chunk_ids": [],
-                },
-            )
-
-            for alias in item.get("aliases", []):
-                if alias not in target["aliases"] and alias != key:
-                    target["aliases"].append(alias)
-
-            for chunk_id in item.get("source_chunk_ids", []):
-                if chunk_id not in target["source_chunk_ids"]:
-                    target["source_chunk_ids"].append(chunk_id)
+            _merge_top_event_catalog_item(catalog, item)
 
     return sorted(catalog.values(), key=lambda item: item["name"])
+
+
+def discover_top_events(chunks: List[dict]) -> List[dict]:
+    discovered = discover_top_events_from_chunk_entities(chunks)
+    if discovered:
+        return discovered
+    return discover_top_events_from_chunks(chunks)
 
 
 def generate_fault_tree_with_progress(
@@ -693,7 +868,7 @@ def _format_chunks(chunks: list) -> str:
         if len(content) > MAX_CHUNK_CHARS:
             content = content[:MAX_CHUNK_CHARS] + "..."
         lines.append(
-            f"[chunk_id={chunk['id']} | {chunk.get('chunk_name', '')} | 章节:{chunk.get('section_path', '')} | 页码:{chunk.get('source', '')}]\n"
+            f"[chunk_id={_get_chunk_identifier(chunk)} | {chunk.get('chunk_name', '')} | 章节:{chunk.get('section_path', '')} | 页码:{chunk.get('source', '')}]\n"
             f"{content}\n"
             f"{'─' * 50}"
         )

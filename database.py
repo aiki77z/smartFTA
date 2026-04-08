@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ db = client[MONGO_DB_NAME]
 trees_col = db["fault_trees"]
 versions_col = db["fault_tree_versions"]
 chunks_col = db["chunks"]
+entity_reverse_index_col = db["entity_reverse_index"]
 top_event_catalog_col = db["top_event_catalog"]
 generation_jobs_col = db["generation_jobs"]
 generation_job_items_col = db["generation_job_items"]
@@ -62,10 +64,49 @@ def _decorate_runtime_fields(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str
     return copied
 
 
+def _get_chunk_identifier(doc: Optional[Dict[str, Any]]) -> Any:
+    if not doc:
+        return None
+    return doc.get("id", doc.get("chunk_id"))
+
+
+def _chunk_sort_key(doc: Dict[str, Any]):
+    chunk_id = _get_chunk_identifier(doc)
+    try:
+        return (0, int(chunk_id))
+    except (TypeError, ValueError):
+        return (1, str(chunk_id or ""))
+
+
+def _fetch_chunks_by_identifiers(chunk_ids: List[Any], limit: int) -> List[Dict[str, Any]]:
+    normalized_ids = _dedupe_keep_order(chunk_ids)
+    if not normalized_ids:
+        return []
+
+    numeric_ids = []
+    for chunk_id in normalized_ids:
+        try:
+            numeric_ids.append(int(str(chunk_id).strip()))
+        except (TypeError, ValueError):
+            continue
+
+    query = {
+        "$or": [
+            {"chunk_id": {"$in": normalized_ids}},
+            {"id": {"$in": _dedupe_keep_order(normalized_ids + numeric_ids)}},
+        ]
+    }
+    docs = list(chunks_col.find(query, {"_id": 0}))
+    docs.sort(key=_chunk_sort_key)
+    return docs[:limit]
+
+
 def _ensure_indexes():
     index_specs = [
         (trees_col, [("catalog_name", ASCENDING), ("updated_at", DESCENDING)]),
         (trees_col, [("normalized_top_event", ASCENDING), ("updated_at", DESCENDING)]),
+        (entity_reverse_index_col, [("entity_type", ASCENDING), ("count", DESCENDING)]),
+        (entity_reverse_index_col, [("entity_name", ASCENDING)]),
         (top_event_catalog_col, [("normalized_name", ASCENDING)]),
         (top_event_catalog_col, [("normalized_aliases", ASCENDING)]),
         (generation_jobs_col, [("status", ASCENDING), ("updated_at", DESCENDING)]),
@@ -91,6 +132,45 @@ def import_chunks(chunks: list):
     print(f"Imported {len(chunks)} chunks")
 
 
+def import_entity_reverse_index(entries: list):
+    """Import aggregated entity reverse-index data into MongoDB and replace old data."""
+    entity_reverse_index_col.drop()
+    if entries:
+        entity_reverse_index_col.insert_many(entries)
+    print(f"Imported {len(entries)} reverse-index entities")
+
+
+def list_entity_reverse_index() -> List[Dict[str, Any]]:
+    cursor = entity_reverse_index_col.find({}, {"_id": 0}).sort([("count", DESCENDING), ("entity_name", ASCENDING)])
+    return list(cursor)
+
+
+def search_chunks_by_entity_names(entity_names: List[str], limit: int = 8) -> list:
+    """
+    Recall chunks directly from the entity reverse index using exact entity names.
+    """
+    cleaned_names = []
+    for name in entity_names or []:
+        text = str(name).strip()
+        if text and text not in cleaned_names:
+            cleaned_names.append(text)
+
+    if not cleaned_names:
+        return []
+
+    reverse_index_hits = list(
+        entity_reverse_index_col.find(
+            {"entity_name": {"$in": cleaned_names}},
+            {"_id": 0, "chunk_ids": 1},
+        )
+    )
+    indexed_chunk_ids = []
+    for hit in reverse_index_hits:
+        indexed_chunk_ids.extend(hit.get("chunk_ids") or [])
+
+    return _fetch_chunks_by_identifiers(indexed_chunk_ids, limit)
+
+
 def search_chunks_by_keywords(keywords: list, limit: int = 8) -> list:
     """
     Search related chunks using exact keyword hit first, then fuzzy text match.
@@ -107,9 +187,28 @@ def search_chunks_by_keywords(keywords: list, limit: int = 8) -> list:
     results = []
     seen_ids = set()
 
+    reverse_index_hits = list(
+        entity_reverse_index_col.find(
+            {"entity_name": {"$in": cleaned_keywords}},
+            {"_id": 0, "chunk_ids": 1},
+        )
+    )
+    indexed_chunk_ids = []
+    for hit in reverse_index_hits:
+        indexed_chunk_ids.extend(hit.get("chunk_ids") or [])
+
+    for doc in _fetch_chunks_by_identifiers(indexed_chunk_ids, limit):
+        doc_id = _get_chunk_identifier(doc)
+        if doc_id not in seen_ids:
+            results.append(doc)
+            seen_ids.add(doc_id)
+
+    if len(results) >= limit:
+        return results[:limit]
+
     exact_hits = chunks_col.find({"key_word": {"$in": cleaned_keywords}}, limit=limit)
     for doc in exact_hits:
-        doc_id = doc.get("id")
+        doc_id = _get_chunk_identifier(doc)
         if doc_id not in seen_ids:
             results.append(doc)
             seen_ids.add(doc_id)
@@ -119,7 +218,7 @@ def search_chunks_by_keywords(keywords: list, limit: int = 8) -> list:
 
     regex_clauses = []
     for kw in cleaned_keywords:
-        regex = {"$regex": kw, "$options": "i"}
+        regex = {"$regex": re.escape(kw), "$options": "i"}
         regex_clauses.extend(
             [
                 {"chunk_name": regex},
@@ -133,7 +232,7 @@ def search_chunks_by_keywords(keywords: list, limit: int = 8) -> list:
     if regex_clauses:
         fuzzy_hits = chunks_col.find({"$or": regex_clauses}, limit=limit * 3)
         for doc in fuzzy_hits:
-            doc_id = doc.get("id")
+            doc_id = _get_chunk_identifier(doc)
             if doc_id not in seen_ids:
                 results.append(doc)
                 seen_ids.add(doc_id)
@@ -144,12 +243,26 @@ def search_chunks_by_keywords(keywords: list, limit: int = 8) -> list:
 
 
 def list_all_chunks() -> List[Dict[str, Any]]:
-    chunks = chunks_col.find({}, {"_id": 0}).sort("id", ASCENDING)
-    return list(chunks)
+    chunks = list(chunks_col.find({}, {"_id": 0}))
+    return sorted(chunks, key=_chunk_sort_key)
 
 
-def get_chunk_by_id(chunk_id: int) -> dict:
-    return chunks_col.find_one({"id": chunk_id})
+def get_chunk_by_id(chunk_id: Any) -> dict:
+    candidates = _dedupe_keep_order([chunk_id, str(chunk_id).strip()])
+    try:
+        numeric_value = int(str(chunk_id).strip())
+        candidates = _dedupe_keep_order(candidates + [numeric_value])
+    except (TypeError, ValueError):
+        pass
+
+    return chunks_col.find_one(
+        {
+            "$or": [
+                {"id": {"$in": candidates}},
+                {"chunk_id": {"$in": candidates}},
+            ]
+        }
+    )
 
 
 def create_tree(

@@ -1,21 +1,60 @@
 """
-import_chunks.py —— 一次性把JSON文件导入MongoDB
+Import chunk data into MongoDB.
 
-用法：
-  python import_chunks.py --file output_with_keywords.json
+Supports:
+- standard JSON array/object files
+- JSON Lines files where each line is a chunk object
 """
 
-import json
 import argparse
+import json
+
 from database import import_chunks
 
+
+def _load_chunks(file_path: str):
+    with open(file_path, "r", encoding="utf-8") as f:
+        raw_text = f.read().strip()
+
+    if not raw_text:
+        return []
+
+    try:
+        loaded = json.loads(raw_text)
+        if isinstance(loaded, list):
+            chunks = loaded
+        elif isinstance(loaded, dict):
+            chunks = [loaded]
+        else:
+            raise ValueError("Unsupported JSON root type")
+    except json.JSONDecodeError:
+        chunks = []
+        for line_no, line in enumerate(raw_text.splitlines(), start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                chunks.append(json.loads(text))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Failed to parse line {line_no} as JSON: {exc}") from exc
+
+    normalized_chunks = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        normalized_chunk = dict(chunk)
+        if "entities" not in normalized_chunk and isinstance(normalized_chunk.get("entity"), list):
+            normalized_chunk["entities"] = normalized_chunk["entity"]
+        normalized_chunks.append(normalized_chunk)
+
+    return normalized_chunks
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="导入chunks到MongoDB")
-    parser.add_argument("--file", required=True, help="JSON文件路径")
+    parser = argparse.ArgumentParser(description="Import chunks into MongoDB")
+    parser.add_argument("--file", required=True, help="Path to the chunk JSON or JSONL file")
     args = parser.parse_args()
 
-    with open(args.file, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
-
+    chunks = _load_chunks(args.file)
     import_chunks(chunks)
-    print("导入完成！")
+    print(f"Imported {len(chunks)} chunks successfully")

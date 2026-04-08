@@ -1,0 +1,3260 @@
+[
+    {
+        "entity_name": "通用型系列驱动系统",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "故障树分析",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "4",
+            "0",
+            "2"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "控制单元",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "12",
+            "6",
+            "13",
+            "18",
+            "7",
+            "26",
+            "19",
+            "4",
+            "16",
+            "0",
+            "14",
+            "11",
+            "2",
+            "20",
+            "23",
+            "17",
+            "22",
+            "15"
+        ],
+        "count": 18
+    },
+    {
+        "entity_name": "CU",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "7",
+            "14",
+            "0",
+            "22",
+            "15"
+        ],
+        "count": 5
+    },
+    {
+        "entity_name": "上位控制器",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "中间事件节点",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "功率单元",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "6",
+            "13",
+            "19",
+            "16",
+            "0"
+        ],
+        "count": 5
+    },
+    {
+        "entity_name": "电机",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "液压模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "13",
+            "18",
+            "19",
+            "16",
+            "20",
+            "14",
+            "0",
+            "17"
+        ],
+        "count": 8
+    },
+    {
+        "entity_name": "执行机构",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "过流",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "过热",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0",
+            "1"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "过载",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "3",
+            "0"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "功率电子元器件",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "硬件故障树",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "6",
+            "0"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "底事件",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "驱动系统停机",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "输出异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "电机模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "13",
+            "24",
+            "18",
+            "21",
+            "19",
+            "4",
+            "16",
+            "0",
+            "14",
+            "20",
+            "2",
+            "17",
+            "15"
+        ],
+        "count": 13
+    },
+    {
+        "entity_name": "MM",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "电机转速",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "转矩",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "电机过载",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "相位短路",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "制动控制故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STO",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "17",
+            "0"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "SS1",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "安全监控系统",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "安全停止响应",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "HLA",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "14",
+            "13",
+            "0",
+            "15"
+        ],
+        "count": 4
+    },
+    {
+        "entity_name": "断流阀",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "16",
+            "14",
+            "0",
+            "18"
+        ],
+        "count": 4
+    },
+    {
+        "entity_name": "断流阀连接故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "反馈信号异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "液压执行机构",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "动作异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "编码器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "6",
+            "24",
+            "26",
+            "21",
+            "0",
+            "22"
+        ],
+        "count": 6
+    },
+    {
+        "entity_name": "传感器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "6",
+            "0",
+            "21"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "通道 2 编码器模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "转速",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "位置",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "温度",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "实际值",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "闭环控制",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "实际值错误",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "信号丢失",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "23",
+            "0"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "端子模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "TM54F",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "17",
+            "0"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "TM31",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "故障安全数字输入模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "数字量",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "模拟量",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "安全指令",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "通讯组件",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "DRIVE-CLiQ 集线器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "通讯板",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "PROFINET 接口",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "4",
+            "0",
+            "10"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "通讯中断",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "数据传输错误",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "0"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "制动模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "16",
+            "1"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "电源滤波器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "1"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "冷却装置",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "1"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "风扇",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "12",
+            "10",
+            "26",
+            "1",
+            "8"
+        ],
+        "count": 5
+    },
+    {
+        "entity_name": "滤波异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "1"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "r0949",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "13",
+            "24",
+            "18",
+            "7",
+            "21",
+            "19",
+            "20",
+            "14",
+            "11",
+            "2",
+            "8",
+            "17",
+            "22",
+            "15"
+        ],
+        "count": 14
+    },
+    {
+        "entity_name": "r2124",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "12",
+            "9",
+            "2",
+            "8",
+            "22"
+        ],
+        "count": 5
+    },
+    {
+        "entity_name": "p9500",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "2"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9501",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19",
+            "2"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p9601",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "17",
+            "2"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "p9602",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "18",
+            "16",
+            "17",
+            "2"
+        ],
+        "count": 4
+    },
+    {
+        "entity_name": "p9610",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "17",
+            "2"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p9799",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19",
+            "16",
+            "2"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "p9899",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19",
+            "2"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p9510",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "20",
+            "2"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "PROFIBUS",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "17",
+            "15",
+            "2"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "p9612",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "17",
+            "2"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p0971",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19",
+            "2"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p0977",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "12",
+            "19",
+            "10",
+            "2"
+        ],
+        "count": 4
+    },
+    {
+        "entity_name": "p0976",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "10",
+            "11",
+            "2"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "热启动",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "15",
+            "20",
+            "11",
+            "2"
+        ],
+        "count": 4
+    },
+    {
+        "entity_name": "p9702",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19",
+            "10",
+            "2"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "SIPROFIsafe",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "2"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0115",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "电流控制器采样时间",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0304",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23",
+            "24",
+            "3"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "电机额定电压",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0305",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23",
+            "24",
+            "3"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "电机额定电流",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0310",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23",
+            "24",
+            "3"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "电机额定转速",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p1215",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "3",
+            "18"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "电机抱闸配置",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "3"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p1278",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "3",
+            "18"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "制动控制设置",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "3"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p9930",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "3",
+            "11",
+            "10"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "系统日志",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "3",
+            "10"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "日志文件大小",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "控制异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "隐性故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "电流控制器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "电机抱闸",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "3",
+            "14",
+            "18"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "电机铭牌",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "3"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "通讯故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4",
+            "5"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "Channel ErorType",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "GSDML 文件",
+        "entity_type": "工具与仪器",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "9000\\~9013",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "通道异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SIMATIC S7 诊断接口",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "DS1",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "0\\~19",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "PROFIBUS 接口",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "ErrorType",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "GSD 文件",
+        "entity_type": "工具与仪器",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "16\\~31",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "通道故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "ET 200 接口",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "ET 200pro FC-2 设备",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "9\\~31",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "设备通道异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "NAMUR 接口",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "r3113",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "0\\~15",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "DRIVE-CLiQ 协议",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "编码器模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "24",
+            "21",
+            "4",
+            "23",
+            "22"
+        ],
+        "count": 5
+    },
+    {
+        "entity_name": "内部通讯故障代码",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "热插拔",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "4"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "PROFIsafe 协议",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "5"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SIL2 安全等级",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "5"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "安全停止",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "5"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STOP A",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "5"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STOP F",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "5"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "目标地址",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "5",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "源地址",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "5",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "看门狗时间",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "5",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "安全控制器",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "5"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "驱动系统",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "12",
+            "6"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01000",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "7",
+            "11"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01002",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "7",
+            "11"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01003",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "7",
+            "11"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01014",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "7",
+            "11"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01015",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "7",
+            "11"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "PROFIdrive",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "13",
+            "7",
+            "9",
+            "14",
+            "8",
+            "22",
+            "15"
+        ],
+        "count": 7
+    },
+    {
+        "entity_name": "存储器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "7",
+            "11"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "DRIVE-CLiQ",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "7",
+            "20",
+            "24",
+            "18"
+        ],
+        "count": 4
+    },
+    {
+        "entity_name": "OFF2",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "13",
+            "7",
+            "14",
+            "22",
+            "15"
+        ],
+        "count": 5
+    },
+    {
+        "entity_name": "访问存储器时出现应答延迟",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "7"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "组件属性变化",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "7"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "内部软件错误",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "7",
+            "15",
+            "10"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "F01020",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "11"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "控制单元（CU）",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "8",
+            "9"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "写 RAM 失败",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "11"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "RAM",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "8",
+            "12",
+            "19"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "F01023",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "12"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "内部软件超时",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "12"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "A01013",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "12"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "A_INF",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "8",
+            "21",
+            "15"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "B_INF",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "8",
+            "21",
+            "15"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "CU_LINK",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "8"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "达到或超过风扇的使用寿命",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "A01016",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "12"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "控制单元存储器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "8"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "固件被修改",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "12"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "A01017",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "12"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "组件列表被更改",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "8",
+            "12"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "A01032（F）",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "9"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "ACX",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "9"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "控制单元主板",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "11",
+            "10"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "内部存储器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "固件存储模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "存储卡",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "12",
+            "24",
+            "11",
+            "10"
+        ],
+        "count": 4
+    },
+    {
+        "entity_name": "设备存储器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "12",
+            "10"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "RAM 芯片",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "11",
+            "10"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "DRIVE-CLiQ 接口",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "16",
+            "23",
+            "10"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "存储卡接口",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "r0945",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "11",
+            "10"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "r9925",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "12",
+            "10"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "r9926",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "r9999",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "接触不良",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "数据传输失败",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "固件读取异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "固件文件出错",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "10"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "故障缓冲器",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "11",
+            "10"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "电容",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "11"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "存储器访问应答延迟",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "11"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "可插拔存储器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "11"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "DRIVE-CLiQ 组件属性变化",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "11"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "DRIVE-CLiQ 组件",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "21",
+            "22",
+            "11"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "DRIVE-CLiQ 电缆",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "11"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "EMC 准则",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "11",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "屏蔽层",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "11",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "强电电缆",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "11"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0009",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "11"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "内部 RAM",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "11"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "风扇使用寿命到期",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "12"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "工作时间计数器",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "12"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p3961",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "12"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "非易失性存储器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "12"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "A01032",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "12"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "需要存储所有参数",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "12"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "ROM",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "12",
+            "19"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01600",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "13",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01611",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "13",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01612",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "13",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "安全监控通道",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "13",
+            "15"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "SERVO",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "13",
+            "14",
+            "22",
+            "15"
+        ],
+        "count": 4
+    },
+    {
+        "entity_name": "SERVO_AC",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "13",
+            "14",
+            "15"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "OFF1",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "13",
+            "14"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "OFF3",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "13",
+            "14"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "PROFIsafe",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "13",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "控制单元数字输入端",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "13"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "二进制映像",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "13"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STO 输入",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "13"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SICU:STOPA",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "13"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SIP1（CU）",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "13"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F01630",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "14",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "GLOBAL",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "14"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "制动绕组短路",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "14",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "制动控制出错",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "14",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01632",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "14",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "断流阀控制/反馈出错",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "14",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "A01631",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "14",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "制动组件",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "14"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SBC",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "14",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "电机抱闸/SBC 配置无意义",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "14",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01640",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19",
+            "14",
+            "15"
+        ],
+        "count": 3
+    },
+    {
+        "entity_name": "LOCAL",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "14"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "识别出组件更换并需应答/保存",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "14"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F01641",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19",
+            "15"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "一般驱动故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "15"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SIP1",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "15"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F01649",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19",
+            "15"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "硬件/软件故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "15"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SI P1",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "15"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F01650",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19",
+            "15"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "监控通道 2",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "19",
+            "15"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "监控通道 1",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "15"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "校验和",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "15"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "验收测试",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "19",
+            "15"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01651",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "20",
+            "15"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "安全时间片同步失败",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "20",
+            "15"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "安全制动适配器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "并联功率单元",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "16",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "制动绕组",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "16",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p9621",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9622",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9625",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9626",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p9650",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p9651",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9652",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9658",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9697",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9802",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p9826",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p7015",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "16",
+            "17"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "X272",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "X281/X282",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "16"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SICU",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STOPA",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "交叉比较数据",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "监控通道",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "控制定时器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "EP 端子",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F-DI",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9850",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "PROFINET",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F 参数",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "CRC 值",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "监控通道故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STO 端子",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STO 状态不一致",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "r9772",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "并联功率单元 STO 输入不同",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "公差时间",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STO 输入信号",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "17"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "电机抱闸装置",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "安全制动模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "X272 接口",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "X282 接口",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "电柜",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "26",
+            "18"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "屏蔽电缆",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "打开制动过程出错",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "闭合制动过程出错",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "控制单元制动控制故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "打开断流阀过程出错",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "断流阀已打开状态出错",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "闭合断流阀过程出错",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "控制/反馈或通讯故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "18"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "组件更换需应答/保存",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p2103",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "安全功能调试",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "组件更换需保存",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "r9776",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "SI 诊断",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "简化验收测试",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "安全功能内部软件错误",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "Safety Integrated",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "必须进行验收测试",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "130",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "无监控通道 2 安全参数",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "1000",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "2000",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "校验和不一致",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p9503",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "2003",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "2004",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "2005",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "3003",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "3005",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "参数或硬件更改",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "STO 功能",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "9999",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "其他安全故障后续反应",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "19"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "PROFIBUS 主站同步故障",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "20"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "PROFIBUS 主站",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "20"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "安全时间片同步",
+        "entity_type": "技术概念与方法",
+        "chunk_ids": [
+            "20"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F01034",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24",
+            "21"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01033",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24",
+            "21"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01010",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24",
+            "21"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "F01005",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24",
+            "21"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p0101",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24",
+            "21"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p0107",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24",
+            "21"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "参数值计算失败",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "21"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "参考参数无效",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "21"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "驱动类型不明",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24",
+            "21"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "固件失败",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "21"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "A01006",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "22"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "A01007",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "22"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F01012",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "22"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "VECTOR",
+        "entity_type": "技术系统与设备",
+        "chunk_ids": [
+            "22"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F01009",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "22"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "控制单元过热",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "26",
+            "22"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "编码器传感器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "位置传感器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "温度传感器",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "DRIVE-CLiQ 编码器接口",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "信号转换模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "固件不匹配",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0187",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0188",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0189",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0600",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0349",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24",
+            "23"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p005",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24",
+            "23"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p0595",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24",
+            "23"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p2000",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24",
+            "23"
+        ],
+        "count": 2
+    },
+    {
+        "entity_name": "p2001",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p7828",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p7829",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "编码器信号处理异常",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "单位转换失败",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "编码器信号接口",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "接口松动",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "信号干扰",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "编码器信号错误",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "23"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "单位转换：参考参数无效",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "p0596",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "单位转换：参考值更改后参数值计算失败",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "功率模块",
+        "entity_type": "硬件组件与元器件",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "固件",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "编码器模块固件下载失败",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "000B",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "校验和错误",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "固件文件",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "000F",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "组件不支持固件内容",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "0012",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "0013",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "固件与硬件版本不兼容",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "0065",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "通讯无应答",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "008B",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "仅载入引导程序",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "引导程序",
+        "entity_type": "参数与数据",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "008C",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "无固件文件",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "24"
+        ],
+        "count": 1
+    },
+    {
+        "entity_name": "F01009（N）",
+        "entity_type": "故障现象与报警",
+        "chunk_ids": [
+            "26"
+        ],
+        "count": 1
+    }
+]
