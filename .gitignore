@@ -14,6 +14,9 @@ __pycache__/
 # Archives
 *.zip
 
+# Data
+entity/
+
 # OS
 .DS_Store
 Thumbs.db
