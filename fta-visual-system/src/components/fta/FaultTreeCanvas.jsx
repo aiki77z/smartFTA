@@ -29,6 +29,33 @@ function getErrorLevelCategory(errorLevel) {
   return 'mild'
 }
 
+/** 解析 JSON event.probability（数字或可解析字符串）；无效返回 null */
+function parseEventProbability(raw) {
+  if (raw === null || raw === undefined || raw === '') return null
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? raw : null
+  }
+  const s = String(raw).trim()
+  if (!s) return null
+  const n = parseFloat(s.replace(/,/g, ''))
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * 概率分档（与图例一致）：
+ * p0: <0.01 或无法判断或超出 [0,1]
+ * p1: [0.01, 0.2)  p2: [0.2, 0.4)  p3: [0.4, 0.6)  p4: ≥0.6
+ */
+function getProbabilityCategory(p) {
+  if (p === null || p === undefined || !Number.isFinite(p)) return 'p0'
+  if (p < 0 || p > 1) return 'p0'
+  if (p < 0.01) return 'p0'
+  if (p < 0.2) return 'p1'
+  if (p < 0.4) return 'p2'
+  if (p < 0.6) return 'p3'
+  return 'p4'
+}
+
 function formatBasicLabel(text) {
   if (!text) return [text]
   const display = text.length > 16 ? text.slice(0, 15) + '…' : text
@@ -45,17 +72,22 @@ function EventNode({ data }) {
   const typeTag = TYPE_LABELS[data.type] || ''
 
   const errorLevel = data.meta?.event?.errorLevel
+  const probabilityRaw = data.meta?.event?.probability
   const viewMode = data.viewMode || 'type'
-  const shouldColorByErrorLevel = viewMode === 'errorLevel' && data.type !== 'top'
-  const errorCategory = shouldColorByErrorLevel
-    ? getErrorLevelCategory(errorLevel)
-    : null
-  const errorBgClass = errorCategory ? `fta-errorLevel-bg--${errorCategory}` : ''
+
+  let extraBgClass = ''
+  if (viewMode === 'errorLevel' && data.type !== 'top') {
+    const cat = getErrorLevelCategory(errorLevel)
+    extraBgClass = `fta-errorLevel-bg--${cat}`
+  } else if (viewMode === 'probability' && data.type !== 'top') {
+    const cat = getProbabilityCategory(parseEventProbability(probabilityRaw))
+    extraBgClass = `fta-probability-bg--${cat}`
+  }
 
   return (
     <div className="fta-node-container">
       <Handle type="target" position={Position.Top} className="fta-handle" />
-      <div className={`${cls}${errorBgClass ? ` ${errorBgClass}` : ''}`}>
+      <div className={`${cls}${extraBgClass ? ` ${extraBgClass}` : ''}`}>
         {typeTag && <div className="fta-node__type-tag">{typeTag}</div>}
         <div className="fta-node__label">
           {isBasic
@@ -94,13 +126,13 @@ function GateNode({ data }) {
         fill: '#E5E7EB',
         fontSize: '15px',
         fontWeight: 700,
-        fontFamily: 'SourceHanSerifCN, system-ui, -apple-system, sans-serif',
+        fontFamily: 'jyhphy, system-ui, -apple-system, sans-serif',
       }
     : {
         fill: isAnd ? '#92400e' : '#6b21a8',
         fontSize: '15px',
         fontWeight: 700,
-        fontFamily: 'SourceHanSerifCN, system-ui, -apple-system, sans-serif',
+        fontFamily: 'jyhphy, system-ui, -apple-system, sans-serif',
       }
   return (
     <div className={`fta-gate ${isAnd ? 'fta-gate--and' : 'fta-gate--or'}`}>
@@ -357,11 +389,7 @@ function LegendPanel({ viewMode = 'type', position = 'bottom-left' }) {
           <div className="fta-legend-title">图例</div>
           <div className="fta-legend-items">
             {viewMode === 'errorLevel' ? (
-              
-               
-              
               <div className="fta-legend-item" style={{ alignItems: 'flex-start' }}>
-                 
                 <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center' }}>
                   <div
                     style={{
@@ -399,6 +427,38 @@ function LegendPanel({ viewMode = 'type', position = 'bottom-left' }) {
                   </div>
                 </div>
               </div>
+            ) : viewMode === 'probability' ? (
+              <div
+                className="fta-legend-item"
+                style={{ alignItems: 'flex-start', flexDirection: 'column', gap: '0.35rem' }}
+              >
+                <span style={{ fontSize: '0.72rem', opacity: 0.85, lineHeight: 1.35 }}>
+                  中间/底事件分档着色
+                </span>
+                {[
+                  { key: 'p0', label: 'P < 0.01 或无法判断' },
+                  { key: 'p1', label: '0.01 ≤ P < 0.2' },
+                  { key: 'p2', label: '0.2 ≤ P < 0.4' },
+                  { key: 'p3', label: '0.4 ≤ P < 0.6' },
+                  { key: 'p4', label: 'P ≥ 0.6' },
+                ].map(({ key, label }) => (
+                  <div
+                    key={key}
+                    style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}
+                  >
+                    <span
+                      className={`fta-probability-legend-swatch--${key}`}
+                      style={{
+                        width: 18,
+                        height: 14,
+                        borderRadius: 4,
+                        flexShrink: 0,
+                      }}
+                    />
+                    <span style={{ fontSize: '0.78rem', lineHeight: 1.3 }}>{label}</span>
+                  </div>
+                ))}
+              </div>
             ) : (
               <>
                 <div className="fta-legend-item">
@@ -416,6 +476,12 @@ function LegendPanel({ viewMode = 'type', position = 'bottom-left' }) {
               </>
             )}
             {viewMode === 'errorLevel' && (
+              <div className="fta-legend-item">
+                <span className="fta-legend-icon fta-legend-icon--top" />
+                <span>顶事件</span>
+              </div>
+            )}
+            {viewMode === 'probability' && (
               <div className="fta-legend-item">
                 <span className="fta-legend-icon fta-legend-icon--top" />
                 <span>顶事件</span>

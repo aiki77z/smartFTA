@@ -48,6 +48,7 @@ import {
 } from '../utils/ftaGraphEditor.js'
 import '../styles/fta.css'
 import '../styles/fta-error-level.css'
+import '../styles/fta-probability.css'
 
 const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '底事件' }
 const EVENT_TYPES = ['top', 'intermediate', 'basic']
@@ -182,6 +183,15 @@ function formatVersionDate(createdAt) {
   return '—'
 }
 
+function extractObjectRefFromDescription(description) {
+  if (typeof description !== 'string') return ''
+  const m = description.match(/\[Ref:\s*(Object_(\d+))\]\s*$/)
+  if (!m) return ''
+  const n = Number(m[2])
+  if (!Number.isFinite(n) || n < 2 || n > 24) return ''
+  return m[1]
+}
+
 function FaultTreePage() {
   const { theme } = useTheme()
   const navigate = useNavigate()
@@ -236,6 +246,9 @@ function FaultTreePage() {
   const [backendVersion, setBackendVersion] = useState(null)
   const [backendLoading, setBackendLoading] = useState(false)
   const [selectedNode, setSelectedNode] = useState(null)
+  const [explodedHighlightNodeName, setExplodedHighlightNodeName] = useState('')
+  /** 每次在画布选中节点且爆炸图已打开时递增，保证 ExplodedViewer 立即/切换时同步高亮 */
+  const [explodedHighlightSync, setExplodedHighlightSync] = useState(0)
   const [chunkPanelOpen, setChunkPanelOpen] = useState(false)
   const [chunkPanelChunkIds, setChunkPanelChunkIds] = useState([])
   const [chunkPanelActiveId, setChunkPanelActiveId] = useState(null)
@@ -280,6 +293,28 @@ function FaultTreePage() {
   const canvasActionsRef = useRef(null)
 
   const sidePanelOpen = jsonPanelOpen || explodedPanelOpen
+
+  const handleNodeSelect = useCallback(
+    (node) => {
+      setSelectedNode(node)
+      if (!explodedPanelOpen) return
+      const desc = node?.data?.meta?.event?.description ?? ''
+      const ref = extractObjectRefFromDescription(desc)
+      setExplodedHighlightNodeName(ref || '')
+      setExplodedHighlightSync((s) => s + 1)
+    },
+    [explodedPanelOpen],
+  )
+
+  /** 侧栏从关到开时，用当前选中节点同步一次三维高亮 */
+  useEffect(() => {
+    if (!explodedPanelOpen) return
+    if (!selectedNode) return
+    const desc = selectedNode?.data?.meta?.event?.description ?? ''
+    const ref = extractObjectRefFromDescription(desc)
+    setExplodedHighlightNodeName(ref || '')
+    setExplodedHighlightSync((s) => s + 1)
+  }, [explodedPanelOpen])
 
   // 高保真导出需要把故障树 JSON 放在 querystring 里（/fta-viewer?snapshot=...），
   // 为避免 JSON 太长触发 431，这里只保留“渲染所需”的最小字段，删除 description/message 等无关内容。
@@ -1515,9 +1550,12 @@ function FaultTreePage() {
                       <IconClose />
                     </button>
                   </div>
-                  <p className="fta-section-desc">后续将支持“事件 ↔ 部件”映射与闪烁联动。</p>
+                  <p className="fta-section-desc">支持“事件 ↔ 部件”映射与闪烁联动。</p>
                   <div className="fta-exploded-wrap">
-                    <ExplodedViewer />
+                    <ExplodedViewer
+                      highlightNodeName={explodedHighlightNodeName}
+                      highlightSync={explodedHighlightSync}
+                    />
                   </div>
                 </div>
               ) : null}
@@ -1655,7 +1693,7 @@ function FaultTreePage() {
             >
               <FaultTreeCanvas
                 graphData={graphData}
-                onNodeSelect={setSelectedNode}
+                onNodeSelect={handleNodeSelect}
                 onNodeContextMenu={handleNodeContextMenu}
                 onPaneContextMenu={handlePaneContextMenu}
                 onNodeDoubleClick={handleNodeDoubleClick}

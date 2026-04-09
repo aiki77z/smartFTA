@@ -501,6 +501,80 @@ button.home-file-card {
   color: #334155;
 }
 
+.home-chat-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.home-chat-progress-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.home-chat-progress-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  font-weight: 800;
+  background: rgba(59, 130, 246, 0.16);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  color: inherit;
+  flex-shrink: 0;
+}
+
+.home-chat-progress-agent {
+  font-weight: 800;
+}
+
+.home-chat-progress-task {
+  margin-left: auto;
+  font-size: 0.7rem;
+  opacity: 0.65;
+  font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
+}
+
+.home-chat-progress-quote {
+  font-size: 0.74rem;
+  opacity: 0.75;
+  padding-left: 0.55rem;
+  border-left: 3px solid rgba(148, 163, 184, 0.55);
+}
+
+.home-chat-progress-body {
+  font-size: 0.82rem;
+}
+
+.home-chat-progress-body--btn {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  line-height: inherit;
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.home-chat-progress-more {
+  margin-left: auto;
+  font-size: 0.72rem;
+  opacity: 0.75;
+  flex-shrink: 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .home-chat-input-wrap {
   margin-top: 0.65rem;
   display: flex;
@@ -701,6 +775,11 @@ button.home-file-card {
 [data-theme='dark'] .home-chat-item--user {
   background: #334155;
   color: #e5e7eb;
+}
+
+[data-theme='dark'] .home-chat-progress-avatar {
+  background: rgba(129, 140, 248, 0.22);
+  border-color: rgba(129, 140, 248, 0.32);
 }
 
 [data-theme='dark'] .home-chat-input {

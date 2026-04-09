@@ -19,6 +19,7 @@ import {
 } from '../utils/projectStore.js'
 import { IconChevronLeft } from '../components/icons.jsx'
 import ThemeToggle from '../components/ThemeToggle.jsx'
+import TaskProgressHistoryModal from '../components/TaskProgressHistoryModal.jsx'
 import '../styles/home.css'
 
 const DEFAULT_TOP_EVENT = '示例设备总故障'
@@ -191,16 +192,108 @@ function HomePage() {
   const [workspaceReady, setWorkspaceReady] = useState(false)
   const [previewModalOpen, setPreviewModalOpen] = useState(false)
   const [batchGenerating, setBatchGenerating] = useState(false)
+  const [progressModal, setProgressModal] = useState({ open: false, taskId: '' })
   const skipTitleBlurRef = useRef(false)
   const executionQueueRef = useRef([])
   const drainingRef = useRef(false)
   const resumePollersRef = useRef(new Map())
+  /** 仅内存：每个任务最后已消费的 event.seq，用于去重 */
+  const taskEventCursorRef = useRef(new Map())
+  /** 仅内存：每个任务的历史事件（用于弹窗展示） */
+  const taskEventHistoryRef = useRef(new Map())
   /** 仅内存：上传的 File 对象，用于本地预览；不写入 localStorage */
   const fileObjectStoreRef = useRef(new Map())
 
   const patchResultTask = useCallback((taskId, patch) => {
     setResultItems((prev) => prev.map((t) => (t.id === taskId ? { ...t, ...patch } : t)))
   }, [])
+
+  const formatAgentDisplay = useCallback((agent) => {
+    const a = String(agent || '').trim()
+    if (!a) return { name: 'Agent', avatar: 'A' }
+    if (a === 'LLM#1') return { name: '知识抽取智能体', avatar: '1' }
+    if (a === 'LLM#2') return { name: '草稿生成智能体', avatar: '2' }
+    if (a === 'LLM#3') return { name: '定向修复智能体', avatar: '3' }
+    if (a.includes('召回')) return { name: '召回智能体', avatar: 'R' }
+    if (a.includes('修复')) return { name: '修复智能体', avatar: 'F' }
+    if (a.includes('校验')) return { name: '校验智能体', avatar: 'V' }
+    if (a.includes('调度')) return { name: '调度器', avatar: 'S' }
+    if (a.includes('流程')) return { name: '流程控制', avatar: 'P' }
+    return { name: a, avatar: a.slice(0, 1).toUpperCase() }
+  }, [])
+
+  const appendTaskEventsToChat = useCallback(
+    ({ taskId, userPrompt, events }) => {
+      if (!taskId || !Array.isArray(events) || events.length === 0) return
+      const lastSeq = Number(taskEventCursorRef.current.get(taskId) || 0)
+      const incoming = events
+        .filter((e) => e && Number(e.seq) > lastSeq)
+        .sort((a, b) => Number(a.seq) - Number(b.seq))
+
+      if (incoming.length === 0) return
+
+      const nextLast = Math.max(...incoming.map((e) => Number(e.seq) || 0))
+      taskEventCursorRef.current.set(taskId, nextLast)
+
+      const quote = userPrompt
+        ? userPrompt.length > 80
+          ? `${userPrompt.slice(0, 80)}…`
+          : userPrompt
+        : ''
+
+      const normalizedIncoming = incoming.map((evt) => {
+        const { name, avatar } = formatAgentDisplay(evt.agent)
+        return {
+          seq: Number(evt.seq) || 0,
+          ts: evt.ts || evt.created_at || '',
+          agent: name,
+          avatar,
+          level: String(evt.level || 'INFO').toUpperCase(),
+          text: String(evt.text || ''),
+          stage: evt.stage || '',
+          progress: evt.progress,
+        }
+      })
+
+      // update per-task history (in-memory)
+      const prevHistory = taskEventHistoryRef.current.get(taskId) || []
+      const merged = [...prevHistory, ...normalizedIncoming]
+      // hard cap to avoid unlimited memory growth
+      taskEventHistoryRef.current.set(taskId, merged.slice(-400))
+
+      // chat: keep only ONE message per task, showing latest event
+      const latest = normalizedIncoming[normalizedIncoming.length - 1]
+      const prefix =
+        latest.level === 'ERROR' ? '错误' : latest.level === 'WARNING' ? '警告' : '进度'
+      const msg = {
+        id: `progress-${taskId}`,
+        role: 'assistant',
+        kind: 'progress',
+        taskId,
+        agent: latest.agent,
+        avatar: latest.avatar,
+        quote,
+        content: `${prefix}：${latest.text || ''}`.trim(),
+        at: Date.now(),
+      }
+
+      setMessages((prev) => {
+        const next = []
+        let replaced = false
+        for (const m of prev) {
+          if (m?.kind === 'progress' && m?.taskId === taskId) {
+            if (!replaced) next.push(msg)
+            replaced = true
+          } else {
+            next.push(m)
+          }
+        }
+        if (!replaced) next.push(msg)
+        return next.slice(-320)
+      })
+    },
+    [formatAgentDisplay],
+  )
 
   useEffect(() => {
     if (!projectId) return
@@ -280,6 +373,11 @@ function HomePage() {
                   stage: item.stage || item.status || '',
                   message: item.message || '',
                   title: item.top_event || task.title || '',
+                })
+                appendTaskEventsToChat({
+                  taskId: task.id,
+                  userPrompt: task.userPrompt || '',
+                  events: item.events || [],
                 })
               },
             })
@@ -557,6 +655,7 @@ function HomePage() {
                 message: item.message || '',
                 title: item.top_event || topEvent,
               })
+              appendTaskEventsToChat({ taskId, userPrompt, events: item.events || [] })
             },
           })
         } catch (pollErr) {
@@ -635,7 +734,7 @@ function HomePage() {
         },
       ])
     },
-    [patchResultTask],
+    [patchResultTask, appendTaskEventsToChat],
   )
 
   const drainGenerationQueue = useCallback(async () => {
@@ -939,7 +1038,33 @@ function HomePage() {
                   msg.role === 'user' ? 'home-chat-item--user' : 'home-chat-item--assistant'
                 }`}
               >
-                {msg.content}
+                {msg.kind === 'progress' ? (
+                  <div className="home-chat-progress">
+                    <div className="home-chat-progress-head">
+                      <span className="home-chat-progress-avatar" aria-hidden>
+                        {msg.avatar || 'A'}
+                      </span>
+                      <span className="home-chat-progress-agent">{msg.agent || 'Agent'}</span>
+                      {msg.taskId ? (
+                        <span className="home-chat-progress-task" title={msg.taskId}>
+                          #{String(msg.taskId).slice(-6)}
+                        </span>
+                      ) : null}
+                    </div>
+                    {msg.quote ? <div className="home-chat-progress-quote">引用：{msg.quote}</div> : null}
+                    <button
+                      type="button"
+                      className="home-chat-progress-body home-chat-progress-body--btn"
+                      onClick={() => setProgressModal({ open: true, taskId: msg.taskId || '' })}
+                      title="点击查看该任务的历史进度记录"
+                    >
+                      {msg.content}
+                      <span className="home-chat-progress-more">查看历史</span>
+                    </button>
+                  </div>
+                ) : (
+                  msg.content
+                )}
               </div>
             ))}
           </div>
@@ -1029,6 +1154,15 @@ function HomePage() {
           </div>
         </div>
       )}
+
+      <TaskProgressHistoryModal
+        open={!!progressModal.open}
+        onClose={() => setProgressModal({ open: false, taskId: '' })}
+        taskId={progressModal.taskId}
+        title={resultItems.find((t) => t.id === progressModal.taskId)?.title || ''}
+        quote={resultItems.find((t) => t.id === progressModal.taskId)?.userPrompt || ''}
+        events={taskEventHistoryRef.current.get(progressModal.taskId) || []}
+      />
     </div>
   )
 }

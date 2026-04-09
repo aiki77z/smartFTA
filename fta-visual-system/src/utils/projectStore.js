@@ -125,12 +125,7 @@ export function listProjectsSortedForListPage() {
     workflowStatus: p.workflowStatus ?? '待上传',
     reviewed: p.reviewed ?? false,
   }))
-  return [...projects].sort((a, b) => {
-    const ta = a.lastChatAt || 0
-    const tb = b.lastChatAt || 0
-    if (tb !== ta) return tb - ta
-    return (b.createdAt || 0) - (a.createdAt || 0)
-  })
+  return [...projects].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
 }
 
 export function listProjects() {

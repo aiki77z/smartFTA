@@ -166,13 +166,23 @@ function MagliteModel({ url, selectedNodeName, onPick }) {
   )
 }
 
-export default function ExplodedViewer({ model = 'din-rail-box', onPartClick }) {
+export default function ExplodedViewer({
+  model = 'din-rail-box',
+  onPartClick,
+  highlightNodeName = '',
+  /** 画布每次选中事件节点时递增，用于同一 Object_X 或需强制刷新高亮时同步 */
+  highlightSync = 0,
+}) {
   const url = useMemo(() => {
     if (model === 'maglite') return MAGLITE_URL
     return DIN_RAIL_BOX_URL
   }, [model])
 
   const [selectedNodeName, setSelectedNodeName] = useState('')
+
+  useEffect(() => {
+    setSelectedNodeName(highlightNodeName || '')
+  }, [highlightNodeName, highlightSync])
   const selectedDetail = useMemo(() => {
     if (!selectedNodeName) return null
     return getPartForNodeName(selectedNodeName)

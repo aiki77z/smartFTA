@@ -1,5 +1,5 @@
 :root {
-  font-family: 'SourceHanSerifCN', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'jyhphy', 'Segoe UI', system-ui, -apple-system, sans-serif;
   line-height: 1.5;
   font-weight: 400;
   color: #334155;
@@ -8,6 +8,14 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+@font-face {
+  font-family: 'jyhphy';
+  src: url('/font/jyhphy.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
 }
 
 [data-theme='dark'] {
