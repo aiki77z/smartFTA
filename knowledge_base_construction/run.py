@@ -83,7 +83,7 @@ def main():
     )
     parser.add_argument("--pdf", "-p", required=True, help="输入的 PDF 文件路径")
     parser.add_argument("--output-dir", "-o", default="./output",
-                        help="输出根目录（默认 ./output），中间文件和最终结果均存放于此")
+                        help="输出根目录（默认 ./output），所有结果将保存在 output_dir/pdf_stem/ 下")
     parser.add_argument("--chunk-size", "-s", type=int, default=800,
                         help="分块大小（字符数），默认 800")
     parser.add_argument("--skip-mineru", action="store_true",
@@ -105,6 +105,10 @@ def main():
     output_root.mkdir(parents=True, exist_ok=True)
 
     pdf_stem = pdf_path.stem  # 不含扩展名的文件名
+
+    # 定义结果存放目录：output_root/pdf_stem/
+    result_dir = output_root / pdf_stem
+    result_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------- 步骤1: PDF -> Markdown (调用 trans_file_to_md.py) ----------
     md_file = None
@@ -145,7 +149,7 @@ def main():
         print(f"错误: 找不到 {chunk_script}")
         sys.exit(1)
 
-    chunks_json = output_root / f"{pdf_stem}_chunks.json"
+    chunks_json = result_dir / f"{pdf_stem}_chunks.json"
     cmd_chunk = [
         sys.executable, str(chunk_script),
         "--input", str(md_file),
@@ -166,8 +170,8 @@ def main():
         print(f"错误: 找不到 {entity_script}")
         sys.exit(1)
 
-    entities_json = output_root / f"{pdf_stem}_entities.jsonl"
-    merged_json = output_root / f"{pdf_stem}_entities_merged.json"
+    entities_json = result_dir / f"{pdf_stem}_entities.jsonl"
+    merged_json = result_dir / f"{pdf_stem}_entities_merged.json"
 
     cmd_entity = [
         sys.executable, str(entity_script),
@@ -192,8 +196,8 @@ def main():
         print(f"错误: 找不到 {relation_script}")
         sys.exit(1)
 
-    relations_json = output_root / f"{pdf_stem}_relations.jsonl"
-    relations_csv = output_root / f"{pdf_stem}_relations.csv"
+    relations_json = result_dir / f"{pdf_stem}_relations.jsonl"
+    relations_csv = result_dir / f"{pdf_stem}_relations.csv"
 
     cmd_relation = [
         sys.executable, str(relation_script),
@@ -210,7 +214,7 @@ def main():
 
     # 输出最终统计
     print("\n=== 流水线执行完成 ===")
-    print(f"输出目录: {output_root}")
+    print(f"结果存放目录: {result_dir}")
     print(f"生成文件:")
     print(f"  - 分块: {chunks_json}")
     print(f"  - 实体 (逐块): {entities_json}")
