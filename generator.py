@@ -11,7 +11,7 @@ generator.py —— 故障树生成模块（v3）
 
 import json
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
@@ -365,7 +365,22 @@ def repair_fault_tree(draft_tree: dict, corrections_hint: str, chunks: list) -> 
     return _parse_json(response.choices[0].message.content)
 
 
-def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
+def generate_fault_tree(
+    top_event: str,
+    requirements: str = "",
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    def _emit(line: str):
+        try:
+            print(line)
+        finally:
+            if log_callback:
+                try:
+                    log_callback(line)
+                except Exception:
+                    # log callback should never break generation
+                    pass
+
     recall_candidates = build_top_event_normalized_candidates(top_event, [top_event])
     if top_event not in recall_candidates:
         recall_candidates = [top_event] + recall_candidates
@@ -374,7 +389,7 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
     recall_source = "entity_reverse_index"
     chunks = search_chunks_by_entity_names(recall_candidates)
     if chunks:
-        print(
+        _emit(
             f"[召回] 顶事件 '{top_event}' 使用 entity_reverse_index 直接召回 {len(chunks)} 个 chunks，"
             f"候选实体：{recall_candidates}"
         )
@@ -385,7 +400,7 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
             if candidate not in keywords:
                 keywords.append(candidate)
         chunks = search_chunks_by_keywords(keywords)
-        print(
+        _emit(
             f"[召回] 顶事件 '{top_event}' 未命中 entity_reverse_index，改用关键词兜底召回 {len(chunks)} 个 chunks，"
             f"关键词：{keywords}"
         )
@@ -393,23 +408,23 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
     if not chunks:
         raise ValueError(f"未找到与'{top_event}'相关的知识，请检查chunks数据是否已导入")
 
-    print(f"[生成] 顶事件：{top_event}")
-    print(f"[生成] 召回来源：{recall_source}，相关chunks数：{len(chunks)}")
+    _emit(f"[生成] 顶事件：{top_event}")
+    _emit(f"[生成] 召回来源：{recall_source}，相关chunks数：{len(chunks)}")
 
-    print("[生成] LLM#1：提取故障要素...")
+    _emit("[生成] LLM#1：提取故障要素...")
     elements = extract_fault_elements(top_event, chunks)
-    print(f"[生成] 提取到 {len(elements.get('events', []))} 个事件，{len(elements.get('relations', []))} 条关系")
+    _emit(f"[生成] 提取到 {len(elements.get('events', []))} 个事件，{len(elements.get('relations', []))} 条关系")
 
     previous_issues = None
     draft_tree = None
     last_error = None
     for attempt in range(1, MAX_RETRY + 2):
-        print(f"[生成] LLM#2：生成草稿（第 {attempt} 次）...")
+        _emit(f"[生成] LLM#2：生成草稿（第 {attempt} 次）...")
         try:
             draft_tree = build_fault_tree(top_event, elements, chunks, requirements, previous_issues)
         except ValueError as e:
             last_error = str(e)
-            print(f"[生成] 草稿JSON解析失败：{last_error}")
+            _emit(f"[生成] 草稿JSON解析失败：{last_error}")
             previous_issues = [{"level": "ERROR", "message": f"模型输出不是完整JSON：{last_error}", "node_name": ""}]
             if attempt <= MAX_RETRY:
                 continue
@@ -419,10 +434,10 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
         draft_tree["validation"] = validation
 
         if validation["passed"]:
-            print("[生成] 草稿结构校验通过")
+            _emit("[生成] 草稿结构校验通过")
             break
 
-        print(
+        _emit(
             f"[生成] 草稿校验失败，ERROR={validation['error_count']}，"
             f"{'重试中...' if attempt <= MAX_RETRY else '已达最大重试次数'}"
         )
@@ -430,7 +445,7 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
         try:
             err_issues = [i for i in (validation.get("issues") or []) if i.get("level") == "ERROR"]
             if err_issues:
-                print("[生成] 草稿结构校验 ERROR 详情：")
+                _emit("[生成] 草稿结构校验 ERROR 详情：")
                 for idx, iss in enumerate(err_issues, start=1):
                     code = iss.get("code", "")
                     msg = iss.get("message", "")
@@ -438,7 +453,7 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
                     node_name = iss.get("node_name", "") or iss.get("nodeName", "")
                     where = " ".join([p for p in [node_name, node_id] if p])
                     suffix = f"（{where}）" if where else ""
-                    print(f"  - [{idx}] {code}: {msg}{suffix}")
+                    _emit(f"  - [{idx}] {code}: {msg}{suffix}")
         except Exception as _e:
             # 避免调试输出影响主流程
             pass
@@ -450,20 +465,20 @@ def generate_fault_tree(top_event: str, requirements: str = "") -> dict:
 
         corrections = get_relevant_corrections(draft_tree)
         if corrections:
-            print(f"[修复] 检索到 {len(corrections)} 条相关历史修正，启动定向修复...")
+            _emit(f"[修复] 检索到 {len(corrections)} 条相关历史修正，启动定向修复...")
             corrections_hint = format_corrections_for_repair(corrections)
             repaired = repair_fault_tree(draft_tree, corrections_hint, chunks)
             repair_validation = validate_full(repaired, skip_semantic=True)
             if repair_validation["passed"]:
                 repaired["validation"] = repair_validation
                 final_tree = repaired
-                print("[修复] 修复版本结构校验通过，采用修复结果")
+                _emit("[修复] 修复版本结构校验通过，采用修复结果")
             else:
-                print("[修复] 修复版本结构校验失败，回退到草稿版本")
+                _emit("[修复] 修复版本结构校验失败，回退到草稿版本")
         else:
-            print("[修复] 暂无相关历史修正记录，跳过修复步骤")
+            _emit("[修复] 暂无相关历史修正记录，跳过修复步骤")
     except Exception as e:
-        print(f"[修复] 修复步骤异常（{e}），回退到草稿版本")
+        _emit(f"[修复] 修复步骤异常（{e}），回退到草稿版本")
 
     final_validation = validate_full(final_tree, skip_semantic=False)
     final_tree["validation"] = final_validation
@@ -837,13 +852,14 @@ def generate_fault_tree_with_progress(
     top_event: str,
     requirements: str = "",
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
         progress_callback(25, "knowledge_search", "Collecting related knowledge chunks")
         progress_callback(40, "generation_pipeline", "Running fault tree generation pipeline")
 
-    tree_data = generate_fault_tree(top_event, requirements)
+    tree_data = generate_fault_tree(top_event, requirements, log_callback=log_callback)
 
     if progress_callback:
         progress_callback(90, "persistence", "Generation completed, persisting result")

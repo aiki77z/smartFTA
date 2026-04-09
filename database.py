@@ -562,6 +562,10 @@ def create_generation_job_item(
         "progress": 0,
         "stage": "queued",
         "message": "Queued",
+        # 增量事件流：用于前端实时展示“多智能体”进度消息（而不是覆盖 message 字段）
+        # event_seq 单调递增，便于前端去重/断点续传；events 保留最近 N 条
+        "event_seq": 0,
+        "events": [],
         "tree_id": None,
         "error": None,
         "execution_owner": None,
@@ -576,6 +580,55 @@ def create_generation_job_item(
     refresh_generation_job(job_id)
     return _strip_mongo_id(doc)
 
+
+def append_generation_job_item_event(
+    item_id: str,
+    *,
+    agent: str,
+    text: str,
+    level: str = "INFO",
+    stage: Optional[str] = None,
+    progress: Optional[int] = None,
+    kind: str = "log",
+    extra: Optional[Dict[str, Any]] = None,
+    max_events: int = 200,
+) -> Optional[Dict[str, Any]]:
+    """
+    Append a progress/log event to a job item.
+    Stored on the job-item so frontend can poll and render messages in real-time.
+    """
+    item = generation_job_items_col.find_one({"_id": item_id}, {"event_seq": 1})
+    if not item:
+        return None
+    next_seq = int(item.get("event_seq") or 0) + 1
+    now = _now()
+    payload = {
+        "seq": next_seq,
+        "ts": now,
+        "agent": str(agent or "").strip() or "Agent",
+        "level": str(level or "INFO").upper(),
+        "kind": str(kind or "log"),
+        "text": str(text or "").rstrip(),
+    }
+    if stage is not None:
+        payload["stage"] = stage
+    if progress is not None:
+        try:
+            payload["progress"] = max(0, min(100, int(progress)))
+        except Exception:
+            payload["progress"] = None
+    if extra and isinstance(extra, dict):
+        payload["extra"] = extra
+
+    generation_job_items_col.update_one(
+        {"_id": item_id},
+        {
+            "$set": {"event_seq": next_seq, "updated_at": now},
+            "$push": {"events": {"$each": [payload], "$slice": -abs(int(max_events))}},
+        },
+    )
+    refresh_generation_job(item.get("job_id"))
+    return get_generation_job_item(item_id)
 
 def update_generation_job_item(
     item_id: str,

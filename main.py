@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from database import (
+    append_generation_job_item_event,
     claim_generation_job_item,
     create_generation_job,
     create_generation_job_item,
@@ -235,6 +237,48 @@ def _log_job_duration_once(job_id: str):
 _start_generation_workers()
 
 
+def _agent_from_log_line(line: str) -> str:
+    text = str(line or "").strip()
+    if not text:
+        return "Agent"
+    if text.startswith("[召回]"):
+        return "召回智能体"
+    if text.startswith("[修复]"):
+        return "修复智能体"
+    if text.startswith("[生成]"):
+        m = re.search(r"LLM#\d+", text)
+        if m:
+            return m.group(0)
+        if "校验" in text:
+            return "结构校验智能体"
+        return "生成智能体"
+    if text.startswith("[scheduler]"):
+        return "调度器"
+    if text.startswith("[timing]"):
+        return "计时器"
+    return "Agent"
+
+
+def _append_event(
+    item_id: str,
+    *,
+    agent: str,
+    text: str,
+    level: str = "INFO",
+    stage: Optional[str] = None,
+    progress: Optional[int] = None,
+):
+    append_generation_job_item_event(
+        item_id,
+        agent=agent,
+        text=text,
+        level=level,
+        stage=stage,
+        progress=progress,
+        kind="log",
+    )
+
+
 def _sync_mirror_items(mirror_item_ids: Optional[List[str]], **kwargs):
     for mirror_item_id in mirror_item_ids or []:
         update_generation_job_item(mirror_item_id, **kwargs)
@@ -278,6 +322,23 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
     tree_id = None
 
     try:
+        # 任务级事件流：用于前端对话栏实时展示执行进度（引用到该 task）
+        _append_event(
+            item_id,
+            agent="调度器",
+            text="任务开始执行。",
+            stage=item.get("stage") or "prepare",
+            progress=item.get("progress") or 0,
+        )
+        for mid in mirror_item_ids or []:
+            _append_event(
+                mid,
+                agent="调度器",
+                text="任务开始执行。",
+                stage=item.get("stage") or "prepare",
+                progress=item.get("progress") or 0,
+            )
+
         reused = find_tree_by_top_event(
             top_event=top_event,
             normalized_top_event=normalized_top_event,
@@ -295,6 +356,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
                 reused=True,
                 version=reused["version"],
             )
+            _append_event(item_id, agent="生成智能体", text="已复用已有故障树。", stage="reuse", progress=100)
             _sync_mirror_items(
                 mirror_item_ids,
                 status="success",
@@ -306,6 +368,8 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
                 version=reused["version"],
                 error=None,
             )
+            for mid in mirror_item_ids or []:
+                _append_event(mid, agent="生成智能体", text="已复用已有故障树。", stage="reuse", progress=100)
             _log_item_duration(item_id)
             for mirror_item_id in mirror_item_ids or []:
                 _log_item_duration(mirror_item_id)
@@ -336,6 +400,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             message="Tree record created",
             tree_id=tree_id,
         )
+        _append_event(item_id, agent="生成智能体", text="已创建故障树记录。", stage="tree_record", progress=15)
         _sync_mirror_items(
             mirror_item_ids,
             tree_id=tree_id,
@@ -343,6 +408,8 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             stage="tree_record",
             message="Tree record created",
         )
+        for mid in mirror_item_ids or []:
+            _append_event(mid, agent="生成智能体", text="已创建故障树记录。", stage="tree_record", progress=15)
 
         def progress_callback(progress: int, stage: str, message: str):
             update_generation_job_item(
@@ -353,6 +420,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
                 message=message,
                 tree_id=tree_id,
             )
+            _append_event(item_id, agent="流程控制", text=message, stage=stage, progress=progress)
             _sync_mirror_items(
                 mirror_item_ids,
                 status="running",
@@ -361,11 +429,20 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
                 message=message,
                 tree_id=tree_id,
             )
+            for mid in mirror_item_ids or []:
+                _append_event(mid, agent="流程控制", text=message, stage=stage, progress=progress)
+
+        def log_callback(line: str):
+            agent = _agent_from_log_line(line)
+            _append_event(item_id, agent=agent, text=line)
+            for mid in mirror_item_ids or []:
+                _append_event(mid, agent=agent, text=line)
 
         tree_data = generate_fault_tree_with_progress(
             top_event=top_event,
             requirements=requirements,
             progress_callback=progress_callback,
+            log_callback=log_callback,
         )
 
         version = save_version(
@@ -386,6 +463,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             version=version,
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
         )
+        _append_event(item_id, agent="生成智能体", text="生成完成。", stage="completed", progress=100)
         _sync_mirror_items(
             mirror_item_ids,
             status="success",
@@ -397,6 +475,8 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             error=None,
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
         )
+        for mid in mirror_item_ids or []:
+            _append_event(mid, agent="生成智能体", text="生成完成。", stage="completed", progress=100)
         _log_item_duration(item_id)
         for mirror_item_id in mirror_item_ids or []:
             _log_item_duration(mirror_item_id)
@@ -418,6 +498,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             error=str(exc),
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
         )
+        _append_event(item_id, agent="生成智能体", text=f"生成失败：{exc}", level="ERROR", stage="failed", progress=100)
         _sync_mirror_items(
             mirror_item_ids,
             status="failed",
@@ -428,6 +509,8 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             error=str(exc),
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
         )
+        for mid in mirror_item_ids or []:
+            _append_event(mid, agent="生成智能体", text=f"生成失败：{exc}", level="ERROR", stage="failed", progress=100)
         _log_item_duration(item_id)
         for mirror_item_id in mirror_item_ids or []:
             _log_item_duration(mirror_item_id)
@@ -449,6 +532,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             error=str(exc),
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
         )
+        _append_event(item_id, agent="生成智能体", text=f"生成失败：{exc}", level="ERROR", stage="failed", progress=100)
         _sync_mirror_items(
             mirror_item_ids,
             status="failed",
@@ -459,6 +543,8 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             error=str(exc),
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
         )
+        for mid in mirror_item_ids or []:
+            _append_event(mid, agent="生成智能体", text=f"生成失败：{exc}", level="ERROR", stage="failed", progress=100)
         _log_item_duration(item_id)
         for mirror_item_id in mirror_item_ids or []:
             _log_item_duration(mirror_item_id)
