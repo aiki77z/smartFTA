@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env
+.env
+.env.*
+
+# IDE
+.idea/
+
+# Archives
+*.zip
+
+# Data
+entity/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# python
+.venv/

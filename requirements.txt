@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn==0.30.0
+pymongo==4.8.0
+openai==1.40.0
+httpx==0.27.0
+python-dotenv==1.0.1
+pydantic==2.8.0
+jieba==0.42.1
+playwright==1.58.0
+# After pip install -r requirements.txt, run: playwright install chromium
