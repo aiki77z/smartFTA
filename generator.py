@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from openai import OpenAI
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 from database import search_chunks_by_entity_names, search_chunks_by_keywords
+from graph_retriever import build_graph_draft_candidates, search_graph_related_chunks
 from validator import validate_full
 
 client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
@@ -194,9 +195,41 @@ def parse_user_prompt(prompt: str) -> dict:
 
     return _extract_top_event_by_llm(normalized)
 
+def _format_graph_draft_context(graph_context: Optional[dict]) -> str:
+    if not graph_context:
+        return "无图谱草稿。"
 
-def extract_fault_elements(top_event: str, chunks: list) -> dict:
+    summary = {
+        "top_event": graph_context.get("top_event"),
+        "matched_names": graph_context.get("matched_names") or [],
+        "direct_causes": [
+            {
+                "mapped_name": item.get("mapped_name"),
+                "entity_type": item.get("entity_type"),
+                "suggested_type": item.get("suggested_type"),
+                "source_relation": item.get("source_relation"),
+            }
+            for item in (graph_context.get("direct_causes") or [])[:8]
+        ],
+        "expanded_nodes": [
+            {
+                "mapped_name": item.get("mapped_name"),
+                "entity_type": item.get("entity_type"),
+                "suggested_type": item.get("suggested_type"),
+                "parent_cause": item.get("parent_cause"),
+                "source_relation": item.get("source_relation"),
+            }
+            for item in (graph_context.get("expanded_nodes") or [])[:16]
+        ],
+        "investigate_methods": (graph_context.get("investigate_methods") or [])[:8],
+        "draft_relations": (graph_context.get("draft") or {}).get("relations", [])[:20],
+    }
+    return json.dumps(summary, ensure_ascii=False, indent=2)
+
+
+def extract_fault_elements(top_event: str, chunks: list, graph_context: Optional[dict] = None) -> dict:
     chunks_text = _format_chunks(chunks)
+    graph_text = _format_graph_draft_context(graph_context)
     prompt = f"""你是工业设备故障分析专家，精通FTA故障树分析方法。
 
 ## 参考知识（来自设备手册）
@@ -240,6 +273,19 @@ def extract_fault_elements(top_event: str, chunks: list) -> dict:
   ]
 }}
 """
+    prompt += f"""
+
+## 图谱候选草稿（用于约束，而不是强制照抄）
+{graph_text}
+
+## 图谱使用规则
+1. direct_causes 是顶事件的高置信直接原因候选，应优先核对并吸收。
+2. expanded_nodes 是下一层候选原因，可作为 intermediate_event 或 basic_event 候选。
+3. 如果 chunks 与图谱冲突，以 chunks 为准。
+4. Method / Tool 类型节点不要直接作为故障树事件，优先写入 investigateMethod。
+5. Component / Parameter / System 类型节点可转成“组件故障”“参数异常”“通讯异常”等故障态表达。
+6. 图谱只是候选草稿，不能凭空补出 chunks 中没有依据的事件链。
+"""
     response = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -249,9 +295,17 @@ def extract_fault_elements(top_event: str, chunks: list) -> dict:
     return _parse_json(response.choices[0].message.content)
 
 
-def build_fault_tree(top_event: str, elements: dict, chunks: list, requirements: str = "", previous_issues: list = None) -> dict:
+def build_fault_tree(
+    top_event: str,
+    elements: dict,
+    chunks: list,
+    requirements: str = "",
+    previous_issues: list = None,
+    graph_context: Optional[dict] = None,
+) -> dict:
     chunks_text = _format_chunks(chunks)
     elements_text = json.dumps(elements, ensure_ascii=False, indent=2)
+    graph_text = _format_graph_draft_context(graph_context)
 
     chunks_ref = [
         {
@@ -311,11 +365,28 @@ def build_fault_tree(top_event: str, elements: dict, chunks: list, requirements:
 
 只输出JSON，不要有任何多余文字或markdown标记。
 """
+    prompt += f"""
+
+## 图谱候选树草稿（高置信结构约束）
+{graph_text}
+
+## 图谱草稿使用规则
+1. direct_causes 优先视为顶事件的候选直接原因。
+2. expanded_nodes 优先视为 direct_causes 的下一层候选子原因。
+3. FaultPhenomenon 节点优先映射为故障树事件节点。
+4. Component 节点优先转写为“组件故障/组件异常”类事件。
+5. Parameter 节点优先转写为“参数异常/参数不匹配/参数未保存”类基本事件。
+6. System 节点优先转写为“通讯异常/系统异常”类事件。
+7. Method / Tool 节点不要直接建成树节点，优先写到 investigateMethod 或 description。
+8. intermediate_event 必须有直接子节点；如果没有子节点，必须改为 basic_event。
+9. 优先保持图谱草稿中的主因果链，再基于 chunks 做必要补充。
+10. 图谱草稿是约束与提示，不是最终答案；若与 chunks 冲突，以 chunks 为准。
+"""
     response = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=8192,
+        max_tokens=8192,    
     )
     return _parse_json(response.choices[0].message.content)
 
@@ -385,24 +456,58 @@ def generate_fault_tree(
     if top_event not in recall_candidates:
         recall_candidates = [top_event] + recall_candidates
 
-    keywords = list(recall_candidates)
-    recall_source = "entity_reverse_index"
-    chunks = search_chunks_by_entity_names(recall_candidates)
-    if chunks:
+    def merge_chunk_lists(*chunk_lists: List[dict]) -> List[dict]:
+        merged = []
+        seen_ids = set()
+        for chunk_list in chunk_lists:
+            for chunk in chunk_list or []:
+                chunk_id = _get_chunk_identifier(chunk)
+                if chunk_id in seen_ids:
+                    continue
+                seen_ids.add(chunk_id)
+                merged.append(chunk)
+                if len(merged) >= MAX_CHUNKS_FOR_PROMPT:
+                    return merged
+        return merged
+
+    keywords = _extract_keywords(top_event)
+    for candidate in recall_candidates:
+        if candidate not in keywords:
+            keywords.append(candidate)
+
+    graph_result = search_graph_related_chunks(top_event, aliases=recall_candidates, limit=MAX_CHUNKS_FOR_PROMPT)
+    graph_draft = build_graph_draft_candidates(top_event, aliases=recall_candidates)
+    graph_chunks = graph_result.get("chunks") or []
+    entity_chunks = search_chunks_by_entity_names(recall_candidates, limit=MAX_CHUNKS_FOR_PROMPT)
+    keyword_chunks = search_chunks_by_keywords(keywords, limit=MAX_CHUNKS_FOR_PROMPT)
+    chunks = merge_chunk_lists(graph_chunks, entity_chunks, keyword_chunks)
+
+    recall_sources = []
+    if graph_chunks:
+        recall_sources.append("graph_fault_trigger")
+        _emit(f"[graph-layer-counts] {graph_result.get('layer_counts') or {}}")
         _emit(
-            f"[召回] 顶事件 '{top_event}' 使用 entity_reverse_index 直接召回 {len(chunks)} 个 chunks，"
+            f"[召回] 顶事件 '{top_event}' 图谱命中 {len(graph_chunks)} 个 chunks，"
+            f"原因候选：{graph_result.get('cause_names') or []}"
+        )
+    if entity_chunks:
+        recall_sources.append("entity_reverse_index")
+        _emit(
+            f"[召回] 顶事件 '{top_event}' 实体索引补充 {len(entity_chunks)} 个 chunks，"
             f"候选实体：{recall_candidates}"
         )
-    else:
-        recall_source = "keyword_search_fallback"
-        keywords = _extract_keywords(top_event)
-        for candidate in recall_candidates:
-            if candidate not in keywords:
-                keywords.append(candidate)
-        chunks = search_chunks_by_keywords(keywords)
+    if keyword_chunks:
+        recall_sources.append("keyword_fallback")
         _emit(
-            f"[召回] 顶事件 '{top_event}' 未命中 entity_reverse_index，改用关键词兜底召回 {len(chunks)} 个 chunks，"
+            f"[召回] 顶事件 '{top_event}' 关键词兜底补充 {len(keyword_chunks)} 个 chunks，"
             f"关键词：{keywords}"
+        )
+
+    recall_source = "+".join(recall_sources) if recall_sources else "none"
+    if not chunks:
+        _emit(
+            f"[召回] 顶事件 '{top_event}' 图谱、实体索引与关键词均未召回有效 chunks，"
+            f"候选实体：{recall_candidates}，关键词：{keywords}"
         )
 
     if not chunks:
@@ -412,7 +517,15 @@ def generate_fault_tree(
     _emit(f"[生成] 召回来源：{recall_source}，相关chunks数：{len(chunks)}")
 
     _emit("[生成] LLM#1：提取故障要素...")
-    elements = extract_fault_elements(top_event, chunks)
+    if graph_draft.get("direct_causes") or graph_draft.get("expanded_nodes"):
+        _emit(
+            f"[图谱草稿] 顶事件 '{top_event}' 生成候选草稿："
+            f"{len(graph_draft.get('direct_causes') or [])} 个直接原因，"
+            f"{len(graph_draft.get('expanded_nodes') or [])} 个扩展节点"
+        )
+    if graph_result.get("chunk_traces"):
+        _emit(f"[graph-path-preview] {(graph_result.get('chunk_traces') or [])[:3]}")
+    elements = extract_fault_elements(top_event, chunks, graph_draft)
     _emit(f"[生成] 提取到 {len(elements.get('events', []))} 个事件，{len(elements.get('relations', []))} 条关系")
 
     previous_issues = None
@@ -421,7 +534,7 @@ def generate_fault_tree(
     for attempt in range(1, MAX_RETRY + 2):
         _emit(f"[生成] LLM#2：生成草稿（第 {attempt} 次）...")
         try:
-            draft_tree = build_fault_tree(top_event, elements, chunks, requirements, previous_issues)
+            draft_tree = build_fault_tree(top_event, elements, chunks, requirements, previous_issues, graph_draft)
         except ValueError as e:
             last_error = str(e)
             _emit(f"[生成] 草稿JSON解析失败：{last_error}")
@@ -482,6 +595,16 @@ def generate_fault_tree(
 
     final_validation = validate_full(final_tree, skip_semantic=False)
     final_tree["validation"] = final_validation
+    final_tree["retrieval"] = {
+        "source": recall_source,
+        "keywords": keywords,
+        "graph": {
+            "matched_names": graph_result.get("matched_names") or [],
+            "direct_cause_names": graph_result.get("cause_names") or [],
+            "layer_counts": graph_result.get("layer_counts") or {},
+            "chunk_traces": graph_result.get("chunk_traces") or [],
+        },
+    }
     return final_tree
 
 
@@ -883,8 +1006,19 @@ def _format_chunks(chunks: list) -> str:
         content = (chunk.get("content", "") or "").strip()
         if len(content) > MAX_CHUNK_CHARS:
             content = content[:MAX_CHUNK_CHARS] + "..."
+        trace = chunk.get("retrieval_trace") or {}
+        trace_text = ""
+        if trace:
+            path = " -> ".join(trace.get("path") or [])
+            relations = " -> ".join(trace.get("path_relations") or [])
+            trace_text = (
+                f"召回层:{trace.get('source_layer', '')} | 分数:{trace.get('score', '')} | "
+                f"命中实体:{trace.get('matched_entity', '')} | "
+                f"路径:{path or '-'} | 关系:{relations or '-'}\n"
+            )
         lines.append(
             f"[chunk_id={_get_chunk_identifier(chunk)} | {chunk.get('chunk_name', '')} | 章节:{chunk.get('section_path', '')} | 页码:{chunk.get('source', '')}]\n"
+            f"{trace_text}"
             f"{content}\n"
             f"{'─' * 50}"
         )

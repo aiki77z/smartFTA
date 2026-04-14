@@ -101,6 +101,10 @@ def _fetch_chunks_by_identifiers(chunk_ids: List[Any], limit: int) -> List[Dict[
     return docs[:limit]
 
 
+def fetch_chunks_by_ids(chunk_ids: List[Any], limit: int = 8) -> List[Dict[str, Any]]:
+    return _fetch_chunks_by_identifiers(chunk_ids, limit)
+
+
 def _ensure_indexes():
     index_specs = [
         (trees_col, [("catalog_name", ASCENDING), ("updated_at", DESCENDING)]),

@@ -52,6 +52,7 @@ from generator import (
     normalize_top_event_name,
     parse_user_prompt,
 )
+from graph_retriever import build_graph_draft_candidates, list_fault_phenomenon_top_events, search_graph_related_chunks
 from validator import validate_full, validate_semantics
 
 MAX_GENERATION_WORKERS = max(1, int(os.getenv("MAX_GENERATION_WORKERS", "2")))
@@ -714,6 +715,16 @@ class GenerateRequest(BaseModel):
     prompt: str
 
 
+class GraphRecallDebugRequest(BaseModel):
+    top_event: Optional[str] = None
+    prompt: Optional[str] = None
+    limit: int = 12
+
+
+class TopEventsPreviewRequest(BaseModel):
+    limit: int = 200
+
+
 class SaveRequest(BaseModel):
     tree_data: dict
     editor: str = "专家"
@@ -726,6 +737,62 @@ class ValidateRequest(BaseModel):
 
 class SemanticValidateRequest(BaseModel):
     tree_data: dict
+
+
+def _resolve_debug_top_event(req: GraphRecallDebugRequest) -> Dict[str, object]:
+    parsed_prompt = None
+    if req.prompt:
+        parsed_prompt = parse_user_prompt(req.prompt)
+        top_event = parsed_prompt["top_event"]
+    else:
+        top_event = str(req.top_event or "").strip()
+
+    if not top_event:
+        raise ValueError("top_event 或 prompt 至少需要提供一个")
+
+    normalized_candidates = build_top_event_normalized_candidates(top_event, [top_event])
+    catalog_entry = resolve_top_event_catalog(normalized_candidates=normalized_candidates)
+
+    resolved_top_event = top_event
+    aliases = [top_event]
+    if catalog_entry:
+        resolved_top_event = catalog_entry["name"]
+        aliases = _dedupe_keep_order((catalog_entry.get("aliases") or []) + [resolved_top_event, top_event])
+    else:
+        aliases = _dedupe_keep_order(normalized_candidates + [top_event])
+
+    return {
+        "parsed_prompt": parsed_prompt,
+        "top_event": top_event,
+        "resolved_top_event": resolved_top_event,
+        "aliases": aliases,
+        "catalog_entry": catalog_entry,
+    }
+
+
+def _discover_batch_top_events() -> Dict[str, object]:
+    graph_top_events = list_fault_phenomenon_top_events()
+    if graph_top_events:
+        return {
+            "discovered": graph_top_events,
+            "discovery_source": "neo4j_fault_phenomenon",
+        }
+
+    entity_index_entries = list_entity_reverse_index()
+    if entity_index_entries:
+        return {
+            "discovered": discover_top_events_from_entity_index(entity_index_entries),
+            "discovery_source": "entity_reverse_index",
+        }
+
+    chunks = list_all_chunks()
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No chunks found, please import knowledge chunks first")
+
+    return {
+        "discovered": discover_top_events(chunks),
+        "discovery_source": "chunks",
+    }
 
 
 @app.post("/api/tree/generate")
@@ -747,21 +814,104 @@ def api_generate(req: GenerateRequest):
         raise HTTPException(status_code=500, detail=f"Queue generation failed: {exc}")
 
 
-@app.post("/api/batch/generate-all")
-def api_batch_generate_all():
-    entity_index_entries = list_entity_reverse_index()
-    if entity_index_entries:
-        discovered = discover_top_events_from_entity_index(entity_index_entries)
-        discovery_source = "entity_reverse_index"
-    else:
-        chunks = list_all_chunks()
-        if not chunks:
-            raise HTTPException(status_code=400, detail="No chunks found, please import knowledge chunks first")
-        discovered = discover_top_events(chunks)
-        discovery_source = "chunks"
+@app.post("/api/debug/graph-recall")
+def api_debug_graph_recall(req: GraphRecallDebugRequest):
+    try:
+        resolved = _resolve_debug_top_event(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Debug top event parse failed: {exc}")
+
+    limit = max(1, min(int(req.limit or 12), 30))
+    top_event = resolved["resolved_top_event"]
+    aliases = resolved["aliases"]
+
+    graph_result = search_graph_related_chunks(top_event, aliases=aliases, limit=limit)
+    graph_draft = build_graph_draft_candidates(top_event, aliases=aliases)
+
+    chunk_items = []
+    for chunk in graph_result.get("chunks") or []:
+        trace = chunk.get("retrieval_trace") or {}
+        chunk_items.append(
+            {
+                "chunk_id": chunk.get("id", chunk.get("chunk_id")),
+                "chunk_name": chunk.get("chunk_name", ""),
+                "section_path": chunk.get("section_path", ""),
+                "source": chunk.get("source", ""),
+                "retrieval_trace": trace,
+            }
+        )
+
+    return {
+        "query": {
+            "top_event": resolved["top_event"],
+            "resolved_top_event": top_event,
+            "aliases": aliases,
+            "limit": limit,
+            "parsed_prompt": resolved["parsed_prompt"],
+        },
+        "catalog_entry": resolved["catalog_entry"],
+        "graph_recall": {
+            "matched_names": graph_result.get("matched_names") or [],
+            "direct_cause_names": graph_result.get("cause_names") or [],
+            "layer_counts": graph_result.get("layer_counts") or {},
+            "chunk_ids": graph_result.get("chunk_ids") or [],
+            "chunk_traces": graph_result.get("chunk_traces") or [],
+            "chunks": chunk_items,
+        },
+        "graph_draft": {
+            "direct_causes": graph_draft.get("direct_causes") or [],
+            "expanded_nodes": graph_draft.get("expanded_nodes") or [],
+            "investigate_methods": graph_draft.get("investigate_methods") or [],
+            "draft_relations": (graph_draft.get("draft") or {}).get("relations", []),
+        },
+    }
+
+
+@app.post("/api/batch/preview-top-events")
+def api_preview_top_events(req: TopEventsPreviewRequest):
+    discovery = _discover_batch_top_events()
+    discovered = discovery["discovered"] or []
+    discovery_source = discovery["discovery_source"]
 
     if not discovered:
-        raise HTTPException(status_code=400, detail="No top events were discovered from chunks")
+        raise HTTPException(status_code=400, detail="No top events were discovered from graph, entity index, or chunks")
+
+    limit = max(1, min(int(req.limit or 200), 1000))
+    preview_items = []
+    for item in discovered[:limit]:
+        canonical_name = normalize_top_event_name(item["name"])
+        aliases = _dedupe_keep_order(item.get("aliases") or [])
+        normalized_candidates = build_top_event_normalized_candidates(canonical_name, aliases + [item["name"]])
+        catalog_entry = resolve_top_event_catalog(normalized_candidates=normalized_candidates)
+        preview_items.append(
+            {
+                "name": canonical_name,
+                "aliases": aliases,
+                "source_chunk_ids": item.get("source_chunk_ids") or [],
+                "normalized_candidates": normalized_candidates,
+                "catalog_hit": bool(catalog_entry),
+                "catalog_name": catalog_entry["name"] if catalog_entry else None,
+            }
+        )
+
+    return {
+        "discovery_source": discovery_source,
+        "total": len(discovered),
+        "returned": len(preview_items),
+        "items": preview_items,
+    }
+
+
+@app.post("/api/batch/generate-all")
+def api_batch_generate_all():
+    discovery = _discover_batch_top_events()
+    discovered = discovery["discovered"] or []
+    discovery_source = discovery["discovery_source"]
+
+    if not discovered:
+        raise HTTPException(status_code=400, detail="No top events were discovered from graph, entity index, or chunks")
 
     catalog_entries = []
     for item in discovered:
