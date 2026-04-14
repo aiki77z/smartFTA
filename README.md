@@ -1,3 +1,48 @@
+# 知识库构建与关系抽取模块
+
+这个分支用于承载“知识库构建关系抽取”能力，不再重复维护故障树自动生成服务代码。它的职责是：
+
+1. 将 PDF / Markdown 文档转换为结构化 chunks
+2. 提取实体与关系
+3. 产出可供 `generate-fta` 分支消费的标准文件
+4. 可选地把关系导入 Neo4j，供故障树召回与图谱约束使用
+
+和其他 worktree 的关系如下：
+
+- `D:\fwwb\fault_tree_visual`：`main` 分支，负责前端
+- `D:\fwwb\fault_tree_system`：`generate-fta` 分支，负责故障树自动生成
+- `D:\fwwb\knowledge_base_construction`：`knowledge_base_construction` 分支，负责知识库构建与关系抽取
+
+## 与 generate-fta 的接口约定
+
+本模块输出以下标准产物，供 `generate-fta` 分支导入：
+
+- `{pdf_stem}_chunks.json`
+  由 `generate-fta` 分支执行 `python import_chunks.py --file <chunks_json>` 导入 MongoDB `chunks`
+- `{pdf_stem}_entities_merged.json`
+  由 `generate-fta` 分支执行 `python import_entity_index.py --file <entities_merged_json>` 导入 `entity_reverse_index`
+- `{pdf_stem}_relations.jsonl`
+  由 `generate-fta` 分支执行 `python import_relations_to_neo4j.py --file <relations_jsonl> ...` 导入 Neo4j 图谱
+
+因此，这个分支和 `generate-fta` 分支通过“标准产物文件 + 导入脚本”衔接，而不是在同一个工作目录里重复维护两套代码。
+
+## 服务接口
+
+本分支新增了一个轻量 FastAPI 服务入口 `main.py`，用于把知识库构建能力独立暴露出来：
+
+- `POST /api/kb/jobs/run`
+  启动一次知识抽取流水线任务
+- `GET /api/kb/jobs/{job_id}`
+  查看任务状态、产物路径和 stdout / stderr
+- `POST /api/kb/neo4j/import`
+  将关系文件导入 Neo4j
+
+启动方式：
+
+```bash
+uvicorn main:app --reload --port 8010
+```
+
 # 知识抽取流水线文档
 
 ## 概述
