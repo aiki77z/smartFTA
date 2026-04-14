@@ -386,7 +386,7 @@ def build_fault_tree(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=8192,    
+        max_tokens=8192,
     )
     return _parse_json(response.choices[0].message.content)
 

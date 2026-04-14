@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
 from database import (
     append_generation_job_item_event,
     claim_generation_job_item,
@@ -23,6 +24,8 @@ from database import (
     create_tree,
     find_active_job_item_by_top_event,
     find_tree_by_top_event,
+    import_chunks as import_chunks_to_db,
+    import_entity_reverse_index as import_entity_reverse_index_to_db,
     get_chunk_by_id,
     get_generation_job,
     get_generation_job_item,
@@ -53,6 +56,9 @@ from generator import (
     parse_user_prompt,
 )
 from graph_retriever import build_graph_draft_candidates, list_fault_phenomenon_top_events, search_graph_related_chunks
+from import_chunks import _load_chunks
+from import_entity_index import _load_entries
+from import_relations_to_neo4j import GraphDatabase, clear_graph, ensure_constraints, import_rows, load_json
 from validator import validate_full, validate_semantics
 
 MAX_GENERATION_WORKERS = max(1, int(os.getenv("MAX_GENERATION_WORKERS", "2")))
@@ -70,6 +76,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _console_log(message: str):
+    print(message, flush=True)
 
 
 def _load_py_module(module_name: str, file_path: Path):
@@ -156,7 +166,7 @@ def _worker_loop(worker_name: str, allow_batch: bool):
         try:
             _run_generation_item(item_id, execution_owner=f"queue:{worker_name}:{item_id}")
         except Exception as exc:
-            print(f"[scheduler] worker={worker_name} item={item_id} failed: {exc}")
+            _console_log(f"[scheduler] worker={worker_name} item={item_id} failed: {exc}")
         finally:
             if queue_ref is not None:
                 queue_ref.task_done()
@@ -190,6 +200,7 @@ def _submit_generation_item(item_id: str, queue_type: str):
         single_generation_queue.put(item_id)
     else:
         batch_generation_queue.put(item_id)
+    _console_log(f"[scheduler] queued item={item_id} queue={queue_type}")
 
 
 def _start_dedicated_generation_thread(item_id: str, mirror_item_ids: Optional[List[str]] = None):
@@ -213,7 +224,7 @@ def _log_item_duration(item_id: str):
 
     duration = item.get("duration_seconds")
     duration_text = f"{duration:.3f}s" if isinstance(duration, (int, float)) else "unknown"
-    print(
+    _console_log(
         f"[timing] item={item_id} top_event={item.get('top_event')} "
         f"status={item.get('status')} duration={duration_text}"
     )
@@ -228,7 +239,7 @@ def _log_job_duration_once(job_id: str):
 
     duration = job.get("duration_seconds")
     duration_text = f"{duration:.3f}s" if isinstance(duration, (int, float)) else "unknown"
-    print(
+    _console_log(
         f"[timing] job={job_id} type={job.get('job_type')} status={job.get('status')} "
         f"total={job.get('total')} success={job.get('success')} failed={job.get('failed')} "
         f"duration={duration_text}"
@@ -323,6 +334,10 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
     tree_id = None
 
     try:
+        _console_log(
+            f"[scheduler] start item={item_id} job={job_id} top_event={top_event} "
+            f"owner={execution_owner or item.get('execution_owner') or 'direct'}"
+        )
         # 任务级事件流：用于前端对话栏实时展示执行进度（引用到该 task）
         _append_event(
             item_id,
@@ -347,6 +362,10 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             catalog_name=top_event,
         )
         if reused:
+            _console_log(
+                f"[reuse] item={item_id} job={job_id} top_event={top_event} "
+                f"tree_id={reused['tree_id']} version={reused['version']}"
+            )
             update_generation_job_item(
                 item_id,
                 status="success",
@@ -413,6 +432,10 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             _append_event(mid, agent="生成智能体", text="已创建故障树记录。", stage="tree_record", progress=15)
 
         def progress_callback(progress: int, stage: str, message: str):
+            _console_log(
+                f"[progress] item={item_id} top_event={top_event} "
+                f"stage={stage} progress={progress} message={message}"
+            )
             update_generation_job_item(
                 item_id,
                 status="running",
@@ -464,6 +487,10 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             version=version,
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
         )
+        _console_log(
+            f"[scheduler] success item={item_id} job={job_id} top_event={top_event} "
+            f"tree_id={tree_id} version={version}"
+        )
         _append_event(item_id, agent="生成智能体", text="生成完成。", stage="completed", progress=100)
         _sync_mirror_items(
             mirror_item_ids,
@@ -487,6 +514,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             if mirror_item:
                 _log_job_duration_once(mirror_item["job_id"])
     except ValueError as exc:
+        _console_log(f"[scheduler] failed item={item_id} job={job_id} top_event={top_event} error={exc}")
         if tree_id:
             update_tree_status(tree_id, "failed", error=str(exc))
         update_generation_job_item(
@@ -521,6 +549,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             if mirror_item:
                 _log_job_duration_once(mirror_item["job_id"])
     except Exception as exc:
+        _console_log(f"[scheduler] failed item={item_id} job={job_id} top_event={top_event} error={exc}")
         if tree_id:
             update_tree_status(tree_id, "failed", error=str(exc))
         update_generation_job_item(
@@ -725,6 +754,15 @@ class TopEventsPreviewRequest(BaseModel):
     limit: int = 200
 
 
+class KnowledgeArtifactsImportRequest(BaseModel):
+    chunks_file: str
+    entities_file: Optional[str] = None
+    relations_file: Optional[str] = None
+    clear_graph: bool = True
+    import_relations: bool = True
+    source: str = "knowledge_base_construction"
+
+
 class SaveRequest(BaseModel):
     tree_data: dict
     editor: str = "专家"
@@ -795,6 +833,39 @@ def _discover_batch_top_events() -> Dict[str, object]:
     }
 
 
+def _import_relations_from_file(relations_file: Path, clear_existing_graph: bool) -> Dict[str, object]:
+    if not relations_file.exists():
+        raise ValueError(f"relations_file 不存在: {relations_file}")
+    if not NEO4J_PASSWORD:
+        raise ValueError("未配置 NEO4J_PASSWORD，无法导入图谱关系")
+
+    rows = load_json(relations_file)
+    if not rows:
+        return {
+            "rows": 0,
+            "relations": 0,
+            "database": NEO4J_DATABASE,
+            "cleared": clear_existing_graph,
+        }
+
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        driver.verify_connectivity()
+        ensure_constraints(driver, NEO4J_DATABASE)
+        if clear_existing_graph:
+            clear_graph(driver, NEO4J_DATABASE)
+        relation_count = import_rows(driver, NEO4J_DATABASE, rows, batch_size=200)
+    finally:
+        driver.close()
+
+    return {
+        "rows": len(rows),
+        "relations": relation_count,
+        "database": NEO4J_DATABASE,
+        "cleared": clear_existing_graph,
+    }
+
+
 @app.post("/api/tree/generate")
 def api_generate(req: GenerateRequest):
     try:
@@ -812,6 +883,57 @@ def api_generate(req: GenerateRequest):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Queue generation failed: {exc}")
+
+
+@app.post("/api/integration/import-knowledge-artifacts")
+def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
+    chunks_path = Path(req.chunks_file).expanduser().resolve()
+    entities_path = Path(req.entities_file).expanduser().resolve() if req.entities_file else None
+    relations_path = Path(req.relations_file).expanduser().resolve() if req.relations_file else None
+
+    if not chunks_path.exists():
+        raise HTTPException(status_code=400, detail=f"chunks_file 不存在: {chunks_path}")
+    if entities_path and not entities_path.exists():
+        raise HTTPException(status_code=400, detail=f"entities_file 不存在: {entities_path}")
+    if req.import_relations and relations_path and not relations_path.exists():
+        raise HTTPException(status_code=400, detail=f"relations_file 不存在: {relations_path}")
+
+    try:
+        chunks = _load_chunks(str(chunks_path))
+        import_chunks_to_db(chunks)
+
+        entity_count = 0
+        if entities_path:
+            entries = _load_entries(str(entities_path))
+            import_entity_reverse_index_to_db(entries)
+            entity_count = len(entries)
+
+        relation_result = None
+        if req.import_relations and relations_path:
+            relation_result = _import_relations_from_file(relations_path, clear_existing_graph=req.clear_graph)
+
+        return {
+            "status": "success",
+            "source": req.source,
+            "imported": {
+                "chunks": len(chunks),
+                "entity_reverse_index": entity_count,
+                "relations": relation_result,
+            },
+            "files": {
+                "chunks_file": str(chunks_path),
+                "entities_file": str(entities_path) if entities_path else None,
+                "relations_file": str(relations_path) if relations_path else None,
+            },
+            "next_steps": {
+                "preview_top_events": "/api/batch/preview-top-events",
+                "generate_all": "/api/batch/generate-all",
+            },
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"导入知识库产物失败: {exc}")
 
 
 @app.post("/api/debug/graph-recall")
@@ -959,6 +1081,11 @@ def api_batch_generate_all():
             "source": "/api/batch/generate-all",
         },
     )
+    _console_log(
+        f"[batch] created job={job['job_id']} discovery={discovery_source} "
+        f"discovered_total={len(discovered)} catalog_total={len(catalog_entries)} "
+        f"existing={existing_count} active={active_count} queued={len(queued_entries)}"
+    )
 
     queued_item_ids = []
     for entry in queued_entries:
@@ -973,6 +1100,9 @@ def api_batch_generate_all():
         )
         queued_item_ids.append(item["item_id"])
         _submit_generation_item(item["item_id"], "batch")
+        _console_log(
+            f"[batch] job={job['job_id']} queued item={item['item_id']} top_event={entry['name']}"
+        )
 
     refresh_generation_job(job["job_id"])
     return {
@@ -1132,4 +1262,5 @@ def root():
         "docs": "/docs",
         "generate_input_example": {"prompt": "请分析控制单元过热，并生成故障树"},
         "batch_endpoint": "/api/batch/generate-all",
+        "integration_endpoint": "/api/integration/import-knowledge-artifacts",
     }
