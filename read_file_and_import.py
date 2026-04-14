@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-完整流水线：PDF → Markdown → 分块 → 实体提取 → 关系提取 → 导入 MongoDB（仅 chunks 和实体索引）
+完整流水线：PDF → Markdown → 分块 → 实体提取 → 关系提取 → 导入 MongoDB + Neo4j
 
 脚本位置：根目录（与 knowledge_base_construction/ 和 validator-service/ 同级）
 依赖：
-    - knowledge_base_construction/output/ 下的脚本：
+    - knowledge_base_construction/ 下的脚本：
         trans_file_to_md.py, chunk_md.py, extract_entities.py, extract_relations.py
     - validator-service/database.py 及 config.py（需配置 MongoDB）
+    - import_relations_to_neo4j.py（位于根目录，提供 Neo4j 导入函数）
     - 外部命令：mineru（MinerU CLI）
-    - Python 包：pymongo
+    - Python 包：pymongo, neo4j
 
 使用方法：
-    python pipeline_full_with_import.py --pdf document.pdf --mongo-uri mongodb://localhost:27017 --db-name mydb
+    python pipeline_full_with_import.py --pdf document.pdf --mongo-uri mongodb://localhost:27017 --db-name mydb \\
+        --neo4j-password yourpassword --neo4j-clear
 """
 
 import argparse
@@ -19,22 +21,28 @@ import json
 import sys
 import subprocess
 import time
+import importlib
 from pathlib import Path
 
 # 获取根目录（脚本所在目录）
 ROOT_DIR = Path(__file__).parent.absolute()
-KB_OUTPUT_DIR = ROOT_DIR / "knowledge_base_construction" / "output"
+KB_SCRIPTS_DIR = ROOT_DIR / "knowledge_base_construction"   # 脚本所在目录
 VALIDATOR_DIR = ROOT_DIR / "validator-service"
 
 # 将 validator-service 添加到 Python 路径，以便导入 database 模块
 sys.path.insert(0, str(VALIDATOR_DIR))
 
-# 导入 database 模块（必须已配置 config.py）
+# 导入 database 模块（使用模块本身，而非直接导入函数，便于重新加载）
+import database
+import config
+
+# 尝试导入 Neo4j 导入模块（位于根目录）
 try:
-    from database import import_chunks, import_entity_reverse_index
+    import import_relations_to_neo4j as neo4j_importer
+    NEO4J_AVAILABLE = True
 except ImportError as e:
-    print(f"无法导入 database 模块，请检查 validator-service 路径和 config.py: {e}")
-    sys.exit(1)
+    print(f"警告: 无法导入 neo4j 导入模块，Neo4j 功能将被禁用。错误: {e}")
+    NEO4J_AVAILABLE = False
 
 
 def run_command(cmd, description, cwd=None):
@@ -83,7 +91,9 @@ def find_md_file(output_dir, pdf_stem):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PDF 知识抽取 + MongoDB 导入流水线（含关系提取，但不导入关系）")
+    parser = argparse.ArgumentParser(
+        description="PDF 知识抽取 + MongoDB 导入 + Neo4j 关系导入流水线"
+    )
     parser.add_argument("--pdf", "-p", required=True, help="输入的 PDF 文件路径")
     parser.add_argument("--output-dir", "-o", default="./output", help="临时输出根目录（默认 ./output）")
     parser.add_argument("--chunk-size", "-s", type=int, default=800, help="分块大小（字符数），默认 800")
@@ -91,26 +101,33 @@ def main():
     parser.add_argument("--skip-entity", action="store_true", help="跳过实体提取（只导入 chunks）")
     parser.add_argument("--skip-relation", action="store_true", help="跳过关系统取（只到实体导入）")
     parser.add_argument("--print-raw-text", action="store_true", help="打印 LLM 原始返回文本（调试用）")
-    # MongoDB 连接参数（会覆盖 config.py 中的配置）
+
+    # MongoDB 连接参数
     parser.add_argument("--mongo-uri", help="MongoDB URI，如 mongodb://localhost:27017")
     parser.add_argument("--db-name", help="MongoDB 数据库名称")
+
+    # Neo4j 连接参数（若提供则导入关系数据）
+    parser.add_argument("--neo4j-uri", default="bolt://localhost:7687", help="Neo4j URI（默认 bolt://localhost:7687）")
+    parser.add_argument("--neo4j-user", default="neo4j", help="Neo4j 用户名（默认 neo4j）")
+    parser.add_argument("--neo4j-password", help="Neo4j 密码（必填以启用 Neo4j 导入）")
+    parser.add_argument("--neo4j-database", default="neo4j", help="Neo4j 数据库名（默认 neo4j）")
+    parser.add_argument("--neo4j-clear", action="store_true", help="导入前清空 Neo4j 图数据库")
+    parser.add_argument("--skip-neo4j", action="store_true", help="跳过 Neo4j 导入（即使提供了密码）")
+
     args = parser.parse_args()
 
-    # 覆盖 database 模块中的全局配置（如果提供了参数）
+    # 覆盖 MongoDB 配置（如果提供了参数），并重新加载 database 模块使配置生效
     if args.mongo_uri or args.db_name:
         try:
-            import config
             if args.mongo_uri:
                 config.MONGO_URI = args.mongo_uri
             if args.db_name:
                 config.MONGO_DB_NAME = args.db_name
-            # 重新加载 database 模块使配置生效
-            import importlib
-            importlib.reload(config)
+            # 重新加载 database 模块，使其使用新的 config 配置
             importlib.reload(database)
-            from database import import_chunks, import_entity_reverse_index
+            print(f"MongoDB 配置已更新: URI={config.MONGO_URI}, DB={config.MONGO_DB_NAME}")
         except Exception as e:
-            print(f"警告：无法覆盖 MongoDB 配置，将使用 config.py 中的默认值: {e}")
+            print(f"警告：无法覆盖 MongoDB 配置，将使用原有配置: {e}")
 
     pdf_path = Path(args.pdf).resolve()
     if not pdf_path.exists():
@@ -126,9 +143,9 @@ def main():
     # ---------- 步骤1: PDF -> Markdown ----------
     if not args.skip_mineru:
         print("\n=== 步骤1: PDF 转 Markdown (MinerU) ===")
-        mineru_script = KB_OUTPUT_DIR / "trans_file_to_md.py"
+        mineru_script = KB_SCRIPTS_DIR / "trans_file_to_md.py"
         if not mineru_script.exists():
-            print(f"错误: 找不到 {mineru_script}，请确认 knowledge_base_construction/output/ 目录存在")
+            print(f"错误: 找不到 {mineru_script}，请确认 knowledge_base_construction/ 目录存在且包含 trans_file_to_md.py")
             sys.exit(1)
         cmd = [
             sys.executable, str(mineru_script),
@@ -154,7 +171,7 @@ def main():
 
     # ---------- 步骤2: Markdown 分块 ----------
     print("\n=== 步骤2: Markdown 分块 ===")
-    chunk_script = KB_OUTPUT_DIR / "chunk_md.py"
+    chunk_script = KB_SCRIPTS_DIR / "chunk_md.py"
     if not chunk_script.exists():
         print(f"错误: 找不到 {chunk_script}")
         sys.exit(1)
@@ -174,7 +191,7 @@ def main():
         chunks_data = json.load(f)
     if not isinstance(chunks_data, list):
         chunks_data = [chunks_data]
-    import_chunks(chunks_data)
+    database.import_chunks(chunks_data)
     print(f"已导入 {len(chunks_data)} 个 chunks")
 
     if args.skip_entity:
@@ -183,7 +200,7 @@ def main():
 
     # ---------- 步骤3: 实体提取 ----------
     print("\n=== 步骤3: 实体提取 ===")
-    entity_script = KB_OUTPUT_DIR / "extract_entities.py"
+    entity_script = KB_SCRIPTS_DIR / "extract_entities.py"
     if not entity_script.exists():
         print(f"错误: 找不到 {entity_script}")
         sys.exit(1)
@@ -211,16 +228,16 @@ def main():
     for entry in entities_data:
         if "chunk_ids" in entry:
             entry["chunk_ids"] = [cid for cid in entry["chunk_ids"] if cid]
-    import_entity_reverse_index(entities_data)
+    database.import_entity_reverse_index(entities_data)
     print(f"已导入 {len(entities_data)} 个实体条目")
 
     if args.skip_relation:
         print("已跳过关系统取，流程结束。")
         return
 
-    # ---------- 步骤4: 关系提取（仅生成文件，不导入数据库） ----------
-    print("\n=== 步骤4: 关系提取（仅生成文件，不导入） ===")
-    relation_script = KB_OUTPUT_DIR / "extract_relations.py"
+    # ---------- 步骤4: 关系提取（仅生成文件） ----------
+    print("\n=== 步骤4: 关系提取（仅生成文件） ===")
+    relation_script = KB_SCRIPTS_DIR / "extract_relations.py"
     if not relation_script.exists():
         print(f"错误: 找不到 {relation_script}")
         sys.exit(1)
@@ -241,12 +258,59 @@ def main():
     print(f"关系 JSON: {relations_json}")
     print(f"关系 CSV:  {relations_csv}")
 
+    # ---------- 步骤5: 导入关系到 Neo4j（如果启用） ----------
+    neo4j_enabled = (args.neo4j_password is not None and not args.skip_neo4j and NEO4J_AVAILABLE)
+    if neo4j_enabled:
+        print("\n=== 步骤5: 导入关系到 Neo4j ===")
+        try:
+            # 使用 import_relations_to_neo4j 模块加载关系数据
+            rows = neo4j_importer.load_json(relations_json)
+            if not rows:
+                print("警告: 关系文件中未找到有效的关系数据，跳过 Neo4j 导入。")
+            else:
+                # 连接 Neo4j
+                from neo4j import GraphDatabase
+                driver = GraphDatabase.driver(
+                    args.neo4j_uri,
+                    auth=(args.neo4j_user, args.neo4j_password)
+                )
+                try:
+                    driver.verify_connectivity()
+                    # 确保约束
+                    neo4j_importer.ensure_constraints(driver, args.neo4j_database)
+                    if args.neo4j_clear:
+                        print("清空 Neo4j 图数据库...")
+                        neo4j_importer.clear_graph(driver, args.neo4j_database)
+                    # 导入关系
+                    relation_count = neo4j_importer.import_rows(
+                        driver, args.neo4j_database, rows, batch_size=200
+                    )
+                    print(f"成功导入 {len(rows)} 个 chunk 行和 {relation_count} 条 RELATION 关系到 Neo4j 数据库 '{args.neo4j_database}'。")
+                    # 打印统计摘要
+                    neo4j_importer.print_summary(driver, args.neo4j_database)
+                finally:
+                    driver.close()
+        except Exception as e:
+            print(f"错误: Neo4j 导入失败: {e}", file=sys.stderr)
+            # 不退出整个流水线，因为 MongoDB 已导入成功
+    else:
+        if not NEO4J_AVAILABLE:
+            print("跳过 Neo4j 导入: 未找到 neo4j 驱动或 import_relations_to_neo4j 模块。")
+        elif args.skip_neo4j:
+            print("跳过 Neo4j 导入 (--skip-neo4j 已设置)。")
+        elif args.neo4j_password is None:
+            print("跳过 Neo4j 导入: 未提供 --neo4j-password。如需导入关系数据到 Neo4j，请提供密码。")
+
     print("\n=== 流水线执行完成 ===")
     print(f"结果目录: {result_dir}")
     print(f"已导入数据库：")
-    print(f"  - Chunks 集合: 'chunks'")
-    print(f"  - 实体索引集合: 'entity_reverse_index'")
-    print(f"关系数据已生成文件，未导入数据库：")
+    print(f"  - MongoDB Chunks 集合: 'chunks'")
+    print(f"  - MongoDB 实体索引集合: 'entity_reverse_index'")
+    if neo4j_enabled:
+        print(f"  - Neo4j 图数据库: {args.neo4j_uri} (数据库: {args.neo4j_database})")
+    else:
+        print("  - Neo4j 导入未执行（可通过 --neo4j-password 启用）")
+    print(f"关系数据文件已保存至: {relations_json}, {relations_csv}")
 
 
 if __name__ == "__main__":
