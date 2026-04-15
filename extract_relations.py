@@ -3,6 +3,8 @@ import os
 import re
 import argparse
 import csv
+import threading
+import concurrent.futures
 from typing import List, Dict, Set
 from collections import Counter, defaultdict
 from generate_prompt_relation import generate_relation_prompt_and_context_second
@@ -111,6 +113,9 @@ def load_processed_chunk_ids(output_file: str) -> Set[str]:
     return {item["chunk_id"] for item in data}
 
 def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dict], output_file: str, print_raw_text: bool = False) -> List[Dict]:
+    """
+    多线程并发调用 LLM 提取关系，结果增量写入 output_file（JSON Lines 格式）
+    """
     processed_chunk_ids = load_processed_chunk_ids(output_file)
     results = []
     if os.path.exists(output_file):
@@ -119,48 +124,77 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
 
     chunk_entities_map = {res["chunk_id"]: res["entities"] for res in entities_results}
 
-    with open(output_file, "a", encoding="utf-8") as f:
-        for chunk in chunks:
-            chunk_id = chunk.get("chunk_id") or chunk.get("id") or str(chunk.get("chunk_id", ""))
-            if not chunk_id or chunk_id in processed_chunk_ids:
-                continue
-            chunk_name = chunk.get("chunk_name") or chunk.get("chunk_name", "未知文档")
-            content = chunk.get("content", "")
-            entities = chunk_entities_map.get(chunk_id, [])
-            print(f"处理文档关系：{chunk_name}，chunk_id: {chunk_id}，实体数: {len(entities)}")
-            valid_relations = []
-            relation_prompt = ""
-            try:
-                if entities:
-                    relation_prompt, relation_context = generate_relation_prompt_and_context_second(
-                        chunk_name, content, entities
-                    )
-                    relation_text = call_llm(relation_prompt, relation_context, mode="relation")
-                    
-                    if print_raw_text:
-                        print(f"\n=== LLM 原始返回 (chunk_id: {chunk_id}) ===\n{relation_text}\n=================================\n")
-                    
-                    relations = parse_relations_second(relation_text)
-                    entity_names = {ent["entity_name"] for ent in entities}
-                    entity_type_map = {ent["entity_name"]: ent["entity_type"] for ent in entities}
-                    for rel in relations:
-                        if rel["entity1"] in entity_names and rel["entity2"] in entity_names:
-                            rel["entity1_type"] = entity_type_map.get(rel["entity1"], "")
-                            rel["entity2_type"] = entity_type_map.get(rel["entity2"], "")
-                            valid_relations.append(rel)
-                result = {
-                    "chunk_id": chunk_id,
-                    "relations": valid_relations,
-                    "entity": entities,
-                    "relation": valid_relations
-                }
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
-                f.flush()
-                results.append(result)
-                print(f"提取有效关系数：{len(valid_relations)}")
-            except Exception as e:
-                print(f"处理chunk_id {chunk_id}关系时出错: {e}")
-                continue
+    # 收集待处理的 chunk
+    pending_chunks = []
+    for chunk in chunks:
+        chunk_id = chunk.get("chunk_id") or chunk.get("id") or str(chunk.get("chunk_id", ""))
+        if not chunk_id or chunk_id in processed_chunk_ids:
+            continue
+        pending_chunks.append((chunk_id, chunk))
+
+    if not pending_chunks:
+        print("没有需要处理的新 chunk")
+        return results
+
+    print(f"需要处理 {len(pending_chunks)} 个 chunk，使用多线程并发调用 LLM")
+
+    # 单个 chunk 的处理函数（将在线程池中执行）
+    def process_one(chunk_id: str, chunk: Dict):
+        chunk_name = chunk.get("chunk_name") or chunk.get("chunk_name", "未知文档")
+        content = chunk.get("content", "")
+        entities = chunk_entities_map.get(chunk_id, [])
+        print(f"处理文档关系：{chunk_name}，chunk_id: {chunk_id}，实体数: {len(entities)}")
+        valid_relations = []
+        try:
+            if entities:
+                relation_prompt, relation_context = generate_relation_prompt_and_context_second(
+                    chunk_name, content, entities
+                )
+                relation_text = call_llm(relation_prompt, relation_context, mode="relation")
+
+                if print_raw_text:
+                    print(f"\n=== LLM 原始返回 (chunk_id: {chunk_id}) ===\n{relation_text}\n=================================\n")
+
+                relations = parse_relations_second(relation_text)
+                entity_names = {ent["entity_name"] for ent in entities}
+                entity_type_map = {ent["entity_name"]: ent["entity_type"] for ent in entities}
+                for rel in relations:
+                    if rel["entity1"] in entity_names and rel["entity2"] in entity_names:
+                        rel["entity1_type"] = entity_type_map.get(rel["entity1"], "")
+                        rel["entity2_type"] = entity_type_map.get(rel["entity2"], "")
+                        valid_relations.append(rel)
+
+            result = {
+                "chunk_id": chunk_id,
+                "relations": valid_relations,
+                "entity": entities,
+                "relation": valid_relations
+            }
+            print(f"提取有效关系数：{len(valid_relations)}")
+            return result
+        except Exception as e:
+            print(f"处理 chunk_id {chunk_id} 关系时出错: {e}")
+            return None
+
+    new_results = []
+    # 使用线程池，最大并发数可根据需要调整
+    max_workers = 5
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_chunk = {executor.submit(process_one, cid, chunk): cid for cid, chunk in pending_chunks}
+        # 主线程顺序处理已完成的任务，并追加写入文件（保证线程安全）
+        with open(output_file, "a", encoding="utf-8") as f:
+            for future in concurrent.futures.as_completed(future_to_chunk):
+                cid = future_to_chunk[future]
+                try:
+                    result = future.result()
+                    if result is not None:
+                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        f.flush()
+                        new_results.append(result)
+                except Exception as e:
+                    print(f"处理 chunk {cid} 时发生异常: {e}")
+
+    results.extend(new_results)
     return results
 
 def load_chunks(file_path: str) -> List[Dict]:
