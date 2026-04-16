@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 try:
     from neo4j import GraphDatabase
 except ImportError as exc:
     raise SystemExit("Missing dependency: neo4j\nInstall it with: pip install neo4j") from exc
+
 
 LABEL_MAP = {
     "故障现象与报警": "FaultPhenomenon",
@@ -21,12 +23,126 @@ LABEL_MAP = {
     "工具与仪器": "Tool",
 }
 
-def load_json(path: Path) -> List[Dict[str, Any]]:
-    content = path.read_text(encoding="utf-8").strip()
-    data = []
-    
+REQUIRED_RELATION_FIELDS = (
+    "chunk_id",
+    "entity1",
+    "entity2",
+    "relation_type",
+    "entity1_type",
+    "entity2_type",
+)
+
+
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _entity_label(entity_type: str) -> str:
+    return LABEL_MAP.get(_clean(entity_type), "")
+
+
+def _is_neo4j_scalar(value: Any) -> bool:
+    return isinstance(value, (str, int, float, bool))
+
+
+def _sanitize_property_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if _is_neo4j_scalar(value):
+        return value
+    if isinstance(value, list):
+        if all(_is_neo4j_scalar(item) for item in value):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _sanitize_entity_props(props: Any) -> Dict[str, Any]:
+    if not isinstance(props, dict):
+        return {}
+
+    sanitized: Dict[str, Any] = {}
+    for key, value in props.items():
+        clean_key = _clean(key)
+        if not clean_key:
+            continue
+        sanitized_value = _sanitize_property_value(value)
+        if sanitized_value is None:
+            continue
+        sanitized[clean_key] = sanitized_value
+    return sanitized
+
+
+def _normalize_relation(rel: Dict[str, Any], default_chunk_id: Any = "") -> Optional[Dict[str, Any]]:
+    entity1 = _clean(rel.get("entity1"))
+    entity2 = _clean(rel.get("entity2"))
+    relation_type = _clean(rel.get("relation_type"))
+    entity1_type = _clean(rel.get("entity1_type"))
+    entity2_type = _clean(rel.get("entity2_type"))
+    chunk_id = _clean(rel.get("chunk_id", default_chunk_id))
+
+    if not chunk_id or not entity1 or not entity2 or not relation_type:
+        return None
+
+    return {
+        "chunk_id": chunk_id,
+        "entity1": entity1,
+        "entity2": entity2,
+        "relation_type": relation_type,
+        "entity1_type": entity1_type,
+        "entity2_type": entity2_type,
+        "entity1_label": _entity_label(entity1_type),
+        "entity2_label": _entity_label(entity2_type),
+        "entity1_props": _sanitize_entity_props(rel.get("entity1_props")),
+        "entity2_props": _sanitize_entity_props(rel.get("entity2_props")),
+    }
+
+
+def _group_flat_relations(relations: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    seen = set()
+
+    for rel in relations:
+        normalized = _normalize_relation(rel)
+        if not normalized:
+            continue
+
+        relation_key = (
+            normalized["chunk_id"],
+            normalized["entity1"],
+            normalized["entity2"],
+            normalized["relation_type"],
+            normalized["entity1_type"],
+            normalized["entity2_type"],
+        )
+        if relation_key in seen:
+            continue
+        seen.add(relation_key)
+
+        chunk_id = normalized.pop("chunk_id")
+        bucket = grouped.setdefault(chunk_id, {"chunk_id": chunk_id, "relations": []})
+        bucket["relations"].append(normalized)
+
+    return list(grouped.values())
+
+
+def _load_csv(path: Path) -> List[Dict[str, Any]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        missing = [field for field in REQUIRED_RELATION_FIELDS if field not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"CSV missing required columns: {', '.join(missing)}")
+        return _group_flat_relations(reader)
+
+
+def _load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
+    content = path.read_text(encoding="utf-8-sig").strip()
+    if not content:
+        return []
+
     try:
-        # 首先尝试按标准单体 JSON 解析
         parsed = json.loads(content)
         if isinstance(parsed, dict):
             data = [parsed]
@@ -35,47 +151,51 @@ def load_json(path: Path) -> List[Dict[str, Any]]:
         else:
             raise ValueError("JSON root must be a list or object")
     except json.JSONDecodeError:
-        # 如果标准解析失败（触发 Extra data 错误），则按 JSONL 格式逐行解析
-        for line in content.splitlines():
+        data = []
+        for line_no, line in enumerate(content.splitlines(), start=1):
             line = line.strip()
             if not line:
                 continue
-            item = json.loads(line)
-            data.append(item)
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at line {line_no}: {exc}") from exc
 
-    # 下方的逻辑保持不变，处理 normalized 提取
-    normalized = []
+    flat_relations = []
     for item in data:
         if not isinstance(item, dict):
             continue
-        chunk_id = str(item.get("chunk_id", "")).strip()
-        relations = item.get("relations") or item.get("relation") or []
-        if not isinstance(relations, list):
+
+        chunk_id = _clean(item.get("chunk_id"))
+        nested_relations = item.get("relations") or item.get("relation")
+        if isinstance(nested_relations, list):
+            for rel in nested_relations:
+                if isinstance(rel, dict):
+                    copied = dict(rel)
+                    copied.setdefault("chunk_id", chunk_id)
+                    flat_relations.append(copied)
             continue
-        cleaned = []
-        for rel in relations:
-            if not isinstance(rel, dict):
-                continue
-            entity1 = str(rel.get("entity1", "")).strip()
-            entity2 = str(rel.get("entity2", "")).strip()
-            relation_type = str(rel.get("relation_type", "")).strip()
-            entity1_type = str(rel.get("entity1_type", "")).strip()
-            entity2_type = str(rel.get("entity2_type", "")).strip()
-            if not entity1 or not entity2 or not relation_type:
-                continue
-            cleaned.append({
-                "entity1": entity1,
-                "entity2": entity2,
-                "relation_type": relation_type,
-                "entity1_type": entity1_type,
-                "entity2_type": entity2_type,
-                "entity1_label": LABEL_MAP.get(entity1_type, ""),
-                "entity2_label": LABEL_MAP.get(entity2_type, ""),
-            })
-        if chunk_id and cleaned:
-            normalized.append({"chunk_id": chunk_id, "relations": cleaned})
-            
-    return normalized
+
+        if all(field in item for field in REQUIRED_RELATION_FIELDS):
+            flat_relations.append(item)
+
+    return _group_flat_relations(flat_relations)
+
+
+def load_relations(path: Path | str) -> List[Dict[str, Any]]:
+    relation_path = Path(path)
+    suffix = relation_path.suffix.lower()
+    if suffix == ".csv":
+        return _load_csv(relation_path)
+    if suffix in {".json", ".jsonl", ".ndjson"}:
+        return _load_json_or_jsonl(relation_path)
+    raise ValueError(f"Unsupported relation file type: {relation_path.suffix}")
+
+
+def load_json(path: Path | str) -> List[Dict[str, Any]]:
+    """Backward-compatible name used by main.py."""
+    return load_relations(path)
+
 
 CREATE_ENTITY_CONSTRAINT = """
 CREATE CONSTRAINT entity_name_type_unique IF NOT EXISTS
@@ -92,11 +212,14 @@ REQUIRE c.chunk_id IS UNIQUE
 IMPORT_BATCH_CYPHER = """
 UNWIND $rows AS row
 MERGE (c:Chunk {chunk_id: row.chunk_id})
+  ON CREATE SET c.created_at = datetime()
+SET c.updated_at = datetime()
 WITH c, row
 UNWIND row.relations AS rel
 MERGE (e1:Entity {name: rel.entity1, entity_type: rel.entity1_type})
   ON CREATE SET e1.created_at = datetime()
-SET e1.updated_at = datetime()
+SET e1 += rel.entity1_props,
+    e1.updated_at = datetime()
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'FaultPhenomenon' THEN [1] ELSE [] END | SET e1:FaultPhenomenon)
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'Component' THEN [1] ELSE [] END | SET e1:Component)
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'Parameter' THEN [1] ELSE [] END | SET e1:Parameter)
@@ -105,14 +228,20 @@ FOREACH (_ IN CASE WHEN rel.entity1_label = 'Method' THEN [1] ELSE [] END | SET 
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'Tool' THEN [1] ELSE [] END | SET e1:Tool)
 MERGE (e2:Entity {name: rel.entity2, entity_type: rel.entity2_type})
   ON CREATE SET e2.created_at = datetime()
-SET e2.updated_at = datetime()
+SET e2 += rel.entity2_props,
+    e2.updated_at = datetime()
 FOREACH (_ IN CASE WHEN rel.entity2_label = 'FaultPhenomenon' THEN [1] ELSE [] END | SET e2:FaultPhenomenon)
 FOREACH (_ IN CASE WHEN rel.entity2_label = 'Component' THEN [1] ELSE [] END | SET e2:Component)
 FOREACH (_ IN CASE WHEN rel.entity2_label = 'Parameter' THEN [1] ELSE [] END | SET e2:Parameter)
 FOREACH (_ IN CASE WHEN rel.entity2_label = 'System' THEN [1] ELSE [] END | SET e2:System)
 FOREACH (_ IN CASE WHEN rel.entity2_label = 'Method' THEN [1] ELSE [] END | SET e2:Method)
 FOREACH (_ IN CASE WHEN rel.entity2_label = 'Tool' THEN [1] ELSE [] END | SET e2:Tool)
-MERGE (e1)-[r:RELATION {relation_type: rel.relation_type, chunk_id: row.chunk_id}]->(e2)
+MERGE (e1)-[r:RELATION {
+  relation_type: rel.relation_type,
+  chunk_id: row.chunk_id,
+  entity1_type: rel.entity1_type,
+  entity2_type: rel.entity2_type
+}]->(e2)
   ON CREATE SET r.created_at = datetime()
 SET r.updated_at = datetime()
 MERGE (e1)-[:MENTIONED_IN]->(c)
@@ -121,18 +250,22 @@ MERGE (e2)-[:MENTIONED_IN]->(c)
 
 DELETE_ALL_CYPHER = "MATCH (n) DETACH DELETE n"
 
+
 def chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
     for idx in range(0, len(items), size):
         yield items[idx : idx + size]
+
 
 def ensure_constraints(driver: Any, database: str) -> None:
     with driver.session(database=database) as session:
         session.run(CREATE_ENTITY_CONSTRAINT).consume()
         session.run(CREATE_CHUNK_CONSTRAINT).consume()
 
+
 def clear_graph(driver: Any, database: str) -> None:
     with driver.session(database=database) as session:
         session.run(DELETE_ALL_CYPHER).consume()
+
 
 def import_rows(driver: Any, database: str, rows: List[Dict[str, Any]], batch_size: int) -> int:
     total_relations = 0
@@ -142,41 +275,93 @@ def import_rows(driver: Any, database: str, rows: List[Dict[str, Any]], batch_si
             total_relations += sum(len(row["relations"]) for row in batch)
     return total_relations
 
+
+def summarize_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    relation_counts: Dict[str, int] = {}
+    label_counts: Dict[str, int] = {}
+    entity_keys = set()
+    edge_count = 0
+
+    for row in rows:
+        for rel in row.get("relations", []):
+            edge_count += 1
+            relation_counts[rel["relation_type"]] = relation_counts.get(rel["relation_type"], 0) + 1
+            for side in ("entity1", "entity2"):
+                entity_keys.add((rel[side], rel.get(f"{side}_type", "")))
+                label = rel.get(f"{side}_label") or "Entity"
+                label_counts[label] = label_counts.get(label, 0) + 1
+
+    return {
+        "chunk_rows": len(rows),
+        "entities": len(entity_keys),
+        "relations": edge_count,
+        "relation_counts": dict(sorted(relation_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "label_mentions": dict(sorted(label_counts.items(), key=lambda item: (-item[1], item[0]))),
+    }
+
+
 def print_summary(driver: Any, database: str) -> None:
     with driver.session(database=database) as session:
         node_count = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
         rel_count = session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
         relation_breakdown = session.run(
-            "MATCH ()-[r:RELATION]->() RETURN r.relation_type AS type, count(*) AS cnt ORDER BY cnt DESC"
+            """
+            MATCH ()-[r:RELATION]->()
+            RETURN r.relation_type AS type, count(*) AS cnt
+            ORDER BY cnt DESC, type ASC
+            """
         ).data()
+        label_breakdown = session.run(
+            """
+            MATCH (e:Entity)
+            RETURN labels(e) AS labels, count(*) AS cnt
+            ORDER BY cnt DESC
+            """
+        ).data()
+
     print(f"Nodes: {node_count}")
     print(f"Relationships: {rel_count}")
     print("RELATION breakdown:")
     for item in relation_breakdown:
         print(f"  - {item['type']}: {item['cnt']}")
+    print("Entity label breakdown:")
+    for item in label_breakdown:
+        labels = [label for label in item["labels"] if label != "Entity"]
+        print(f"  - {'/'.join(labels) or 'Entity'}: {item['cnt']}")
+
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Import relation JSON into Neo4j")
-    parser.add_argument("--file", required=True, help="Path to relation JSON file")
+    parser = argparse.ArgumentParser(description="Import knowledge graph relations into Neo4j")
+    parser.add_argument("--file", required=True, help="Path to relation CSV/JSON/JSONL file")
     parser.add_argument("--uri", default="bolt://localhost:7687", help="Neo4j URI")
     parser.add_argument("--user", default="neo4j", help="Neo4j username")
     parser.add_argument("--password", required=True, help="Neo4j password")
     parser.add_argument("--database", default="neo4j", help="Target Neo4j database")
-    parser.add_argument("--batch-size", type=int, default=200, help="Rows per write batch")
+    parser.add_argument("--batch-size", type=int, default=200, help="Chunk rows per write batch")
     parser.add_argument("--clear", action="store_true", help="Delete all existing graph data before import")
+    parser.add_argument("--dry-run", action="store_true", help="Parse the file and print a summary without writing")
     return parser
+
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    json_path = Path(args.file)
-    if not json_path.exists():
-        print(f"File not found: {json_path}", file=sys.stderr)
+    relation_path = Path(args.file)
+    if not relation_path.exists():
+        print(f"File not found: {relation_path}", file=sys.stderr)
         return 1
-    rows = load_json(json_path)
+
+    rows = load_relations(relation_path)
     if not rows:
-        print("No valid relation rows found in JSON.", file=sys.stderr)
+        print("No valid relation rows found.", file=sys.stderr)
         return 1
+
+    local_summary = summarize_rows(rows)
+    print(json.dumps(local_summary, ensure_ascii=False, indent=2))
+
+    if args.dry_run:
+        return 0
+
     driver = GraphDatabase.driver(args.uri, auth=(args.user, args.password))
     try:
         driver.verify_connectivity()
@@ -189,6 +374,7 @@ def main() -> int:
     finally:
         driver.close()
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

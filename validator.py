@@ -75,6 +75,8 @@ def _tree_to_validator_service_graph(tree_data: dict) -> dict:
             return "intermediate"
         if t == "basic_event":
             return "basic"
+        if t == "gate":
+            return "gate"
         # fallback：未知当中间事件处理
         return "intermediate"
 
@@ -108,12 +110,32 @@ def _tree_to_validator_service_graph(tree_data: dict) -> dict:
         )
 
     # 为“确实有子事件”的非 basic 事件合成 gate 节点，并把 child->parent 改写为 child->gate、gate->parent
+    explicit_gate_ids = {
+        nid
+        for nid, n in nodes_by_id.items()
+        if str(n.get("type") or "") == "gate"
+    }
+    for l in link_list:
+        child = str(l.get("sourceId", ""))
+        parent = str(l.get("targetId", ""))
+        if child not in nodes_by_id or parent not in nodes_by_id:
+            continue
+        if child in explicit_gate_ids or parent in explicit_gate_ids:
+            graph_edges.append({"id": f"{child}->{parent}", "source": child, "target": parent})
+
     for nid, n in nodes_by_id.items():
         t = str(n.get("type") or "")
-        if t == "basic_event":
+        if t in {"basic_event", "gate"}:
             continue
 
         if not (children_of.get(nid) or []):
+            continue
+
+        has_explicit_gate = any(
+            str(nodes_by_id.get(child_id, {}).get("type") or "") == "gate"
+            for child_id in children_of.get(nid, []) or []
+        )
+        if has_explicit_gate:
             continue
 
         gate_value = n.get("gate")

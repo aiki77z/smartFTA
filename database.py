@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import re
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
 
-from config import MONGO_DB_NAME, MONGO_URI
+from config import MONGO_DB_NAME, MONGO_URI, NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
+
+try:
+    from neo4j import GraphDatabase
+except ImportError:
+    GraphDatabase = None
 
 client = MongoClient(MONGO_URI)
 db = client[MONGO_DB_NAME]
@@ -19,6 +25,18 @@ entity_reverse_index_col = db["entity_reverse_index"]
 top_event_catalog_col = db["top_event_catalog"]
 generation_jobs_col = db["generation_jobs"]
 generation_job_items_col = db["generation_job_items"]
+
+TOP_EVENT_PRIORITY_HINTS = ("故障", "异常", "报警", "停机", "失败", "超时", "触发", "中断")
+TOP_EVENT_NEGATIVE_HINTS = ("接线错误", "接口松动", "参数错误", "过流", "过热", "损坏", "松动")
+GRAPH_PROPERTY_UPDATE_FIELDS = {
+    "description",
+    "errorLevel",
+    "priority",
+    "probability",
+    "showProbability",
+    "rule",
+    "investigateMethod",
+}
 
 
 def _now() -> datetime:
@@ -70,6 +88,129 @@ def _get_chunk_identifier(doc: Optional[Dict[str, Any]]) -> Any:
     return doc.get("id", doc.get("chunk_id"))
 
 
+def _neo4j_available() -> bool:
+    return bool(GraphDatabase and NEO4J_PASSWORD)
+
+
+_neo4j_driver = None
+
+
+def _get_neo4j_driver():
+    global _neo4j_driver
+    if not _neo4j_available():
+        return None
+    if _neo4j_driver is None:
+        _neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    return _neo4j_driver
+
+
+def _normalize_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _compact_text(value: Any) -> str:
+    return re.sub(r"\s+", "", _normalize_text(value))
+
+
+def _looks_like_fault_code(name: str) -> bool:
+    text = _normalize_text(name)
+    if re.fullmatch(r"[FA]\d{5}(?:\([A-Z]\))?", text, flags=re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[A-Z]{1,6}=?[0-9A-F]{3,6}", text, flags=re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[0-9A-F]{3,6}", text, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _parse_maybe_json(value: Any, default):
+    if value in (None, ""):
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return default
+
+
+def _coerce_chunk_ids(value: Any) -> List[Any]:
+    parsed = _parse_maybe_json(value, value)
+    if isinstance(parsed, list):
+        return _dedupe_keep_order(parsed)
+    if isinstance(parsed, str) and parsed.strip():
+        if "," in parsed:
+            return _dedupe_keep_order([part.strip() for part in parsed.split(",") if part.strip()])
+        return [parsed.strip()]
+    return []
+
+
+def _coerce_documents(value: Any) -> List[Dict[str, Any]]:
+    parsed = _parse_maybe_json(value, [])
+    if not isinstance(parsed, list):
+        return []
+    docs = []
+    for item in parsed:
+        if isinstance(item, dict) and item.get("chunk_id") not in (None, ""):
+            docs.append({"chunk_id": item.get("chunk_id")})
+    return docs
+
+
+def _decode_graph_node(raw: Dict[str, Any]) -> Dict[str, Any]:
+    props = dict(raw.get("props") or {})
+    documents = _coerce_documents(props.get("documents"))
+    source_chunk_ids = _coerce_chunk_ids(props.get("source_chunk_ids"))
+    if not source_chunk_ids and documents:
+        source_chunk_ids = _dedupe_keep_order([doc.get("chunk_id") for doc in documents])
+    return {
+        "graph_node_id": raw.get("graph_node_id"),
+        "name": props.get("name") or "",
+        "normalized_name": props.get("normalized_name") or props.get("name") or "",
+        "entity_type": props.get("entity_type") or "",
+        "node_type": props.get("node_type") or ("AND" if "LogicGate" in (raw.get("labels") or []) else "FAULT"),
+        "labels": raw.get("labels") or [],
+        "description": props.get("description") or "",
+        "errorLevel": props.get("errorLevel") or "",
+        "priority": props.get("priority"),
+        "probability": props.get("probability"),
+        "showProbability": props.get("showProbability"),
+        "rule": props.get("rule") or "",
+        "investigateMethod": props.get("investigateMethod") or "",
+        "documents": documents,
+        "source_chunk_ids": source_chunk_ids,
+        "support_count": props.get("support_count"),
+        "raw_props": props,
+    }
+
+
+def _decode_graph_relation(raw: Dict[str, Any]) -> Dict[str, Any]:
+    props = dict(raw.get("rel_props") or {})
+    source_chunk_ids = _coerce_chunk_ids(props.get("source_chunk_ids"))
+    chunk_id = props.get("chunk_id")
+    if chunk_id not in (None, "") and chunk_id not in source_chunk_ids:
+        source_chunk_ids.insert(0, chunk_id)
+    return {
+        "source_graph_node_id": raw.get("source_graph_node_id"),
+        "target_graph_node_id": raw.get("target_graph_node_id"),
+        "relation_type": props.get("relation_type") or "触发",
+        "chunk_id": chunk_id,
+        "source_chunk_ids": source_chunk_ids,
+        "support_count": props.get("support_count"),
+        "raw_props": props,
+    }
+
+
+def _score_top_event_candidate(node: Dict[str, Any]) -> tuple:
+    name = _normalize_text(node.get("name"))
+    support = int(node.get("support_count") or len(node.get("source_chunk_ids") or []))
+    positive = sum(1 for hint in TOP_EVENT_PRIORITY_HINTS if hint in name)
+    negative = sum(1 for hint in TOP_EVENT_NEGATIVE_HINTS if hint in name)
+    length_ok = 1 if 2 <= len(name) <= 30 else 0
+    return (positive, length_ok, support, -negative, len(name))
+
+
 def _chunk_sort_key(doc: Dict[str, Any]):
     chunk_id = _get_chunk_identifier(doc)
     try:
@@ -103,6 +244,340 @@ def _fetch_chunks_by_identifiers(chunk_ids: List[Any], limit: int) -> List[Dict[
 
 def fetch_chunks_by_ids(chunk_ids: List[Any], limit: int = 8) -> List[Dict[str, Any]]:
     return _fetch_chunks_by_identifiers(chunk_ids, limit)
+
+
+def get_chunks_by_ids(chunk_ids: List[Any], limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    effective_limit = limit if limit is not None else max(len(_dedupe_keep_order(chunk_ids)), 1)
+    return _fetch_chunks_by_identifiers(chunk_ids, effective_limit)
+
+
+def hydrate_documents_by_chunk_ids(chunk_ids: List[Any]) -> List[Dict[str, Any]]:
+    documents = []
+    for chunk in get_chunks_by_ids(chunk_ids):
+        chunk_id = _get_chunk_identifier(chunk)
+        if chunk_id in (None, ""):
+            continue
+        documents.append(
+            {
+                "chunk_id": chunk_id,
+                "chunk_name": chunk.get("chunk_name", ""),
+                "section_path": chunk.get("section_path", ""),
+                "source_page": chunk.get("source", ""),
+            }
+        )
+    return documents
+
+
+def match_top_event_from_graph(top_event_query: str, normalized_candidates: Optional[List[str]] = None) -> Dict[str, Any]:
+    driver = _get_neo4j_driver()
+    if driver is None:
+        raise ValueError("Neo4j is not configured. Set NEO4J_PASSWORD and install the neo4j package.")
+
+    queries = _dedupe_keep_order([top_event_query] + list(normalized_candidates or []))
+    queries = [_normalize_text(item) for item in queries if _normalize_text(item)]
+    compact_queries = _dedupe_keep_order([_compact_text(item) for item in queries])
+    if not queries:
+        raise ValueError("top_event_query is empty")
+
+    cypher = """
+    MATCH (n:Entity)
+    WHERE (n:FaultPhenomenon OR n.entity_type = '故障现象与报警')
+    WITH n, elementId(n) AS graph_node_id, replace(coalesce(n.name, ''), ' ', '') AS compact_name
+    WHERE
+      n.name IN $queries
+      OR coalesce(n.normalized_name, '') IN $queries
+      OR compact_name IN $compact_queries
+      OR any(query IN $queries WHERE n.name CONTAINS query OR query CONTAINS n.name)
+      OR any(query IN $compact_queries WHERE compact_name CONTAINS query OR query CONTAINS compact_name)
+    RETURN
+      graph_node_id,
+      labels(n) AS labels,
+      properties(n) AS props
+    LIMIT 30
+    """
+    with driver.session(database=NEO4J_DATABASE) as session:
+        rows = session.run(cypher, queries=queries, compact_queries=compact_queries).data()
+
+    candidates = [_decode_graph_node(row) for row in rows]
+    if not candidates:
+        raise ValueError(f"Neo4j graph has no matching top event for '{top_event_query}'")
+
+    scored = []
+    for node in candidates:
+        name = _normalize_text(node.get("name"))
+        normalized_name = _normalize_text(node.get("normalized_name"))
+        compact_name = _compact_text(name)
+        exact = 1 if name in queries else 0
+        normalized_exact = 1 if normalized_name in queries else 0
+        compact_exact = 1 if compact_name in compact_queries else 0
+        contains = 1 if any(name and (name in q or q in name) for q in queries) else 0
+        score = (
+            exact,
+            normalized_exact,
+            compact_exact,
+            contains,
+            int(node.get("support_count") or len(node.get("source_chunk_ids") or [])),
+            len(name),
+        )
+        scored.append((score, node))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best = scored[0][1]
+    if _looks_like_fault_code(best.get("name", "")):
+        with driver.session(database=NEO4J_DATABASE) as session:
+            alias_row = session.run(
+                """
+                MATCH (code:Entity)-[:RELATION {relation_type:'触发'}]->(target:Entity)
+                WHERE elementId(code) = $graph_node_id
+                  AND (target:FaultPhenomenon OR target.entity_type = '故障现象与报警')
+                RETURN elementId(target) AS graph_node_id, labels(target) AS labels, properties(target) AS props
+                LIMIT 1
+                """,
+                graph_node_id=best.get("graph_node_id"),
+            ).single()
+        if alias_row:
+            best = _decode_graph_node(dict(alias_row))
+
+    alternatives = []
+    for _, node in scored[1:6]:
+        alternatives.append(
+            {
+                "graph_node_id": node.get("graph_node_id"),
+                "name": node.get("name"),
+                "normalized_name": node.get("normalized_name"),
+            }
+        )
+
+    return {
+        "matched_node_id": best.get("graph_node_id"),
+        "matched_name": best.get("name"),
+        "matched_node": best,
+        "score": 1.0,
+        "alternatives": alternatives,
+    }
+
+
+def expand_local_fault_subgraph(root_node_id: str, max_depth: int = 3, max_nodes: int = 20) -> Dict[str, Any]:
+    driver = _get_neo4j_driver()
+    if driver is None:
+        raise ValueError("Neo4j is not configured. Set NEO4J_PASSWORD and install the neo4j package.")
+    if not root_node_id:
+        raise ValueError("root_node_id is empty")
+
+    safe_depth = max(1, min(int(max_depth or 3), 4))
+    safe_max_nodes = max(1, min(int(max_nodes or 20), 50))
+
+    nodes_by_id: Dict[str, Dict[str, Any]] = {}
+    edges: List[Dict[str, Any]] = []
+    edge_keys = set()
+    gate_groups: List[Dict[str, Any]] = []
+    support_chunk_ids: List[Any] = []
+    frontier = [root_node_id]
+    visited = {root_node_id}
+    depths = {root_node_id: 0}
+
+    node_query = """
+    MATCH (n)
+    WHERE elementId(n) = $node_id
+    RETURN elementId(n) AS graph_node_id, labels(n) AS labels, properties(n) AS props
+    """
+    expand_query = """
+    UNWIND $frontier AS parent_id
+    MATCH (child)-[r:RELATION {relation_type:'触发'}]->(parent)
+    WHERE elementId(parent) = parent_id
+    RETURN
+      elementId(child) AS source_graph_node_id,
+      labels(child) AS source_labels,
+      properties(child) AS source_props,
+      elementId(parent) AS target_graph_node_id,
+      labels(parent) AS target_labels,
+      properties(parent) AS target_props,
+      properties(r) AS rel_props
+    """
+    with driver.session(database=NEO4J_DATABASE) as session:
+        root_row = session.run(node_query, node_id=root_node_id).single()
+        if not root_row:
+            raise ValueError(f"Neo4j graph has no node with id '{root_node_id}'")
+        root_node = _decode_graph_node(dict(root_row))
+        nodes_by_id[root_node_id] = {**root_node, "depth": 0}
+
+        for depth in range(1, safe_depth + 1):
+            if not frontier or len(nodes_by_id) >= safe_max_nodes:
+                break
+            rows = session.run(expand_query, frontier=frontier).data()
+            next_frontier = []
+            for row in rows:
+                source_node = _decode_graph_node(
+                    {
+                        "graph_node_id": row.get("source_graph_node_id"),
+                        "labels": row.get("source_labels"),
+                        "props": row.get("source_props"),
+                    }
+                )
+                target_node = _decode_graph_node(
+                    {
+                        "graph_node_id": row.get("target_graph_node_id"),
+                        "labels": row.get("target_labels"),
+                        "props": row.get("target_props"),
+                    }
+                )
+                source_id = source_node["graph_node_id"]
+                target_id = target_node["graph_node_id"]
+                nodes_by_id.setdefault(target_id, {**target_node, "depth": depths.get(target_id, depth - 1)})
+
+                if source_id not in nodes_by_id and len(nodes_by_id) >= safe_max_nodes:
+                    continue
+
+                if source_id not in nodes_by_id:
+                    depths[source_id] = depth
+                    nodes_by_id[source_id] = {**source_node, "depth": depth}
+                if source_id not in visited:
+                    visited.add(source_id)
+                    next_frontier.append(source_id)
+
+                edge = _decode_graph_relation(
+                    {
+                        "source_graph_node_id": source_id,
+                        "target_graph_node_id": target_id,
+                        "rel_props": row.get("rel_props"),
+                    }
+                )
+                edge_key = (source_id, target_id, edge.get("relation_type"), tuple(edge.get("source_chunk_ids") or []))
+                if edge_key not in edge_keys:
+                    edge_keys.add(edge_key)
+                    edges.append(edge)
+                    support_chunk_ids.extend(edge.get("source_chunk_ids") or [])
+            frontier = next_frontier
+
+    for node in nodes_by_id.values():
+        support_chunk_ids.extend(node.get("source_chunk_ids") or [])
+
+    child_targets = {}
+    for edge in edges:
+        child_targets.setdefault(edge["target_graph_node_id"], []).append(edge["source_graph_node_id"])
+    for node in nodes_by_id.values():
+        if str(node.get("node_type")).upper() == "AND":
+            gate_groups.append(
+                {
+                    "gate_node_id": node["graph_node_id"],
+                    "gate_type": "AND",
+                    "depth": node.get("depth", 0),
+                    "input_node_ids": child_targets.get(node["graph_node_id"], []),
+                }
+            )
+
+    return {
+        "root": root_node_id,
+        "nodes": list(nodes_by_id.values()),
+        "edges": edges,
+        "gate_groups": gate_groups,
+        "support_chunk_ids": _dedupe_keep_order(support_chunk_ids),
+    }
+
+
+def collect_subgraph_chunks(subgraph_bundle: Dict[str, Any], chunk_limit: int = 12) -> List[Any]:
+    scores: Dict[str, float] = {}
+    bundle_nodes = subgraph_bundle.get("nodes") or []
+    bundle_edges = subgraph_bundle.get("edges") or []
+    root_id = subgraph_bundle.get("root")
+
+    node_depth = {node.get("graph_node_id"): int(node.get("depth") or 0) for node in bundle_nodes}
+    for node in bundle_nodes:
+        weight = 10 if node.get("graph_node_id") == root_id else max(3, 8 - int(node.get("depth") or 0) * 2)
+        for chunk_id in node.get("source_chunk_ids") or []:
+            key = str(chunk_id)
+            scores[key] = scores.get(key, 0.0) + weight
+        for doc in node.get("documents") or []:
+            chunk_id = doc.get("chunk_id")
+            if chunk_id in (None, ""):
+                continue
+            key = str(chunk_id)
+            scores[key] = scores.get(key, 0.0) + weight
+
+    for edge in bundle_edges:
+        source_depth = node_depth.get(edge.get("source_graph_node_id"), 3)
+        weight = max(4, 9 - source_depth)
+        for chunk_id in edge.get("source_chunk_ids") or []:
+            key = str(chunk_id)
+            scores[key] = scores.get(key, 0.0) + weight
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    return [chunk_id for chunk_id, _ in ranked[: max(1, int(chunk_limit or 12))]]
+
+
+def list_graph_top_event_candidates(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    driver = _get_neo4j_driver()
+    if driver is None:
+        return []
+
+    cypher = """
+    MATCH (n:Entity)
+    WHERE (n:FaultPhenomenon OR n.entity_type = '故障现象与报警')
+    RETURN elementId(n) AS graph_node_id, labels(n) AS labels, properties(n) AS props
+    """
+    with driver.session(database=NEO4J_DATABASE) as session:
+        rows = session.run(cypher).data()
+
+    decoded = [_decode_graph_node(row) for row in rows]
+    filtered = []
+    for node in decoded:
+        if str(node.get("node_type") or "").upper() == "AND":
+            continue
+        name = _normalize_text(node.get("name"))
+        if not name or len(name) < 2 or len(name) > 40:
+            continue
+        if _looks_like_fault_code(name):
+            continue
+        filtered.append(node)
+
+    filtered.sort(key=_score_top_event_candidate, reverse=True)
+    if limit:
+        filtered = filtered[:limit]
+
+    return [
+        {
+            "graph_node_id": node.get("graph_node_id"),
+            "name": node.get("name"),
+            "normalized_name": node.get("normalized_name"),
+            "support_count": int(node.get("support_count") or len(node.get("source_chunk_ids") or [])),
+            "source_chunk_ids": node.get("source_chunk_ids") or [],
+            "documents": node.get("documents") or [],
+        }
+        for node in filtered
+    ]
+
+
+def update_graph_node_properties(graph_node_id: str, properties: Dict[str, Any]) -> bool:
+    driver = _get_neo4j_driver()
+    if driver is None:
+        raise ValueError("Neo4j is not configured. Set NEO4J_PASSWORD and install the neo4j package.")
+    if not graph_node_id:
+        return False
+
+    update_props = {}
+    for key, value in (properties or {}).items():
+        if key not in GRAPH_PROPERTY_UPDATE_FIELDS:
+            continue
+        if value is None:
+            continue
+        update_props[key] = value
+
+    if not update_props:
+        return False
+
+    with driver.session(database=NEO4J_DATABASE) as session:
+        result = session.run(
+            """
+            MATCH (n)
+            WHERE elementId(n) = $graph_node_id
+            SET n += $props,
+                n.updated_at = datetime()
+            RETURN count(n) AS updated
+            """,
+            graph_node_id=graph_node_id,
+            props=update_props,
+        ).single()
+    return bool(result and result.get("updated"))
 
 
 def _ensure_indexes():

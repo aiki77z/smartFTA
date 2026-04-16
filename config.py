@@ -23,6 +23,9 @@ def _as_bool(name: str, default: str = "false") -> bool:
 
 
 ENABLE_GRAPH_RETRIEVAL = _as_bool("ENABLE_GRAPH_RETRIEVAL", "false")
+ENABLE_GRAPH_TREE_BUILDING = _as_bool("ENABLE_GRAPH_TREE_BUILDING", "true")
+GRAPH_TREE_MAX_DEPTH = int(os.getenv("GRAPH_TREE_MAX_DEPTH", "3"))
+GRAPH_TREE_MAX_NODES = int(os.getenv("GRAPH_TREE_MAX_NODES", "30"))
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")

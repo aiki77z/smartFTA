@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from config import (
     ENABLE_GRAPH_RETRIEVAL,
+    ENABLE_GRAPH_TREE_BUILDING,
     NEO4J_DATABASE,
     NEO4J_PASSWORD,
     NEO4J_URI,
@@ -204,7 +205,7 @@ def _fetch_ordered_chunks(chunk_ids: List[Any], limit: int) -> List[Dict[str, An
 
 
 def is_graph_available() -> bool:
-    return bool(ENABLE_GRAPH_RETRIEVAL and GraphDatabase and NEO4J_PASSWORD)
+    return bool((ENABLE_GRAPH_RETRIEVAL or ENABLE_GRAPH_TREE_BUILDING) and GraphDatabase and NEO4J_PASSWORD)
 
 
 @lru_cache(maxsize=1)
@@ -219,6 +220,7 @@ def list_fault_phenomenon_top_events(limit: Optional[int] = None) -> List[Dict[s
     if driver is None:
         return []
 
+    # 批量生成的顶事件列表直接来自图里的 FaultPhenomenon 节点，不再依赖 chunks 发现。
     cypher = """
     MATCH (top:Entity:FaultPhenomenon)
     OPTIONAL MATCH (top)-[:MENTIONED_IN]->(c:Chunk)
@@ -237,7 +239,7 @@ def list_fault_phenomenon_top_events(limit: Optional[int] = None) -> List[Dict[s
     results = []
     for row in rows:
         name = _normalize_graph_top_event_name(row.get("name"))
-        if not _is_valid_fault_phenomenon_top_event(name):
+        if not name:
             continue
         results.append(
             {
@@ -327,6 +329,7 @@ def search_graph_related_chunks(top_event: str, aliases: Optional[List[str]] = N
 
     try:
         with driver.session(database=NEO4J_DATABASE) as session:
+            # A/B/C 三层分别对应：顶事件自身、直接原因、间接原因/支撑实体。
             layer_a_top_rows = session.run(
                 """
                 UNWIND $names AS name
@@ -486,6 +489,7 @@ def search_graph_related_chunks(top_event: str, aliases: Optional[List[str]] = N
         )
         layer_counts["C"] += 1
 
+    # 多条路径可能落到同一个 chunk，这里按 chunk 聚合并保留最强证据链。
     chunk_traces = _merge_chunk_trace_buckets(traces)[:limit]
     chunk_ids = [item["chunk_id"] for item in chunk_traces]
     chunks = _fetch_ordered_chunks(chunk_ids, limit=limit)
@@ -522,6 +526,7 @@ def build_graph_draft_candidates(top_event: str, aliases: Optional[List[str]] = 
             "investigate_methods": [],
         }
 
+    # 这里只生成“适合喂给 LLM 的局部草图”，不是最终故障树。
     cypher = """
     UNWIND $names AS name
     MATCH (cause:Entity)-[r:RELATION]->(top:Entity:FaultPhenomenon {name: name})

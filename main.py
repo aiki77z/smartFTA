@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,11 +19,14 @@ from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
 from database import (
     append_generation_job_item_event,
     claim_generation_job_item,
+    collect_subgraph_chunks,
     create_generation_job,
     create_generation_job_item,
     create_tree,
+    expand_local_fault_subgraph,
     find_active_job_item_by_top_event,
     find_tree_by_top_event,
+    get_chunks_by_ids,
     import_chunks as import_chunks_to_db,
     import_entity_reverse_index as import_entity_reverse_index_to_db,
     get_chunk_by_id,
@@ -33,14 +36,17 @@ from database import (
     get_version,
     get_version_list,
     list_all_chunks,
+    list_graph_top_event_candidates,
     list_entity_reverse_index,
     list_generation_job_items,
+    match_top_event_from_graph,
     refresh_generation_job,
     resolve_top_event_catalog,
     rollback_version,
     save_version,
     top_event_catalog_col,
     try_mark_job_completion_logged,
+    update_graph_node_properties,
     update_generation_job_item,
     update_tree_status,
     upsert_top_event_catalog_entry,
@@ -55,7 +61,6 @@ from generator import (
     normalize_top_event_name,
     parse_user_prompt,
 )
-from graph_retriever import build_graph_draft_candidates, list_fault_phenomenon_top_events, search_graph_related_chunks
 from import_chunks import _load_chunks
 from import_entity_index import _load_entries
 from import_relations_to_neo4j import GraphDatabase, clear_graph, ensure_constraints, import_rows, load_json
@@ -111,6 +116,12 @@ def _ensure_catalog_entry(name: str, aliases: Optional[List[str]] = None, source
 
     if existing:
         final_name = existing["name"]
+        if (
+            canonical_name
+            and canonical_name != final_name
+            and re.sub(r"\s+", "", canonical_name) == re.sub(r"\s+", "", str(final_name or ""))
+        ):
+            final_name = canonical_name
         normalized_name = existing["normalized_name"]
         merged_aliases = _dedupe_keep_order((existing.get("aliases") or []) + raw_aliases)
         merged_normalized_aliases = _dedupe_keep_order(
@@ -809,28 +820,14 @@ def _resolve_debug_top_event(req: GraphRecallDebugRequest) -> Dict[str, object]:
 
 
 def _discover_batch_top_events() -> Dict[str, object]:
-    graph_top_events = list_fault_phenomenon_top_events()
+    graph_top_events = list_graph_top_event_candidates()
     if graph_top_events:
         return {
             "discovered": graph_top_events,
-            "discovery_source": "neo4j_fault_phenomenon",
+            "discovery_source": "graph_top_event_candidates",
         }
 
-    entity_index_entries = list_entity_reverse_index()
-    if entity_index_entries:
-        return {
-            "discovered": discover_top_events_from_entity_index(entity_index_entries),
-            "discovery_source": "entity_reverse_index",
-        }
-
-    chunks = list_all_chunks()
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No chunks found, please import knowledge chunks first")
-
-    return {
-        "discovered": discover_top_events(chunks),
-        "discovery_source": "chunks",
-    }
+    raise HTTPException(status_code=400, detail="No graph top-event candidates available")
 
 
 def _import_relations_from_file(relations_file: Path, clear_existing_graph: bool) -> Dict[str, object]:
@@ -947,46 +944,38 @@ def api_debug_graph_recall(req: GraphRecallDebugRequest):
 
     limit = max(1, min(int(req.limit or 12), 30))
     top_event = resolved["resolved_top_event"]
-    aliases = resolved["aliases"]
+    aliases = resolved["aliases"] or []
 
-    graph_result = search_graph_related_chunks(top_event, aliases=aliases, limit=limit)
-    graph_draft = build_graph_draft_candidates(top_event, aliases=aliases)
-
-    chunk_items = []
-    for chunk in graph_result.get("chunks") or []:
-        trace = chunk.get("retrieval_trace") or {}
-        chunk_items.append(
-            {
-                "chunk_id": chunk.get("id", chunk.get("chunk_id")),
-                "chunk_name": chunk.get("chunk_name", ""),
-                "section_path": chunk.get("section_path", ""),
-                "source": chunk.get("source", ""),
-                "retrieval_trace": trace,
-            }
-        )
+    matched = match_top_event_from_graph(top_event, build_top_event_normalized_candidates(top_event, aliases))
+    subgraph_bundle = expand_local_fault_subgraph(matched["matched_node_id"], max_depth=3, max_nodes=20)
+    chunk_ids = collect_subgraph_chunks(subgraph_bundle, chunk_limit=limit)
+    chunk_items = get_chunks_by_ids(chunk_ids, limit=limit)
 
     return {
         "query": {
             "top_event": resolved["top_event"],
-            "resolved_top_event": top_event,
+            "resolved_top_event": matched["matched_name"],
             "aliases": aliases,
             "limit": limit,
             "parsed_prompt": resolved["parsed_prompt"],
         },
         "catalog_entry": resolved["catalog_entry"],
-        "graph_recall": {
-            "matched_names": graph_result.get("matched_names") or [],
-            "direct_cause_names": graph_result.get("cause_names") or [],
-            "layer_counts": graph_result.get("layer_counts") or {},
-            "chunk_ids": graph_result.get("chunk_ids") or [],
-            "chunk_traces": graph_result.get("chunk_traces") or [],
-            "chunks": chunk_items,
+        "graph_match": {
+            "matched_node_id": matched["matched_node_id"],
+            "matched_name": matched["matched_name"],
+            "alternatives": matched.get("alternatives") or [],
         },
-        "graph_draft": {
-            "direct_causes": graph_draft.get("direct_causes") or [],
-            "expanded_nodes": graph_draft.get("expanded_nodes") or [],
-            "investigate_methods": graph_draft.get("investigate_methods") or [],
-            "draft_relations": (graph_draft.get("draft") or {}).get("relations", []),
+        "subgraph": {
+            "root": subgraph_bundle.get("root"),
+            "node_count": len(subgraph_bundle.get("nodes") or []),
+            "edge_count": len(subgraph_bundle.get("edges") or []),
+            "nodes": subgraph_bundle.get("nodes") or [],
+            "edges": subgraph_bundle.get("edges") or [],
+            "gate_groups": subgraph_bundle.get("gate_groups") or [],
+        },
+        "chunk_recall": {
+            "chunk_ids": chunk_ids,
+            "chunks": chunk_items,
         },
     }
 
@@ -998,7 +987,7 @@ def api_preview_top_events(req: TopEventsPreviewRequest):
     discovery_source = discovery["discovery_source"]
 
     if not discovered:
-        raise HTTPException(status_code=400, detail="No top events were discovered from graph, entity index, or chunks")
+        raise HTTPException(status_code=400, detail="No top events were discovered from graph")
 
     limit = max(1, min(int(req.limit or 200), 1000))
     preview_items = []
@@ -1010,7 +999,10 @@ def api_preview_top_events(req: TopEventsPreviewRequest):
         preview_items.append(
             {
                 "name": canonical_name,
+                "graph_node_id": item.get("graph_node_id"),
+                "normalized_name": item.get("normalized_name") or canonical_name,
                 "aliases": aliases,
+                "support_count": item.get("support_count"),
                 "source_chunk_ids": item.get("source_chunk_ids") or [],
                 "normalized_candidates": normalized_candidates,
                 "catalog_hit": bool(catalog_entry),
@@ -1033,7 +1025,7 @@ def api_batch_generate_all():
     discovery_source = discovery["discovery_source"]
 
     if not discovered:
-        raise HTTPException(status_code=400, detail="No top events were discovered from graph, entity index, or chunks")
+        raise HTTPException(status_code=400, detail="No top events were discovered from graph")
 
     catalog_entries = []
     for item in discovered:
@@ -1149,6 +1141,59 @@ def api_get_version(tree_id: str, version: int):
     return ver
 
 
+def _nodes_by_id(tree_data: Optional[dict]) -> Dict[str, dict]:
+    result: Dict[str, dict] = {}
+    for node in (tree_data or {}).get("nodeList", []) or []:
+        node_id = node.get("id")
+        if node_id:
+            result[node_id] = node
+    return result
+
+
+def _extract_graph_property_updates(previous_tree: Optional[dict], current_tree: dict) -> List[Dict[str, object]]:
+    previous_nodes = _nodes_by_id(previous_tree)
+    current_nodes = _nodes_by_id(current_tree)
+    updates: List[Dict[str, object]] = []
+
+    for node_id, current_node in current_nodes.items():
+        previous_node = previous_nodes.get(node_id)
+        if not previous_node:
+            continue
+
+        graph_node_id = current_node.get("graphNodeId") or current_node.get("kg_key")
+        if not graph_node_id:
+            continue
+
+        prev_event = previous_node.get("event") or {}
+        curr_event = current_node.get("event") or {}
+        changed: Dict[str, object] = {}
+        for field in ("description", "errorLevel", "priority", "probability", "showProbability", "investigateMethod"):
+            if prev_event.get(field) != curr_event.get(field):
+                changed[field] = curr_event.get(field)
+
+        prev_rule = str(prev_event.get("rule") or "")
+        curr_rule = str(curr_event.get("rule") or "")
+        prev_rules = prev_event.get("rules") or []
+        curr_rules = curr_event.get("rules") or []
+        if not prev_rule and isinstance(prev_rules, list) and prev_rules and isinstance(prev_rules[0], dict):
+            prev_rule = str(prev_rules[0].get("measurePointName") or "")
+        if not curr_rule and isinstance(curr_rules, list) and curr_rules and isinstance(curr_rules[0], dict):
+            curr_rule = str(curr_rules[0].get("measurePointName") or "")
+        if prev_rule != curr_rule and curr_rule:
+            changed["rule"] = curr_rule
+
+        if changed:
+            updates.append(
+                {
+                    "graph_node_id": graph_node_id,
+                    "node_id": node_id,
+                    "node_name": current_node.get("name"),
+                    "properties": changed,
+                }
+            )
+    return updates
+
+
 @app.post("/api/tree/{tree_id}/save")
 def api_save(tree_id: str, req: SaveRequest):
     meta = get_tree_meta(tree_id)
@@ -1179,6 +1224,17 @@ def api_save(tree_id: str, req: SaveRequest):
     elif not description:
         description = "手动修改"
 
+    graph_property_updates = _extract_graph_property_updates(prev_tree_data, req.tree_data)
+    graph_updates_applied = 0
+    graph_update_errors = []
+    for item in graph_property_updates:
+        try:
+            updated = update_graph_node_properties(item["graph_node_id"], item["properties"])
+            if updated:
+                graph_updates_applied += 1
+        except Exception as exc:
+            graph_update_errors.append({"node_id": item["node_id"], "error": str(exc)})
+
     new_version = save_version(
         tree_id=tree_id,
         tree_data=req.tree_data,
@@ -1191,7 +1247,16 @@ def api_save(tree_id: str, req: SaveRequest):
     if prev_version_num and prev_ver and prev_ver.get("is_ai_generated"):
         learned_count = analyze_and_store(tree_id, prev_version_num, new_version)
 
-    return {"success": True, "version": new_version, "learned_count": learned_count}
+    return {
+        "success": True,
+        "version": new_version,
+        "learned_count": learned_count,
+        "graph_property_updates": {
+            "attempted": len(graph_property_updates),
+            "applied": graph_updates_applied,
+            "errors": graph_update_errors,
+        },
+    }
 
 
 @app.post("/api/tree/{tree_id}/rollback/{target_version}")
@@ -1253,6 +1318,13 @@ def api_get_corrections(tree_id: str):
 def api_list_catalog_top_events():
     docs = list(top_event_catalog_col.find({}, {"_id": 0}).sort("name", 1))
     return {"items": docs, "total": len(docs)}
+
+
+@app.get("/api/top-events")
+def api_list_graph_top_events(limit: int = 200):
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    items = list_graph_top_event_candidates(limit=safe_limit)
+    return {"items": items, "total": len(items)}
 
 
 @app.get("/")
