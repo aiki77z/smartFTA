@@ -19,13 +19,23 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from openai import OpenAI
 
-from config import GRAPH_TREE_MAX_DEPTH, GRAPH_TREE_MAX_NODES, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+from config import (
+    GRAPH_TREE_MAX_DEPTH,
+    GRAPH_TREE_MAX_NODES,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_GENERATION_MAX_TOKENS,
+    LLM_MODEL,
+    LLM_PARSE_MAX_TOKENS,
+    LLM_REPAIR_MAX_TOKENS,
+)
 from database import (
     collect_subgraph_chunks,
-    expand_local_fault_subgraph,
+    expand_scoped_local_fault_subgraph,
     hydrate_documents_by_chunk_ids,
     list_graph_top_event_candidates,
     match_top_event_from_graph,
+    resolve_selected_file_version_ids,
 )
 from validator import validate_full
 
@@ -117,7 +127,7 @@ def parse_user_prompt(prompt: str) -> dict:
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt_text}],
         temperature=0.1,
-        max_tokens=300,
+        max_tokens=LLM_PARSE_MAX_TOKENS,
     )
     parsed = _parse_json(response.choices[0].message.content)
     top_event = normalize_top_event_name(parsed.get("top_event"))
@@ -197,7 +207,10 @@ def _compress_subgraph_to_tree_skeleton(subgraph_bundle: Dict[str, Any]) -> Dict
                 "gate": gate,
                 "graphNodeId": graph_node_id,
                 "kg_key": graph_node_id,
+                "fileId": node.get("file_id"),
+                "fileVersionId": node.get("file_version_id"),
                 "source_chunk_ids": node.get("source_chunk_ids") or [],
+                "source_chunk_refs": node.get("source_chunk_refs") or [],
                 "graph_props": {field: node.get(field) for field in PROPERTY_FIELDS},
                 "documents_seed": node.get("documents") or [],
             }
@@ -262,10 +275,14 @@ def _format_evidence_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]
             content = content[:MAX_CHUNK_CHARS] + "..."
         evidence.append(
             {
+                "chunk_uid": chunk.get("chunk_uid"),
                 "chunk_id": chunk.get("id", chunk.get("chunk_id")),
                 "chunk_name": chunk.get("chunk_name", ""),
                 "section_path": chunk.get("section_path", ""),
                 "source_page": chunk.get("source", ""),
+                "file_id": chunk.get("file_id", ""),
+                "file_version_id": chunk.get("file_version_id", ""),
+                "file": chunk.get("file", ""),
                 "content": content,
             }
         )
@@ -290,8 +307,11 @@ def build_fault_tree_from_subgraph_and_chunks(
                 "gate": node["gate"],
                 "graphNodeId": node["graphNodeId"],
                 "kg_key": node["kg_key"],
+                "fileId": node["fileId"],
+                "fileVersionId": node["fileVersionId"],
                 "graph_props": node["graph_props"],
                 "source_chunk_ids": node["source_chunk_ids"],
+                "source_chunk_refs": node["source_chunk_refs"],
                 "documents_seed": node["documents_seed"],
             }
             for node in skeleton["nodes"]
@@ -333,7 +353,7 @@ def build_fault_tree_from_subgraph_and_chunks(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=8192,
+        max_tokens=LLM_GENERATION_MAX_TOKENS,
     )
     tree = _parse_json(response.choices[0].message.content)
     return _post_process_generated_tree(tree, skeleton, evidence)
@@ -375,11 +395,15 @@ def _post_process_generated_tree(
     skeleton_nodes = {node["id"]: node for node in skeleton["nodes"]}
     graph_to_node = {node["graphNodeId"]: node for node in skeleton["nodes"]}
     evidence_doc_map = {
-        str(chunk.get("chunk_id")): {
+        str(chunk.get("chunk_uid") or chunk.get("chunk_id")): {
             "chunk_id": chunk.get("chunk_id"),
+            "chunk_uid": chunk.get("chunk_uid"),
             "chunk_name": chunk.get("chunk_name", ""),
             "section_path": chunk.get("section_path", ""),
             "source_page": chunk.get("source_page", ""),
+            "file_id": chunk.get("file_id", ""),
+            "file_version_id": chunk.get("file_version_id", ""),
+            "file": chunk.get("file", ""),
         }
         for chunk in evidence_chunks
     }
@@ -414,6 +438,8 @@ def _post_process_generated_tree(
         node_type = node.get("type") or (skeleton_node.get("type") if skeleton_node else "basic_event")
         gate = node.get("gate") if node.get("gate") is not None else (skeleton_node.get("gate") if skeleton_node else None)
         name = node.get("name") or (skeleton_node.get("name") if skeleton_node else "")
+        file_id = node.get("fileId") or (skeleton_node.get("fileId") if skeleton_node else None)
+        file_version_id = node.get("fileVersionId") or (skeleton_node.get("fileVersionId") if skeleton_node else None)
         if node_type == "top_event":
             event = None
         else:
@@ -441,7 +467,12 @@ def _post_process_generated_tree(
                     chunk_ids.append(doc.get("chunk_id"))
             documents = []
             for chunk_id in dict.fromkeys(chunk_ids):
-                if str(chunk_id) in evidence_doc_map:
+                chunk_ref = str(chunk_id)
+                if file_version_id:
+                    chunk_ref = f"{file_version_id}::{chunk_id}"
+                if chunk_ref in evidence_doc_map:
+                    documents.append(evidence_doc_map[chunk_ref])
+                elif str(chunk_id) in evidence_doc_map:
                     documents.append(evidence_doc_map[str(chunk_id)])
             merged["documents"] = documents
             event = merged
@@ -456,6 +487,8 @@ def _post_process_generated_tree(
                 "event": event,
                 "graphNodeId": graph_node_id or (skeleton_node.get("graphNodeId") if skeleton_node else None),
                 "kg_key": graph_node_id or (skeleton_node.get("kg_key") if skeleton_node else None),
+                "fileId": file_id,
+                "fileVersionId": file_version_id,
             }
         )
 
@@ -507,7 +540,7 @@ def repair_fault_tree(draft_tree: dict, corrections_hint: str, chunks: list) -> 
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
-        max_tokens=8192,
+        max_tokens=LLM_REPAIR_MAX_TOKENS,
     )
     return _parse_json(response.choices[0].message.content)
 
@@ -515,6 +548,7 @@ def repair_fault_tree(draft_tree: dict, corrections_hint: str, chunks: list) -> 
 def generate_fault_tree(
     top_event: str,
     requirements: str = "",
+    selected_file_version_ids: Optional[List[str]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     def emit(message: str):
@@ -527,33 +561,51 @@ def generate_fault_tree(
                 except Exception:
                     pass
 
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
     normalized_candidates = build_top_event_normalized_candidates(top_event, [top_event])
     emit(f"[graph-match] matching top event '{top_event}'")
-    matched = match_top_event_from_graph(top_event, normalized_candidates=normalized_candidates)
+    matched = match_top_event_from_graph(
+        top_event,
+        normalized_candidates=normalized_candidates,
+        selected_file_version_ids=scoped_file_version_ids,
+    )
     matched_node = matched["matched_node"]
     emit(f"[graph-match] matched '{top_event}' -> '{matched['matched_name']}'")
 
-    subgraph_bundle = expand_local_fault_subgraph(
-        matched["matched_node_id"],
+    root_node_ids = [item.get("graph_node_id") for item in (matched.get("matched_nodes") or []) if item.get("graph_node_id")]
+    subgraph_bundle = expand_scoped_local_fault_subgraph(
+        root_node_ids or [matched["matched_node_id"]],
         max_depth=GRAPH_TREE_MAX_DEPTH,
         max_nodes=GRAPH_TREE_MAX_NODES,
+        selected_file_version_ids=scoped_file_version_ids,
     )
     emit(
-        f"[graph-subgraph] root={matched['matched_name']} nodes={len(subgraph_bundle.get('nodes') or [])} "
-        f"edges={len(subgraph_bundle.get('edges') or [])}"
+        f"[graph-subgraph] root={matched['matched_name']} roots={len(subgraph_bundle.get('roots') or [])} "
+        f"nodes={len(subgraph_bundle.get('nodes') or [])} edges={len(subgraph_bundle.get('edges') or [])}"
     )
 
     chunk_ids = collect_subgraph_chunks(subgraph_bundle, chunk_limit=MAX_CHUNKS_FOR_PROMPT)
-    evidence_chunks = hydrate_documents_by_chunk_ids(chunk_ids)
+    evidence_chunks = hydrate_documents_by_chunk_ids(chunk_ids, selected_file_version_ids=scoped_file_version_ids)
     raw_chunk_docs = []
-    chunk_doc_map = {str(item["chunk_id"]): item for item in evidence_chunks}
+    chunk_doc_map = {
+        str(item.get("chunk_uid") or item["chunk_id"]): item
+        for item in evidence_chunks
+    }
     for chunk_id in chunk_ids:
         doc = chunk_doc_map.get(str(chunk_id))
         if doc:
             raw_chunk_docs.append(doc)
     from database import get_chunks_by_ids  # local import to keep module surface small
 
-    raw_chunks = get_chunks_by_ids(chunk_ids, limit=max(len(chunk_ids), 1))
+    raw_chunks = get_chunks_by_ids(
+        chunk_ids,
+        limit=max(len(chunk_ids), 1),
+        selected_file_version_ids=scoped_file_version_ids,
+    )
     emit(f"[graph-chunks] collected {len(raw_chunks)} evidence chunks")
 
     draft_tree = None
@@ -607,21 +659,29 @@ def generate_fault_tree(
 
     final_validation = validate_full(final_tree, skip_semantic=False)
     final_tree["validation"] = final_validation
+    evidence_chunk_ids = [chunk.get("chunk_uid") or chunk.get("chunk_id") for chunk in raw_chunks if chunk.get("chunk_uid") or chunk.get("chunk_id")]
+    subgraph_node_ids = [node.get("graph_node_id") for node in (subgraph_bundle.get("nodes") or []) if node.get("graph_node_id")]
     final_tree["retrieval"] = {
         "source": "graph_local_subgraph",
         "matched_top_event": matched["matched_name"],
         "matched_node_id": matched["matched_node_id"],
+        "matched_node_ids": root_node_ids or [matched["matched_node_id"]],
         "alternatives": matched.get("alternatives") or [],
+        "source_file_version_ids": scoped_file_version_ids,
         "subgraph_node_count": len(subgraph_bundle.get("nodes") or []),
         "subgraph_edge_count": len(subgraph_bundle.get("edges") or []),
         "chunk_ids": chunk_ids,
+        "evidence_chunk_ids": evidence_chunk_ids,
+        "subgraph_node_ids": subgraph_node_ids,
     }
+    final_tree["source_file_version_ids"] = scoped_file_version_ids
     return final_tree
 
 
 def generate_fault_tree_with_progress(
     top_event: str,
     requirements: str = "",
+    selected_file_version_ids: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
@@ -632,7 +692,12 @@ def generate_fault_tree_with_progress(
         progress_callback(55, "graph_chunks", "Collecting subgraph evidence chunks")
         progress_callback(70, "graph_llm", "Building fault tree from subgraph and chunks")
 
-    tree_data = generate_fault_tree(top_event, requirements, log_callback=log_callback)
+    tree_data = generate_fault_tree(
+        top_event,
+        requirements,
+        selected_file_version_ids=selected_file_version_ids,
+        log_callback=log_callback,
+    )
 
     if progress_callback:
         progress_callback(90, "persistence", "Generation completed, persisting result")

@@ -16,7 +16,7 @@ validator.py —— 故障树逻辑校验模块
 from dataclasses import dataclass
 from typing import Literal
 from openai import OpenAI
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_VALIDATION_MAX_TOKENS
 import json
 import re
 import importlib.util
@@ -278,7 +278,8 @@ level只能是 WARNING 或 INFO。
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2
+            temperature=0.2,
+            max_tokens=LLM_VALIDATION_MAX_TOKENS,
         )
         raw   = response.choices[0].message.content
         clean = re.sub(r"```json|```", "", raw).strip()

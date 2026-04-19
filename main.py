@@ -17,14 +17,18 @@ from pydantic import BaseModel
 
 from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
 from database import (
+    activate_file_version,
+    archive_file,
     append_generation_job_item_event,
     claim_generation_job_item,
     collect_subgraph_chunks,
+    create_file_version_record,
     create_generation_job,
     create_generation_job_item,
     create_tree,
-    expand_local_fault_subgraph,
+    expand_scoped_local_fault_subgraph,
     find_active_job_item_by_top_event,
+    find_active_job_item_by_top_event_and_scope,
     find_tree_by_top_event,
     get_chunks_by_ids,
     import_chunks as import_chunks_to_db,
@@ -39,8 +43,12 @@ from database import (
     list_graph_top_event_candidates,
     list_entity_reverse_index,
     list_generation_job_items,
+    list_top_event_catalog,
+    mark_file_version_import_failed,
     match_top_event_from_graph,
+    rebuild_top_event_catalog_for_file_version,
     refresh_generation_job,
+    resolve_selected_file_version_ids,
     resolve_top_event_catalog,
     rollback_version,
     save_version,
@@ -105,47 +113,175 @@ def _dedupe_keep_order(values: Optional[List[str]]) -> List[str]:
     return result
 
 
-def _ensure_catalog_entry(name: str, aliases: Optional[List[str]] = None, source_chunk_ids: Optional[List[int]] = None):
+def _ensure_catalog_entry(
+    name: str,
+    aliases: Optional[List[str]] = None,
+    source_chunk_ids: Optional[List[int]] = None,
+    selected_file_version_ids: Optional[List[str]] = None,
+):
     canonical_name = normalize_top_event_name(name)
     if not canonical_name:
         raise ValueError("顶事件不能为空")
 
+    scoped_file_version_ids = resolve_selected_file_version_ids(selected_file_version_ids, fallback_to_active=True)
     raw_aliases = _dedupe_keep_order((aliases or []) + [name])
     normalized_candidates = build_top_event_normalized_candidates(canonical_name, raw_aliases)
-    existing = resolve_top_event_catalog(normalized_candidates=normalized_candidates)
+    existing = resolve_top_event_catalog(
+        normalized_candidates=normalized_candidates,
+        selected_file_version_ids=scoped_file_version_ids,
+    )
 
     if existing:
-        final_name = existing["name"]
-        if (
-            canonical_name
-            and canonical_name != final_name
-            and re.sub(r"\s+", "", canonical_name) == re.sub(r"\s+", "", str(final_name or ""))
-        ):
-            final_name = canonical_name
-        normalized_name = existing["normalized_name"]
-        merged_aliases = _dedupe_keep_order((existing.get("aliases") or []) + raw_aliases)
-        merged_normalized_aliases = _dedupe_keep_order(
-            (existing.get("normalized_aliases") or [])
-            + [candidate for candidate in normalized_candidates if candidate != normalized_name]
-        )
-        merged_source_chunk_ids = list(dict.fromkeys((existing.get("source_chunk_ids") or []) + (source_chunk_ids or [])))
-        return upsert_top_event_catalog_entry(
-            name=final_name,
-            normalized_name=normalized_name,
-            aliases=merged_aliases,
-            normalized_aliases=merged_normalized_aliases,
-            source_chunk_ids=merged_source_chunk_ids,
+        return existing
+
+    graph_candidates = list_graph_top_event_candidates(selected_file_version_ids=scoped_file_version_ids)
+    candidate_keys = set(normalized_candidates)
+    for item in graph_candidates:
+        item_name = normalize_top_event_name(item.get("name"))
+        item_normalized_name = normalize_top_event_name(item.get("normalized_name") or item_name)
+        if not item_name or not item_normalized_name:
+            continue
+        if item_normalized_name not in candidate_keys and item_name not in candidate_keys:
+            continue
+        upsert_top_event_catalog_entry(
+            name=item_name,
+            normalized_name=item_normalized_name,
+            file_id=item.get("file_id"),
+            file_version_id=item.get("file_version_id"),
+            aliases=_dedupe_keep_order(raw_aliases + [item_name]),
+            normalized_aliases=[candidate for candidate in normalized_candidates if candidate != item_normalized_name],
+            source_chunk_ids=_dedupe_keep_order((item.get("source_chunk_refs") or item.get("source_chunk_ids") or []) + (source_chunk_ids or [])),
+            graph_node_id=item.get("graph_node_id"),
         )
 
-    normalized_name = canonical_name
-    normalized_aliases = [candidate for candidate in normalized_candidates if candidate != normalized_name]
-    return upsert_top_event_catalog_entry(
-        name=canonical_name,
-        normalized_name=normalized_name,
-        aliases=raw_aliases,
-        normalized_aliases=normalized_aliases,
-        source_chunk_ids=source_chunk_ids or [],
+    resolved = resolve_top_event_catalog(
+        normalized_candidates=normalized_candidates,
+        selected_file_version_ids=scoped_file_version_ids,
     )
+    if resolved:
+        return resolved
+
+    raise ValueError(f"当前选源范围内未找到顶事件: {canonical_name}")
+
+
+def _merge_discovered_top_events(
+    *,
+    graph_top_events: Optional[List[Dict[str, Any]]] = None,
+    catalog_top_events: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    def _ensure_bucket(name: str, normalized_name: str) -> Dict[str, Any]:
+        bucket = merged.get(normalized_name)
+        if bucket:
+            return bucket
+
+        bucket = {
+            "name": name,
+            "normalized_name": normalized_name,
+            "aliases": [],
+            "graph_node_ids": [],
+            "file_ids": [],
+            "file_version_ids": [],
+            "source_chunk_ids": [],
+            "support_count": 0,
+            "catalog_hit": False,
+            "catalog_name": None,
+            "discovery_sources": [],
+            "graph_candidate_count": 0,
+        }
+        merged[normalized_name] = bucket
+        return bucket
+
+    def _merge_item(item: Dict[str, Any], *, source: str):
+        raw_name = normalize_top_event_name(item.get("name"))
+        normalized_name = normalize_top_event_name(item.get("normalized_name") or raw_name)
+        if not raw_name or not normalized_name:
+            return
+
+        bucket = _ensure_bucket(raw_name, normalized_name)
+        item_support = int(item.get("support_count") or 0)
+        bucket_support = int(bucket.get("support_count") or 0)
+        if not bucket.get("name") or item_support > bucket_support:
+            bucket["name"] = raw_name
+
+        aliases = item.get("aliases") or []
+        bucket["aliases"] = _dedupe_keep_order((bucket.get("aliases") or []) + aliases + [raw_name])
+
+        graph_node_ids = []
+        if item.get("graph_node_id"):
+            graph_node_ids.append(item.get("graph_node_id"))
+        graph_node_ids.extend(item.get("graph_node_ids") or [])
+        bucket["graph_node_ids"] = _dedupe_keep_order((bucket.get("graph_node_ids") or []) + graph_node_ids)
+
+        file_ids = []
+        if item.get("file_id"):
+            file_ids.append(item.get("file_id"))
+        file_ids.extend(item.get("file_ids") or [])
+        bucket["file_ids"] = _dedupe_keep_order((bucket.get("file_ids") or []) + file_ids)
+
+        file_version_ids = []
+        if item.get("file_version_id"):
+            file_version_ids.append(item.get("file_version_id"))
+        file_version_ids.extend(item.get("file_version_ids") or [])
+        bucket["file_version_ids"] = _dedupe_keep_order((bucket.get("file_version_ids") or []) + file_version_ids)
+
+        source_chunk_ids = list(item.get("source_chunk_refs") or item.get("source_chunk_ids") or [])
+        bucket["source_chunk_ids"] = _dedupe_keep_order((bucket.get("source_chunk_ids") or []) + source_chunk_ids)
+
+        bucket["support_count"] = max(bucket_support, item_support)
+        if source not in bucket["discovery_sources"]:
+            bucket["discovery_sources"] = (bucket.get("discovery_sources") or []) + [source]
+        if source == "graph":
+            bucket["graph_candidate_count"] = int(bucket.get("graph_candidate_count") or 0) + 1
+        if source == "catalog":
+            bucket["catalog_hit"] = True
+            bucket["catalog_name"] = item.get("name") or bucket.get("catalog_name") or raw_name
+
+    for item in graph_top_events or []:
+        if isinstance(item, dict):
+            _merge_item(item, source="graph")
+
+    for item in catalog_top_events or []:
+        if isinstance(item, dict):
+            _merge_item(item, source="catalog")
+
+    items = []
+    for normalized_name, bucket in merged.items():
+        name = normalize_top_event_name(bucket.get("name") or normalized_name)
+        aliases = _dedupe_keep_order(
+            [
+                alias
+                for alias in (bucket.get("aliases") or [])
+                if normalize_top_event_name(alias) and normalize_top_event_name(alias) != name
+            ]
+        )
+        items.append(
+            {
+                "name": name,
+                "normalized_name": normalized_name,
+                "aliases": aliases,
+                "graph_node_id": ((bucket.get("graph_node_ids") or [None])[0]),
+                "graph_node_ids": bucket.get("graph_node_ids") or [],
+                "file_ids": bucket.get("file_ids") or [],
+                "file_version_ids": bucket.get("file_version_ids") or [],
+                "source_chunk_ids": bucket.get("source_chunk_ids") or [],
+                "support_count": int(bucket.get("support_count") or 0),
+                "catalog_hit": bool(bucket.get("catalog_hit")),
+                "catalog_name": bucket.get("catalog_name"),
+                "discovery_sources": bucket.get("discovery_sources") or [],
+                "graph_candidate_count": int(bucket.get("graph_candidate_count") or 0),
+            }
+        )
+
+    items.sort(
+        key=lambda item: (
+            0 if "graph" in (item.get("discovery_sources") or []) else 1,
+            -(int(item.get("support_count") or 0)),
+            item.get("name") or "",
+        )
+    )
+    return items
 
 
 def _serialize_job(job_id: str) -> Dict:
@@ -342,6 +478,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
     normalized_top_event = item["normalized_top_event"]
     aliases = _dedupe_keep_order(item.get("aliases") or [])
     requirements = item.get("requirements") or ""
+    selected_file_version_ids = _resolve_selected_scope(item.get("source_file_version_ids") or [])
     tree_id = None
 
     try:
@@ -371,6 +508,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             normalized_top_event=normalized_top_event,
             aliases=aliases,
             catalog_name=top_event,
+            source_file_version_ids=selected_file_version_ids,
         )
         if reused:
             _console_log(
@@ -419,6 +557,8 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             normalized_top_event=normalized_top_event,
             aliases=aliases,
             source_chunk_ids=item.get("source_chunk_ids") or [],
+            source_file_version_ids=selected_file_version_ids,
+            source_scope_key=item.get("source_scope_key"),
             job_id=job_id,
             job_item_id=item_id,
         )
@@ -476,9 +616,15 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
         tree_data = generate_fault_tree_with_progress(
             top_event=top_event,
             requirements=requirements,
+            selected_file_version_ids=selected_file_version_ids,
             progress_callback=progress_callback,
             log_callback=log_callback,
         )
+
+        retrieval = tree_data.get("retrieval") or {}
+        evidence_chunk_ids = retrieval.get("evidence_chunk_ids") or retrieval.get("chunk_ids") or []
+        subgraph_node_ids = retrieval.get("subgraph_node_ids") or []
+        resolved_source_file_version_ids = retrieval.get("source_file_version_ids") or selected_file_version_ids
 
         version = save_version(
             tree_id=tree_id,
@@ -486,6 +632,9 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             editor="AI",
             description=f"AI initial generation for top event: {top_event}",
             is_ai=True,
+            source_file_version_ids=resolved_source_file_version_ids,
+            evidence_chunk_ids=evidence_chunk_ids,
+            subgraph_node_ids=subgraph_node_ids,
         )
 
         update_generation_job_item(
@@ -596,8 +745,18 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
                 _log_job_duration_once(mirror_item["job_id"])
 
 
-def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: str) -> Dict:
-    catalog = _ensure_catalog_entry(parsed_top_event, aliases=[parsed_top_event])
+def _queue_single_generation(
+    prompt: str,
+    parsed_top_event: str,
+    requirements: str,
+    selected_file_version_ids: Optional[List[str]] = None,
+) -> Dict:
+    scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
+    catalog = _ensure_catalog_entry(
+        parsed_top_event,
+        aliases=[parsed_top_event],
+        selected_file_version_ids=scoped_file_version_ids,
+    )
     aliases = _dedupe_keep_order((catalog.get("aliases") or []) + [parsed_top_event])
 
     reused = find_tree_by_top_event(
@@ -605,12 +764,14 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
         normalized_top_event=catalog["normalized_name"],
         aliases=aliases,
         catalog_name=catalog["name"],
+        source_file_version_ids=scoped_file_version_ids,
     )
     if reused:
         return {
             "mode": "reuse",
             "tree_id": reused["tree_id"],
             "version": reused["version"],
+            "selected_file_version_ids": scoped_file_version_ids,
             "parsed_prompt": {
                 "top_event": parsed_top_event,
                 "catalog_top_event": catalog["name"],
@@ -619,7 +780,7 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
             "tree_data": reused["tree_data"],
         }
 
-    active_item = find_active_job_item_by_top_event(catalog["normalized_name"])
+    active_item = find_active_job_item_by_top_event_and_scope(catalog["normalized_name"], scoped_file_version_ids)
     if active_item:
         active_job = get_generation_job(active_item["job_id"])
         if active_item["status"] == "pending" and active_job and active_job.get("job_type") == "batch":
@@ -641,6 +802,7 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
                         "requested_prompt": prompt,
                         "source": "/api/tree/generate",
                         "accelerated_batch_item_id": claimed_batch_item["item_id"],
+                        "selected_file_version_ids": scoped_file_version_ids,
                     },
                 )
                 item = create_generation_job_item(
@@ -649,11 +811,13 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
                     normalized_top_event=catalog["normalized_name"],
                     aliases=aliases,
                     source_chunk_ids=catalog.get("source_chunk_ids") or [],
+                    source_file_version_ids=scoped_file_version_ids,
                     requirements=requirements,
                     metadata={
                         "requested_prompt": prompt,
                         "query_top_event": parsed_top_event,
                         "accelerated_batch_item_id": claimed_batch_item["item_id"],
+                        "selected_file_version_ids": scoped_file_version_ids,
                     },
                 )
                 _start_dedicated_generation_thread(item["item_id"], mirror_item_ids=[claimed_batch_item["item_id"]])
@@ -666,6 +830,7 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
                     "progress": item["progress"],
                     "accelerated_batch_job_id": claimed_batch_item["job_id"],
                     "accelerated_batch_item_id": claimed_batch_item["item_id"],
+                    "selected_file_version_ids": scoped_file_version_ids,
                     "parsed_prompt": {
                         "top_event": parsed_top_event,
                         "catalog_top_event": catalog["name"],
@@ -679,6 +844,7 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
             "item_id": active_item["item_id"],
             "status": active_item["status"],
             "progress": active_item["progress"],
+            "selected_file_version_ids": scoped_file_version_ids,
             "parsed_prompt": {
                 "top_event": parsed_top_event,
                 "catalog_top_event": catalog["name"],
@@ -690,7 +856,11 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
         job_type="single",
         total=1,
         top_event=catalog["name"],
-        metadata={"requested_prompt": prompt, "source": "/api/tree/generate"},
+        metadata={
+            "requested_prompt": prompt,
+            "source": "/api/tree/generate",
+            "selected_file_version_ids": scoped_file_version_ids,
+        },
     )
     item = create_generation_job_item(
         job_id=job["job_id"],
@@ -698,8 +868,13 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
         normalized_top_event=catalog["normalized_name"],
         aliases=aliases,
         source_chunk_ids=catalog.get("source_chunk_ids") or [],
+        source_file_version_ids=scoped_file_version_ids,
         requirements=requirements,
-        metadata={"requested_prompt": prompt, "query_top_event": parsed_top_event},
+        metadata={
+            "requested_prompt": prompt,
+            "query_top_event": parsed_top_event,
+            "selected_file_version_ids": scoped_file_version_ids,
+        },
     )
     _submit_generation_item(item["item_id"], "single")
 
@@ -709,6 +884,7 @@ def _queue_single_generation(prompt: str, parsed_top_event: str, requirements: s
         "item_id": item["item_id"],
         "status": item["status"],
         "progress": item["progress"],
+        "selected_file_version_ids": scoped_file_version_ids,
         "parsed_prompt": {
             "top_event": parsed_top_event,
             "catalog_top_event": catalog["name"],
@@ -753,23 +929,33 @@ if _VALIDATOR_DIR.exists():
 
 class GenerateRequest(BaseModel):
     prompt: str
+    selected_file_version_ids: Optional[List[str]] = None
 
 
 class GraphRecallDebugRequest(BaseModel):
     top_event: Optional[str] = None
     prompt: Optional[str] = None
     limit: int = 12
+    selected_file_version_ids: Optional[List[str]] = None
 
 
 class TopEventsPreviewRequest(BaseModel):
     limit: int = 200
+    selected_file_version_ids: Optional[List[str]] = None
+
+
+class GenerateAllRequest(BaseModel):
+    selected_file_version_ids: Optional[List[str]] = None
 
 
 class KnowledgeArtifactsImportRequest(BaseModel):
     chunks_file: str
     entities_file: Optional[str] = None
     relations_file: Optional[str] = None
-    clear_graph: bool = True
+    file_id: Optional[str] = None
+    file_name: Optional[str] = None
+    chunks_import_mode: str = "replace"
+    clear_graph: bool = False
     import_relations: bool = True
     source: str = "knowledge_base_construction"
 
@@ -799,8 +985,12 @@ def _resolve_debug_top_event(req: GraphRecallDebugRequest) -> Dict[str, object]:
     if not top_event:
         raise ValueError("top_event 或 prompt 至少需要提供一个")
 
+    scoped_file_version_ids = _resolve_selected_scope(req.selected_file_version_ids)
     normalized_candidates = build_top_event_normalized_candidates(top_event, [top_event])
-    catalog_entry = resolve_top_event_catalog(normalized_candidates=normalized_candidates)
+    catalog_entry = resolve_top_event_catalog(
+        normalized_candidates=normalized_candidates,
+        selected_file_version_ids=scoped_file_version_ids,
+    )
 
     resolved_top_event = top_event
     aliases = [top_event]
@@ -816,27 +1006,111 @@ def _resolve_debug_top_event(req: GraphRecallDebugRequest) -> Dict[str, object]:
         "resolved_top_event": resolved_top_event,
         "aliases": aliases,
         "catalog_entry": catalog_entry,
+        "selected_file_version_ids": scoped_file_version_ids,
     }
 
 
-def _discover_batch_top_events() -> Dict[str, object]:
-    graph_top_events = list_graph_top_event_candidates()
+def _discover_batch_top_events(selected_file_version_ids: Optional[List[str]] = None) -> Dict[str, object]:
+    scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
+    catalog_top_events = list_top_event_catalog(selected_file_version_ids=scoped_file_version_ids)
+    if catalog_top_events:
+        return {
+            "discovered": catalog_top_events,
+            "discovery_source": "scoped_top_event_catalog",
+        }
+
+    graph_top_events = list_graph_top_event_candidates(selected_file_version_ids=scoped_file_version_ids)
     if graph_top_events:
         return {
             "discovered": graph_top_events,
             "discovery_source": "graph_top_event_candidates",
         }
 
-    raise HTTPException(status_code=400, detail="No graph top-event candidates available")
+    raise HTTPException(status_code=400, detail="当前选源范围内没有可用顶事件")
 
 
-def _import_relations_from_file(relations_file: Path, clear_existing_graph: bool) -> Dict[str, object]:
+def _discover_batch_top_events_v2(selected_file_version_ids: Optional[List[str]] = None) -> Dict[str, object]:
+    scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
+    graph_top_events = list_graph_top_event_candidates(selected_file_version_ids=scoped_file_version_ids)
+    catalog_top_events = list_top_event_catalog(selected_file_version_ids=scoped_file_version_ids)
+    discovered = _merge_discovered_top_events(
+        graph_top_events=graph_top_events,
+        catalog_top_events=catalog_top_events,
+    )
+    if not discovered:
+        raise HTTPException(status_code=400, detail="褰撳墠閫夋簮鑼冨洿鍐呮病鏈夊彲鐢ㄩ《浜嬩欢")
+
+    if graph_top_events and catalog_top_events:
+        discovery_source = "graph_candidates_merged_with_catalog"
+    elif graph_top_events:
+        discovery_source = "graph_top_event_candidates"
+    else:
+        discovery_source = "scoped_top_event_catalog"
+
+    return {
+        "discovered": discovered,
+        "discovery_source": discovery_source,
+        "graph_total": len(graph_top_events),
+        "catalog_total": len(catalog_top_events),
+    }
+
+
+def _resolve_selected_scope(selected_file_version_ids: Optional[List[str]]) -> List[str]:
+    return resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+
+
+def _derive_file_name_from_artifacts(
+    *,
+    explicit_file_name: Optional[str],
+    chunks: Optional[List[Dict[str, Any]]] = None,
+    chunks_path: Optional[Path] = None,
+    relations_path: Optional[Path] = None,
+) -> str:
+    if explicit_file_name:
+        return explicit_file_name
+
+    first_chunk = (chunks or [{}])[0] if chunks else {}
+    chunk_file = str(first_chunk.get("file") or "").strip()
+    if chunk_file:
+        return chunk_file
+
+    if relations_path:
+        relation_name = relations_path.name
+        if relation_name.endswith("_relations.jsonl"):
+            return relation_name.replace("_relations.jsonl", "_cleaned.md")
+        if relation_name.endswith("_relations.json"):
+            return relation_name.replace("_relations.json", "_cleaned.md")
+
+    if chunks_path:
+        return chunks_path.stem + ".md"
+
+    raise ValueError("无法推断 file_name，请显式传入 file_name")
+
+
+def _import_relations_from_file(
+    relations_file: Path,
+    clear_existing_graph: bool,
+    *,
+    file_id: str,
+    file_version_id: str,
+    file_name: str,
+) -> Dict[str, object]:
     if not relations_file.exists():
         raise ValueError(f"relations_file 不存在: {relations_file}")
     if not NEO4J_PASSWORD:
         raise ValueError("未配置 NEO4J_PASSWORD，无法导入图谱关系")
 
-    rows = load_json(relations_file)
+    rows = load_json(
+        relations_file,
+        file_id=file_id,
+        file_version_id=file_version_id,
+        file_name=file_name,
+        is_active=True,
+    )
     if not rows:
         return {
             "rows": 0,
@@ -875,7 +1149,12 @@ def api_generate(req: GenerateRequest):
         raise HTTPException(status_code=500, detail=f"Prompt parse failed: {exc}")
 
     try:
-        return _queue_single_generation(req.prompt, top_event, requirements)
+        return _queue_single_generation(
+            req.prompt,
+            top_event,
+            requirements,
+            selected_file_version_ids=req.selected_file_version_ids,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -894,28 +1173,80 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
         raise HTTPException(status_code=400, detail=f"entities_file 不存在: {entities_path}")
     if req.import_relations and relations_path and not relations_path.exists():
         raise HTTPException(status_code=400, detail=f"relations_file 不存在: {relations_path}")
+    if req.clear_graph:
+        raise HTTPException(status_code=400, detail="版本化知识库模式下禁止 clear_graph，请通过 file_version 失活旧版本。")
 
+    chunks_import_mode = str(req.chunks_import_mode or "replace").strip().lower()
+    if chunks_import_mode not in {"replace", "append"}:
+        raise HTTPException(status_code=400, detail="chunks_import_mode 必须是 replace 或 append")
+
+    file_version = None
     try:
         chunks = _load_chunks(str(chunks_path))
-        import_chunks_to_db(chunks)
+        file_name = _derive_file_name_from_artifacts(
+            explicit_file_name=req.file_name,
+            chunks=chunks,
+            chunks_path=chunks_path,
+            relations_path=relations_path,
+        )
+        file_version = create_file_version_record(
+            file_name=file_name,
+            file_id=req.file_id,
+            source=req.source,
+            metadata={
+                "chunks_file": str(chunks_path),
+                "entities_file": str(entities_path) if entities_path else None,
+                "relations_file": str(relations_path) if relations_path else None,
+            },
+        )
+
+        chunk_import_result = import_chunks_to_db(
+            chunks,
+            mode=chunks_import_mode,
+            file_id=file_version["file_id"],
+            file_version_id=file_version["file_version_id"],
+            is_active=True,
+        )
 
         entity_count = 0
         if entities_path:
             entries = _load_entries(str(entities_path))
-            import_entity_reverse_index_to_db(entries)
+            import_entity_reverse_index_to_db(
+                entries,
+                file_id=file_version["file_id"],
+                file_version_id=file_version["file_version_id"],
+                is_active=True,
+            )
             entity_count = len(entries)
 
         relation_result = None
         if req.import_relations and relations_path:
-            relation_result = _import_relations_from_file(relations_path, clear_existing_graph=req.clear_graph)
+            relation_result = _import_relations_from_file(
+                relations_path,
+                clear_existing_graph=req.clear_graph,
+                file_id=file_version["file_id"],
+                file_version_id=file_version["file_version_id"],
+                file_name=file_version["file_name"],
+            )
+
+        catalog_entries = rebuild_top_event_catalog_for_file_version(file_version["file_version_id"])
+        activate_file_version(file_version["file_id"], file_version["file_version_id"])
 
         return {
             "status": "success",
             "source": req.source,
+            "file": {
+                "file_id": file_version["file_id"],
+                "file_name": file_version["file_name"],
+                "file_version_id": file_version["file_version_id"],
+                "version_no": file_version["version_no"],
+                "is_active": True,
+            },
             "imported": {
-                "chunks": len(chunks),
+                "chunks": chunk_import_result,
                 "entity_reverse_index": entity_count,
                 "relations": relation_result,
+                "top_event_catalog": len(catalog_entries),
             },
             "files": {
                 "chunks_file": str(chunks_path),
@@ -928,8 +1259,12 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
             },
         }
     except ValueError as exc:
+        if file_version:
+            mark_file_version_import_failed(file_version["file_version_id"], str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
+        if file_version:
+            mark_file_version_import_failed(file_version["file_version_id"], str(exc))
         raise HTTPException(status_code=500, detail=f"导入知识库产物失败: {exc}")
 
 
@@ -945,11 +1280,22 @@ def api_debug_graph_recall(req: GraphRecallDebugRequest):
     limit = max(1, min(int(req.limit or 12), 30))
     top_event = resolved["resolved_top_event"]
     aliases = resolved["aliases"] or []
+    scoped_file_version_ids = resolved["selected_file_version_ids"]
 
-    matched = match_top_event_from_graph(top_event, build_top_event_normalized_candidates(top_event, aliases))
-    subgraph_bundle = expand_local_fault_subgraph(matched["matched_node_id"], max_depth=3, max_nodes=20)
+    matched = match_top_event_from_graph(
+        top_event,
+        build_top_event_normalized_candidates(top_event, aliases),
+        selected_file_version_ids=scoped_file_version_ids,
+    )
+    root_node_ids = [item.get("graph_node_id") for item in (matched.get("matched_nodes") or []) if item.get("graph_node_id")]
+    subgraph_bundle = expand_scoped_local_fault_subgraph(
+        root_node_ids or [matched["matched_node_id"]],
+        max_depth=3,
+        max_nodes=20,
+        selected_file_version_ids=scoped_file_version_ids,
+    )
     chunk_ids = collect_subgraph_chunks(subgraph_bundle, chunk_limit=limit)
-    chunk_items = get_chunks_by_ids(chunk_ids, limit=limit)
+    chunk_items = get_chunks_by_ids(chunk_ids, limit=limit, selected_file_version_ids=scoped_file_version_ids)
 
     return {
         "query": {
@@ -958,11 +1304,13 @@ def api_debug_graph_recall(req: GraphRecallDebugRequest):
             "aliases": aliases,
             "limit": limit,
             "parsed_prompt": resolved["parsed_prompt"],
+            "selected_file_version_ids": scoped_file_version_ids,
         },
         "catalog_entry": resolved["catalog_entry"],
         "graph_match": {
             "matched_node_id": matched["matched_node_id"],
             "matched_name": matched["matched_name"],
+            "matched_nodes": matched.get("matched_nodes") or [],
             "alternatives": matched.get("alternatives") or [],
         },
         "subgraph": {
@@ -982,7 +1330,8 @@ def api_debug_graph_recall(req: GraphRecallDebugRequest):
 
 @app.post("/api/batch/preview-top-events")
 def api_preview_top_events(req: TopEventsPreviewRequest):
-    discovery = _discover_batch_top_events()
+    scoped_file_version_ids = _resolve_selected_scope(req.selected_file_version_ids)
+    discovery = _discover_batch_top_events_v2(scoped_file_version_ids)
     discovered = discovery["discovered"] or []
     discovery_source = discovery["discovery_source"]
 
@@ -995,23 +1344,28 @@ def api_preview_top_events(req: TopEventsPreviewRequest):
         canonical_name = normalize_top_event_name(item["name"])
         aliases = _dedupe_keep_order(item.get("aliases") or [])
         normalized_candidates = build_top_event_normalized_candidates(canonical_name, aliases + [item["name"]])
-        catalog_entry = resolve_top_event_catalog(normalized_candidates=normalized_candidates)
         preview_items.append(
             {
                 "name": canonical_name,
-                "graph_node_id": item.get("graph_node_id"),
+                "graph_node_id": item.get("graph_node_id") or ((item.get("graph_node_ids") or [None])[0]),
                 "normalized_name": item.get("normalized_name") or canonical_name,
                 "aliases": aliases,
+                "file_version_ids": item.get("file_version_ids") or ([item.get("file_version_id")] if item.get("file_version_id") else []),
                 "support_count": item.get("support_count"),
                 "source_chunk_ids": item.get("source_chunk_ids") or [],
                 "normalized_candidates": normalized_candidates,
-                "catalog_hit": bool(catalog_entry),
-                "catalog_name": catalog_entry["name"] if catalog_entry else None,
+                "catalog_hit": bool(item.get("catalog_hit")),
+                "catalog_name": item.get("catalog_name"),
+                "discovery_sources": item.get("discovery_sources") or [],
+                "graph_candidate_count": int(item.get("graph_candidate_count") or 0),
             }
         )
 
     return {
         "discovery_source": discovery_source,
+        "selected_file_version_ids": scoped_file_version_ids,
+        "graph_total": int(discovery.get("graph_total") or 0),
+        "catalog_total": int(discovery.get("catalog_total") or 0),
         "total": len(discovered),
         "returned": len(preview_items),
         "items": preview_items,
@@ -1019,8 +1373,9 @@ def api_preview_top_events(req: TopEventsPreviewRequest):
 
 
 @app.post("/api/batch/generate-all")
-def api_batch_generate_all():
-    discovery = _discover_batch_top_events()
+def api_batch_generate_all(req: Optional[GenerateAllRequest] = None):
+    scoped_file_version_ids = _resolve_selected_scope((req.selected_file_version_ids if req else None))
+    discovery = _discover_batch_top_events_v2(scoped_file_version_ids)
     discovered = discovery["discovered"] or []
     discovery_source = discovery["discovery_source"]
 
@@ -1034,6 +1389,7 @@ def api_batch_generate_all():
                 item["name"],
                 aliases=item.get("aliases") or [],
                 source_chunk_ids=item.get("source_chunk_ids") or [],
+                selected_file_version_ids=scoped_file_version_ids,
             )
         except ValueError:
             continue
@@ -1042,6 +1398,7 @@ def api_batch_generate_all():
     existing_count = 0
     active_count = 0
     queued_entries = []
+    entry_statuses = []
     for entry in catalog_entries:
         aliases = entry.get("aliases") or []
         reused = find_tree_by_top_event(
@@ -1049,17 +1406,49 @@ def api_batch_generate_all():
             normalized_top_event=entry["normalized_name"],
             aliases=aliases,
             catalog_name=entry["name"],
+            source_file_version_ids=scoped_file_version_ids,
         )
         if reused:
             existing_count += 1
+            entry_statuses.append(
+                {
+                    "top_event": entry["name"],
+                    "normalized_name": entry["normalized_name"],
+                    "status": "reused_in_same_scope",
+                    "reason": "existing_tree_in_same_scope",
+                    "tree_id": reused.get("tree_id"),
+                    "version": reused.get("version"),
+                    "source_file_version_ids": scoped_file_version_ids,
+                }
+            )
             continue
 
-        active_item = find_active_job_item_by_top_event(entry["normalized_name"])
+        active_item = find_active_job_item_by_top_event_and_scope(entry["normalized_name"], scoped_file_version_ids)
         if active_item:
             active_count += 1
+            entry_statuses.append(
+                {
+                    "top_event": entry["name"],
+                    "normalized_name": entry["normalized_name"],
+                    "status": "already_running_in_same_scope",
+                    "reason": "active_job_item_in_same_scope",
+                    "job_id": active_item.get("job_id"),
+                    "item_id": active_item.get("item_id"),
+                    "source_file_version_ids": scoped_file_version_ids,
+                }
+            )
             continue
 
         queued_entries.append(entry)
+        entry_statuses.append(
+            {
+                "top_event": entry["name"],
+                "normalized_name": entry["normalized_name"],
+                "status": "queued_for_generation",
+                "reason": "no_existing_tree_in_same_scope",
+                "source_file_version_ids": scoped_file_version_ids,
+            }
+        )
 
     job = create_generation_job(
         job_type="batch",
@@ -1067,10 +1456,12 @@ def api_batch_generate_all():
         metadata={
             "discovered_total": len(discovered),
             "catalog_total": len(catalog_entries),
+            "graph_total": int(discovery.get("graph_total") or 0),
             "existing_count": existing_count,
             "active_count": active_count,
             "discovery_source": discovery_source,
             "source": "/api/batch/generate-all",
+            "selected_file_version_ids": scoped_file_version_ids,
         },
     )
     _console_log(
@@ -1087,10 +1478,20 @@ def api_batch_generate_all():
             normalized_top_event=entry["normalized_name"],
             aliases=entry.get("aliases") or [],
             source_chunk_ids=entry.get("source_chunk_ids") or [],
+            source_file_version_ids=scoped_file_version_ids,
             requirements="",
-            metadata={"source": "batch_generate_all"},
+            metadata={"source": "batch_generate_all", "selected_file_version_ids": scoped_file_version_ids},
         )
         queued_item_ids.append(item["item_id"])
+        for status_item in entry_statuses:
+            if (
+                status_item.get("normalized_name") == entry.get("normalized_name")
+                and status_item.get("status") == "queued_for_generation"
+                and not status_item.get("item_id")
+            ):
+                status_item["job_id"] = job["job_id"]
+                status_item["item_id"] = item["item_id"]
+                break
         _submit_generation_item(item["item_id"], "batch")
         _console_log(
             f"[batch] job={job['job_id']} queued item={item['item_id']} top_event={entry['name']}"
@@ -1101,12 +1502,15 @@ def api_batch_generate_all():
         "job_id": job["job_id"],
         "status": get_generation_job(job["job_id"])["status"],
         "discovered_total": len(discovered),
+        "graph_total": int(discovery.get("graph_total") or 0),
         "catalog_total": len(catalog_entries),
         "existing_count": existing_count,
         "active_count": active_count,
         "discovery_source": discovery_source,
+        "selected_file_version_ids": scoped_file_version_ids,
         "queued_count": len(queued_entries),
         "queued_item_ids": queued_item_ids,
+        "items": entry_statuses,
     }
 
 
@@ -1241,6 +1645,9 @@ def api_save(tree_id: str, req: SaveRequest):
         editor=req.editor,
         description=description,
         is_ai=False,
+        source_file_version_ids=(prev_ver or {}).get("source_file_version_ids") or meta.get("source_file_version_ids") or [],
+        evidence_chunk_ids=(prev_ver or {}).get("evidence_chunk_ids") or (prev_ver or {}).get("source_chunk_ids") or meta.get("source_chunk_ids") or [],
+        subgraph_node_ids=(prev_ver or {}).get("subgraph_node_ids") or [],
     )
 
     learned_count = 0
@@ -1314,17 +1721,53 @@ def api_get_corrections(tree_id: str):
     return docs
 
 
+@app.post("/api/files/{file_id}/archive")
+def api_archive_file(file_id: str):
+    try:
+        doc = archive_file(file_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not doc:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return {"success": True, "file": doc}
+
+
 @app.get("/api/catalog/top-events")
-def api_list_catalog_top_events():
-    docs = list(top_event_catalog_col.find({}, {"_id": 0}).sort("name", 1))
-    return {"items": docs, "total": len(docs)}
+def api_list_catalog_top_events(selected_file_version_ids: Optional[str] = None):
+    scope = [item.strip() for item in str(selected_file_version_ids or "").split(",") if item.strip()] or None
+    try:
+        discovery = _discover_batch_top_events_v2(scope)
+    except HTTPException:
+        discovery = {"discovered": [], "discovery_source": "empty", "graph_total": 0, "catalog_total": 0}
+    docs = discovery["discovered"] or []
+    return {
+        "items": docs,
+        "total": len(docs),
+        "selected_file_version_ids": _resolve_selected_scope(scope),
+        "discovery_source": discovery["discovery_source"],
+        "graph_total": int(discovery.get("graph_total") or 0),
+        "catalog_total": int(discovery.get("catalog_total") or 0),
+    }
 
 
 @app.get("/api/top-events")
-def api_list_graph_top_events(limit: int = 200):
+def api_list_graph_top_events(limit: int = 200, selected_file_version_ids: Optional[str] = None):
     safe_limit = max(1, min(int(limit or 200), 1000))
-    items = list_graph_top_event_candidates(limit=safe_limit)
-    return {"items": items, "total": len(items)}
+    scope = [item.strip() for item in str(selected_file_version_ids or "").split(",") if item.strip()] or None
+    try:
+        discovery = _discover_batch_top_events_v2(scope)
+    except HTTPException:
+        discovery = {"discovered": [], "discovery_source": "empty", "graph_total": 0, "catalog_total": 0}
+    items = (discovery["discovered"] or [])[:safe_limit]
+    return {
+        "items": items,
+        "total": len(discovery["discovered"] or []),
+        "returned": len(items),
+        "selected_file_version_ids": _resolve_selected_scope(scope),
+        "discovery_source": discovery["discovery_source"],
+        "graph_total": int(discovery.get("graph_total") or 0),
+        "catalog_total": int(discovery.get("catalog_total") or 0),
+    }
 
 
 @app.get("/")

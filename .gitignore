@@ -18,6 +18,7 @@ __pycache__/
 entity/
 README.txt
 output/
+multi/
 
 # OS
 .DS_Store

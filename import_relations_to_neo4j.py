@@ -59,7 +59,29 @@ def _sanitize_property_value(value: Any) -> Any:
     return str(value)
 
 
-def _sanitize_entity_props(props: Any) -> Dict[str, Any]:
+def _sanitize_documents(value: Any, fallback_chunk_id: Any = "") -> List[Dict[str, Any]]:
+    documents: List[Dict[str, Any]] = []
+    chunk_candidates: List[Any] = []
+
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict) and item.get("chunk_id") not in (None, ""):
+                chunk_candidates.append(item.get("chunk_id"))
+
+    if fallback_chunk_id not in (None, ""):
+        chunk_candidates.append(fallback_chunk_id)
+
+    seen = set()
+    for chunk_id in chunk_candidates:
+        key = _clean(chunk_id)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        documents.append({"chunk_id": key})
+    return documents
+
+
+def _sanitize_entity_props(props: Any, fallback_chunk_id: Any = "") -> Dict[str, Any]:
     if not isinstance(props, dict):
         return {}
 
@@ -68,6 +90,11 @@ def _sanitize_entity_props(props: Any) -> Dict[str, Any]:
         clean_key = _clean(key)
         if not clean_key:
             continue
+        if clean_key == "documents":
+            sanitized_documents = _sanitize_documents(value, fallback_chunk_id=fallback_chunk_id)
+            if sanitized_documents:
+                sanitized[clean_key] = json.dumps(sanitized_documents, ensure_ascii=False)
+            continue
         sanitized_value = _sanitize_property_value(value)
         if sanitized_value is None:
             continue
@@ -75,7 +102,15 @@ def _sanitize_entity_props(props: Any) -> Dict[str, Any]:
     return sanitized
 
 
-def _normalize_relation(rel: Dict[str, Any], default_chunk_id: Any = "") -> Optional[Dict[str, Any]]:
+def _normalize_relation(
+    rel: Dict[str, Any],
+    default_chunk_id: Any = "",
+    *,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    is_active: bool = True,
+) -> Optional[Dict[str, Any]]:
     entity1 = _clean(rel.get("entity1"))
     entity2 = _clean(rel.get("entity2"))
     relation_type = _clean(rel.get("relation_type"))
@@ -88,6 +123,10 @@ def _normalize_relation(rel: Dict[str, Any], default_chunk_id: Any = "") -> Opti
 
     return {
         "chunk_id": chunk_id,
+        "file_id": _clean(rel.get("file_id")) or _clean(file_id),
+        "file_version_id": _clean(rel.get("file_version_id")) or _clean(file_version_id),
+        "file_name": _clean(rel.get("file_name")) or _clean(file_name),
+        "is_active": bool(rel.get("is_active", is_active)),
         "entity1": entity1,
         "entity2": entity2,
         "relation_type": relation_type,
@@ -95,21 +134,35 @@ def _normalize_relation(rel: Dict[str, Any], default_chunk_id: Any = "") -> Opti
         "entity2_type": entity2_type,
         "entity1_label": _entity_label(entity1_type),
         "entity2_label": _entity_label(entity2_type),
-        "entity1_props": _sanitize_entity_props(rel.get("entity1_props")),
-        "entity2_props": _sanitize_entity_props(rel.get("entity2_props")),
+        "entity1_props": _sanitize_entity_props(rel.get("entity1_props"), fallback_chunk_id=chunk_id),
+        "entity2_props": _sanitize_entity_props(rel.get("entity2_props"), fallback_chunk_id=chunk_id),
     }
 
 
-def _group_flat_relations(relations: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _group_flat_relations(
+    relations: Iterable[Dict[str, Any]],
+    *,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    is_active: bool = True,
+) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     seen = set()
 
     for rel in relations:
-        normalized = _normalize_relation(rel)
+        normalized = _normalize_relation(
+            rel,
+            file_id=file_id,
+            file_version_id=file_version_id,
+            file_name=file_name,
+            is_active=is_active,
+        )
         if not normalized:
             continue
 
         relation_key = (
+            normalized["file_version_id"],
             normalized["chunk_id"],
             normalized["entity1"],
             normalized["entity2"],
@@ -122,22 +175,53 @@ def _group_flat_relations(relations: Iterable[Dict[str, Any]]) -> List[Dict[str,
         seen.add(relation_key)
 
         chunk_id = normalized.pop("chunk_id")
-        bucket = grouped.setdefault(chunk_id, {"chunk_id": chunk_id, "relations": []})
+        bucket_key = f"{normalized.get('file_version_id', '')}::{chunk_id}"
+        bucket = grouped.setdefault(
+            bucket_key,
+            {
+                "chunk_id": chunk_id,
+                "file_id": normalized.get("file_id") or _clean(file_id),
+                "file_version_id": normalized.get("file_version_id") or _clean(file_version_id),
+                "file_name": normalized.get("file_name") or _clean(file_name),
+                "is_active": bool(normalized.get("is_active", is_active)),
+                "relations": [],
+            },
+        )
         bucket["relations"].append(normalized)
 
     return list(grouped.values())
 
 
-def _load_csv(path: Path) -> List[Dict[str, Any]]:
+def _load_csv(
+    path: Path,
+    *,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    is_active: bool = True,
+) -> List[Dict[str, Any]]:
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         missing = [field for field in REQUIRED_RELATION_FIELDS if field not in (reader.fieldnames or [])]
         if missing:
             raise ValueError(f"CSV missing required columns: {', '.join(missing)}")
-        return _group_flat_relations(reader)
+        return _group_flat_relations(
+            reader,
+            file_id=file_id,
+            file_version_id=file_version_id,
+            file_name=file_name,
+            is_active=is_active,
+        )
 
 
-def _load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
+def _load_json_or_jsonl(
+    path: Path,
+    *,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    is_active: bool = True,
+) -> List[Dict[str, Any]]:
     content = path.read_text(encoding="utf-8-sig").strip()
     if not content:
         return []
@@ -179,46 +263,94 @@ def _load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
         if all(field in item for field in REQUIRED_RELATION_FIELDS):
             flat_relations.append(item)
 
-    return _group_flat_relations(flat_relations)
+    return _group_flat_relations(
+        flat_relations,
+        file_id=file_id,
+        file_version_id=file_version_id,
+        file_name=file_name,
+        is_active=is_active,
+    )
 
 
-def load_relations(path: Path | str) -> List[Dict[str, Any]]:
+def load_relations(
+    path: Path | str,
+    *,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    is_active: bool = True,
+) -> List[Dict[str, Any]]:
     relation_path = Path(path)
     suffix = relation_path.suffix.lower()
     if suffix == ".csv":
-        return _load_csv(relation_path)
+        return _load_csv(
+            relation_path,
+            file_id=file_id,
+            file_version_id=file_version_id,
+            file_name=file_name,
+            is_active=is_active,
+        )
     if suffix in {".json", ".jsonl", ".ndjson"}:
-        return _load_json_or_jsonl(relation_path)
+        return _load_json_or_jsonl(
+            relation_path,
+            file_id=file_id,
+            file_version_id=file_version_id,
+            file_name=file_name,
+            is_active=is_active,
+        )
     raise ValueError(f"Unsupported relation file type: {relation_path.suffix}")
 
 
-def load_json(path: Path | str) -> List[Dict[str, Any]]:
+def load_json(
+    path: Path | str,
+    *,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    is_active: bool = True,
+) -> List[Dict[str, Any]]:
     """Backward-compatible name used by main.py."""
-    return load_relations(path)
+    return load_relations(
+        path,
+        file_id=file_id,
+        file_version_id=file_version_id,
+        file_name=file_name,
+        is_active=is_active,
+    )
 
+
+DROP_LEGACY_ENTITY_CONSTRAINT = "DROP CONSTRAINT entity_name_type_unique IF EXISTS"
+DROP_LEGACY_CHUNK_CONSTRAINT = "DROP CONSTRAINT chunk_id_unique IF EXISTS"
 
 CREATE_ENTITY_CONSTRAINT = """
-CREATE CONSTRAINT entity_name_type_unique IF NOT EXISTS
+CREATE CONSTRAINT entity_name_type_version_unique IF NOT EXISTS
 FOR (e:Entity)
-REQUIRE (e.name, e.entity_type) IS UNIQUE
+REQUIRE (e.name, e.entity_type, e.file_version_id) IS UNIQUE
 """
 
 CREATE_CHUNK_CONSTRAINT = """
-CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS
+CREATE CONSTRAINT chunk_version_chunk_id_unique IF NOT EXISTS
 FOR (c:Chunk)
-REQUIRE c.chunk_id IS UNIQUE
+REQUIRE (c.file_version_id, c.chunk_id) IS UNIQUE
 """
 
 IMPORT_BATCH_CYPHER = """
 UNWIND $rows AS row
-MERGE (c:Chunk {chunk_id: row.chunk_id})
+MERGE (c:Chunk {file_version_id: row.file_version_id, chunk_id: row.chunk_id})
   ON CREATE SET c.created_at = datetime()
-SET c.updated_at = datetime()
+SET c.file_id = row.file_id,
+    c.file_name = row.file_name,
+    c.file_version_id = row.file_version_id,
+    c.is_active = coalesce(row.is_active, true),
+    c.updated_at = datetime()
 WITH c, row
 UNWIND row.relations AS rel
-MERGE (e1:Entity {name: rel.entity1, entity_type: rel.entity1_type})
+MERGE (e1:Entity {name: rel.entity1, entity_type: rel.entity1_type, file_version_id: row.file_version_id})
   ON CREATE SET e1.created_at = datetime()
-SET e1 += rel.entity1_props,
+SET e1.file_id = row.file_id,
+    e1.file_version_id = row.file_version_id,
+    e1.is_active = coalesce(row.is_active, true),
+    e1 += rel.entity1_props,
     e1.updated_at = datetime()
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'FaultPhenomenon' THEN [1] ELSE [] END | SET e1:FaultPhenomenon)
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'Component' THEN [1] ELSE [] END | SET e1:Component)
@@ -226,9 +358,12 @@ FOREACH (_ IN CASE WHEN rel.entity1_label = 'Parameter' THEN [1] ELSE [] END | S
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'System' THEN [1] ELSE [] END | SET e1:System)
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'Method' THEN [1] ELSE [] END | SET e1:Method)
 FOREACH (_ IN CASE WHEN rel.entity1_label = 'Tool' THEN [1] ELSE [] END | SET e1:Tool)
-MERGE (e2:Entity {name: rel.entity2, entity_type: rel.entity2_type})
+MERGE (e2:Entity {name: rel.entity2, entity_type: rel.entity2_type, file_version_id: row.file_version_id})
   ON CREATE SET e2.created_at = datetime()
-SET e2 += rel.entity2_props,
+SET e2.file_id = row.file_id,
+    e2.file_version_id = row.file_version_id,
+    e2.is_active = coalesce(row.is_active, true),
+    e2 += rel.entity2_props,
     e2.updated_at = datetime()
 FOREACH (_ IN CASE WHEN rel.entity2_label = 'FaultPhenomenon' THEN [1] ELSE [] END | SET e2:FaultPhenomenon)
 FOREACH (_ IN CASE WHEN rel.entity2_label = 'Component' THEN [1] ELSE [] END | SET e2:Component)
@@ -240,12 +375,16 @@ MERGE (e1)-[r:RELATION {
   relation_type: rel.relation_type,
   chunk_id: row.chunk_id,
   entity1_type: rel.entity1_type,
-  entity2_type: rel.entity2_type
+  entity2_type: rel.entity2_type,
+  file_version_id: row.file_version_id
 }]->(e2)
   ON CREATE SET r.created_at = datetime()
-SET r.updated_at = datetime()
-MERGE (e1)-[:MENTIONED_IN]->(c)
-MERGE (e2)-[:MENTIONED_IN]->(c)
+SET r.file_id = row.file_id,
+    r.file_version_id = row.file_version_id,
+    r.is_active = coalesce(row.is_active, true),
+    r.updated_at = datetime()
+MERGE (e1)-[:MENTIONED_IN {file_version_id: row.file_version_id}]->(c)
+MERGE (e2)-[:MENTIONED_IN {file_version_id: row.file_version_id}]->(c)
 """
 
 DELETE_ALL_CYPHER = "MATCH (n) DETACH DELETE n"
@@ -258,6 +397,8 @@ def chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, A
 
 def ensure_constraints(driver: Any, database: str) -> None:
     with driver.session(database=database) as session:
+        session.run(DROP_LEGACY_ENTITY_CONSTRAINT).consume()
+        session.run(DROP_LEGACY_CHUNK_CONSTRAINT).consume()
         session.run(CREATE_ENTITY_CONSTRAINT).consume()
         session.run(CREATE_CHUNK_CONSTRAINT).consume()
 

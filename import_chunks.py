@@ -53,8 +53,14 @@ def _load_chunks(file_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import chunks into MongoDB")
     parser.add_argument("--file", required=True, help="Path to the chunk JSON or JSONL file")
+    parser.add_argument(
+        "--mode",
+        choices=["replace", "append"],
+        default="replace",
+        help="replace: clear then import all; append: keep old data and auto-increment chunk_id/id",
+    )
     args = parser.parse_args()
 
     chunks = _load_chunks(args.file)
-    import_chunks(chunks)
-    print(f"Imported {len(chunks)} chunks successfully")
+    result = import_chunks(chunks, mode=args.mode)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
