@@ -25,3 +25,6 @@ Thumbs.db
 
 # python
 .venv/
+
+# Logs
+.txt
