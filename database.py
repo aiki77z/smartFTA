@@ -1060,6 +1060,7 @@ def _ensure_indexes():
         (top_event_catalog_col, [("normalized_aliases", ASCENDING)]),
         (top_event_catalog_col, [("file_version_id", ASCENDING), ("normalized_name", ASCENDING)]),
         (generation_jobs_col, [("status", ASCENDING), ("updated_at", DESCENDING)]),
+        (generation_jobs_col, [("job_type", ASCENDING), ("source_scope_key", ASCENDING), ("updated_at", DESCENDING)]),
         (generation_job_items_col, [("job_id", ASCENDING), ("status", ASCENDING)]),
         (generation_job_items_col, [("normalized_top_event", ASCENDING), ("status", ASCENDING)]),
         (generation_job_items_col, [("source_scope_key", ASCENDING), ("normalized_top_event", ASCENDING), ("status", ASCENDING)]),
@@ -1994,16 +1995,20 @@ def create_generation_job(
     job_type: str,
     total: int,
     top_event: Optional[str] = None,
+    source_file_version_ids: Optional[List[Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     job_id = f"{job_type}_{uuid4().hex[:10]}"
     now = _now()
+    scope_ids = _dedupe_keep_order(source_file_version_ids)
     status = "completed" if total == 0 else "pending"
     doc = {
         "_id": job_id,
         "job_id": job_id,
         "job_type": job_type,
         "top_event": top_event,
+        "source_file_version_ids": scope_ids,
+        "source_scope_key": _make_scope_key(scope_ids),
         "status": status,
         "total": total,
         "success": 0,
@@ -2229,6 +2234,34 @@ def get_generation_job(job_id: str) -> Optional[Dict[str, Any]]:
     return _decorate_runtime_fields(generation_jobs_col.find_one({"_id": job_id}))
 
 
+def find_latest_generation_job_by_scope(
+    *,
+    job_type: str,
+    source_file_version_ids: Optional[List[Any]],
+    statuses: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    target_scope_key = _make_scope_key(source_file_version_ids)
+    query: Dict[str, Any] = {
+        "job_type": job_type,
+        "source_scope_key": target_scope_key,
+    }
+    if statuses:
+        query["status"] = {"$in": statuses}
+    doc = generation_jobs_col.find_one(query, sort=[("updated_at", DESCENDING)])
+    if doc:
+        return _decorate_runtime_fields(doc)
+
+    legacy_query: Dict[str, Any] = {"job_type": job_type}
+    if statuses:
+        legacy_query["status"] = {"$in": statuses}
+    cursor = generation_jobs_col.find(legacy_query).sort("updated_at", DESCENDING).limit(200)
+    for item in cursor:
+        legacy_scope_ids = item.get("source_file_version_ids") or (item.get("metadata") or {}).get("selected_file_version_ids") or []
+        if _make_scope_key(legacy_scope_ids) == target_scope_key:
+            return _decorate_runtime_fields(item)
+    return None
+
+
 def get_generation_job_item(item_id: str) -> Optional[Dict[str, Any]]:
     return _decorate_runtime_fields(generation_job_items_col.find_one({"_id": item_id}))
 
@@ -2236,6 +2269,96 @@ def get_generation_job_item(item_id: str) -> Optional[Dict[str, Any]]:
 def list_generation_job_items(job_id: str) -> List[Dict[str, Any]]:
     cursor = generation_job_items_col.find({"job_id": job_id}, {"_id": 0}).sort("created_at", ASCENDING)
     return [_decorate_runtime_fields(doc) for doc in cursor]
+
+
+def requeue_generation_job_item(
+    item_id: str,
+    *,
+    allowed_statuses: Optional[List[str]] = None,
+    message: str = "Queued for continue",
+    stage: str = "queued",
+) -> Optional[Dict[str, Any]]:
+    allowed_statuses = allowed_statuses or ["pending", "running"]
+    payload = {
+        "status": "pending",
+        "progress": 0,
+        "stage": stage,
+        "message": message,
+        "execution_owner": None,
+        "error": None,
+        "finished_at": None,
+        "duration_seconds": None,
+        "updated_at": _now(),
+    }
+    result = generation_job_items_col.update_one(
+        {
+            "_id": item_id,
+            "status": {"$in": allowed_statuses},
+        },
+        {"$set": payload},
+    )
+    if result.modified_count == 0:
+        return None
+    doc = generation_job_items_col.find_one({"_id": item_id})
+    if doc:
+        refresh_generation_job(doc["job_id"])
+    return get_generation_job_item(item_id)
+
+
+def prepare_generation_job_for_continue(
+    job_id: str,
+    *,
+    stale_after_seconds: int = 300,
+) -> Dict[str, Any]:
+    job = refresh_generation_job(job_id)
+    if not job:
+        raise ValueError(f"Unknown job_id: {job_id}")
+
+    now = _now()
+    stale_item_ids: List[str] = []
+    pending_item_ids: List[str] = []
+    active_running_item_ids: List[str] = []
+
+    items = list_generation_job_items(job_id)
+    for item in items:
+        item_id = item.get("item_id")
+        if not item_id:
+            continue
+        status = item.get("status")
+        if status == "pending":
+            pending_item_ids.append(item_id)
+            continue
+        if status != "running":
+            continue
+        updated_at = item.get("updated_at") or item.get("started_at")
+        if not updated_at:
+            stale_item_ids.append(item_id)
+            continue
+        age_seconds = max(0.0, (now - updated_at).total_seconds())
+        if age_seconds >= max(1, int(stale_after_seconds or 300)):
+            stale_item_ids.append(item_id)
+        else:
+            active_running_item_ids.append(item_id)
+
+    resumed_item_ids: List[str] = []
+    for item_id in stale_item_ids:
+        resumed = requeue_generation_job_item(
+            item_id,
+            allowed_statuses=["running"],
+            message="Requeued after stale running item",
+            stage="requeued",
+        )
+        if resumed:
+            resumed_item_ids.append(item_id)
+
+    queue_item_ids = _dedupe_keep_order(pending_item_ids + resumed_item_ids)
+    job = refresh_generation_job(job_id) or job
+    return {
+        "job": job,
+        "queue_item_ids": queue_item_ids,
+        "stale_requeued_item_ids": resumed_item_ids,
+        "active_running_item_ids": active_running_item_ids,
+    }
 
 
 def find_active_job_item_by_top_event(normalized_top_event: str) -> Optional[Dict[str, Any]]:

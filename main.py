@@ -29,6 +29,7 @@ from database import (
     expand_scoped_local_fault_subgraph,
     find_active_job_item_by_top_event,
     find_active_job_item_by_top_event_and_scope,
+    find_latest_generation_job_by_scope,
     find_tree_by_top_event,
     get_chunks_by_ids,
     import_chunks as import_chunks_to_db,
@@ -48,6 +49,7 @@ from database import (
     match_top_event_from_graph,
     rebuild_top_event_catalog_for_file_version,
     refresh_generation_job,
+    prepare_generation_job_for_continue,
     resolve_selected_file_version_ids,
     resolve_top_event_catalog,
     rollback_version,
@@ -443,6 +445,84 @@ def _sync_mirror_items(mirror_item_ids: Optional[List[str]], **kwargs):
         update_generation_job_item(mirror_item_id, **kwargs)
 
 
+def _build_single_generate_result(
+    *,
+    mode: str,
+    tree_id: str,
+    version: int,
+    tree_data: Dict[str, Any],
+    selected_file_version_ids: List[str],
+    parsed_top_event: str,
+    catalog_top_event: str,
+    requirements: str,
+    job_id: Optional[str] = None,
+    item_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload = {
+        "mode": mode,
+        "tree_id": tree_id,
+        "version": version,
+        "selected_file_version_ids": selected_file_version_ids,
+        "parsed_prompt": {
+            "top_event": parsed_top_event,
+            "catalog_top_event": catalog_top_event,
+            "requirements": requirements,
+        },
+        "tree_data": tree_data,
+    }
+    if job_id:
+        payload["job_id"] = job_id
+    if item_id:
+        payload["item_id"] = item_id
+    return payload
+
+
+def _wait_for_single_item_result(
+    *,
+    item_id: str,
+    selected_file_version_ids: List[str],
+    parsed_top_event: str,
+    catalog_top_event: str,
+    requirements: str,
+    job_id: Optional[str] = None,
+    execute_if_pending: bool = False,
+) -> Dict[str, Any]:
+    execution_owner = f"single-sync:{uuid.uuid4().hex[:8]}"
+    if execute_if_pending:
+        _run_generation_item(item_id, execution_owner=execution_owner)
+
+    while True:
+        item = get_generation_job_item(item_id)
+        if not item:
+            raise ValueError(f"Generation item not found: {item_id}")
+
+        status = item.get("status")
+        if status == "success":
+            tree_id = item.get("tree_id")
+            if not tree_id:
+                raise ValueError(f"Generation item succeeded without tree_id: {item_id}")
+            version_doc = get_version(tree_id)
+            if not version_doc:
+                raise ValueError(f"Tree version not found for generated tree: {tree_id}")
+            return _build_single_generate_result(
+                mode="generated",
+                tree_id=tree_id,
+                version=int(version_doc.get("version") or 1),
+                tree_data=version_doc.get("tree_data") or {},
+                selected_file_version_ids=selected_file_version_ids,
+                parsed_top_event=parsed_top_event,
+                catalog_top_event=catalog_top_event,
+                requirements=requirements,
+                job_id=job_id or item.get("job_id"),
+                item_id=item_id,
+            )
+
+        if status == "failed":
+            raise ValueError(item.get("error") or "Generation failed")
+
+        time.sleep(0.2)
+
+
 def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mirror_item_ids: Optional[List[str]] = None):
     item = get_generation_job_item(item_id)
     if not item:
@@ -767,95 +847,34 @@ def _queue_single_generation(
         source_file_version_ids=scoped_file_version_ids,
     )
     if reused:
-        return {
-            "mode": "reuse",
-            "tree_id": reused["tree_id"],
-            "version": reused["version"],
-            "selected_file_version_ids": scoped_file_version_ids,
-            "parsed_prompt": {
-                "top_event": parsed_top_event,
-                "catalog_top_event": catalog["name"],
-                "requirements": requirements,
-            },
-            "tree_data": reused["tree_data"],
-        }
+        return _build_single_generate_result(
+            mode="reuse",
+            tree_id=reused["tree_id"],
+            version=reused["version"],
+            tree_data=reused["tree_data"],
+            selected_file_version_ids=scoped_file_version_ids,
+            parsed_top_event=parsed_top_event,
+            catalog_top_event=catalog["name"],
+            requirements=requirements,
+        )
 
     active_item = find_active_job_item_by_top_event_and_scope(catalog["normalized_name"], scoped_file_version_ids)
     if active_item:
-        active_job = get_generation_job(active_item["job_id"])
-        if active_item["status"] == "pending" and active_job and active_job.get("job_type") == "batch":
-            batch_claim_owner = f"accelerated-batch:{uuid.uuid4().hex[:8]}"
-            claimed_batch_item = claim_generation_job_item(
-                active_item["item_id"],
-                execution_owner=batch_claim_owner,
-                allowed_statuses=["pending"],
-                progress=1,
-                stage="accelerated",
-                message="Accelerated by single request",
-            )
-            if claimed_batch_item:
-                job = create_generation_job(
-                    job_type="single",
-                    total=1,
-                    top_event=catalog["name"],
-                    metadata={
-                        "requested_prompt": prompt,
-                        "source": "/api/tree/generate",
-                        "accelerated_batch_item_id": claimed_batch_item["item_id"],
-                        "selected_file_version_ids": scoped_file_version_ids,
-                    },
-                )
-                item = create_generation_job_item(
-                    job_id=job["job_id"],
-                    top_event=catalog["name"],
-                    normalized_top_event=catalog["normalized_name"],
-                    aliases=aliases,
-                    source_chunk_ids=catalog.get("source_chunk_ids") or [],
-                    source_file_version_ids=scoped_file_version_ids,
-                    requirements=requirements,
-                    metadata={
-                        "requested_prompt": prompt,
-                        "query_top_event": parsed_top_event,
-                        "accelerated_batch_item_id": claimed_batch_item["item_id"],
-                        "selected_file_version_ids": scoped_file_version_ids,
-                    },
-                )
-                _start_dedicated_generation_thread(item["item_id"], mirror_item_ids=[claimed_batch_item["item_id"]])
-                return {
-                    "mode": "queued",
-                    "dispatch": "dedicated_worker",
-                    "job_id": job["job_id"],
-                    "item_id": item["item_id"],
-                    "status": item["status"],
-                    "progress": item["progress"],
-                    "accelerated_batch_job_id": claimed_batch_item["job_id"],
-                    "accelerated_batch_item_id": claimed_batch_item["item_id"],
-                    "selected_file_version_ids": scoped_file_version_ids,
-                    "parsed_prompt": {
-                        "top_event": parsed_top_event,
-                        "catalog_top_event": catalog["name"],
-                        "requirements": requirements,
-                    },
-                }
-
-        return {
-            "mode": "queued",
-            "job_id": active_item["job_id"],
-            "item_id": active_item["item_id"],
-            "status": active_item["status"],
-            "progress": active_item["progress"],
-            "selected_file_version_ids": scoped_file_version_ids,
-            "parsed_prompt": {
-                "top_event": parsed_top_event,
-                "catalog_top_event": catalog["name"],
-                "requirements": requirements,
-            },
-        }
+        return _wait_for_single_item_result(
+            item_id=active_item["item_id"],
+            selected_file_version_ids=scoped_file_version_ids,
+            parsed_top_event=parsed_top_event,
+            catalog_top_event=catalog["name"],
+            requirements=requirements,
+            job_id=active_item.get("job_id"),
+            execute_if_pending=(active_item.get("status") == "pending"),
+        )
 
     job = create_generation_job(
         job_type="single",
         total=1,
         top_event=catalog["name"],
+        source_file_version_ids=scoped_file_version_ids,
         metadata={
             "requested_prompt": prompt,
             "source": "/api/tree/generate",
@@ -876,21 +895,15 @@ def _queue_single_generation(
             "selected_file_version_ids": scoped_file_version_ids,
         },
     )
-    _submit_generation_item(item["item_id"], "single")
-
-    return {
-        "mode": "queued",
-        "job_id": job["job_id"],
-        "item_id": item["item_id"],
-        "status": item["status"],
-        "progress": item["progress"],
-        "selected_file_version_ids": scoped_file_version_ids,
-        "parsed_prompt": {
-            "top_event": parsed_top_event,
-            "catalog_top_event": catalog["name"],
-            "requirements": requirements,
-        },
-    }
+    return _wait_for_single_item_result(
+        item_id=item["item_id"],
+        selected_file_version_ids=scoped_file_version_ids,
+        parsed_top_event=parsed_top_event,
+        catalog_top_event=catalog["name"],
+        requirements=requirements,
+        job_id=job["job_id"],
+        execute_if_pending=True,
+    )
 
 
 # ---- Optional: merge validator-service into this backend (same uvicorn port) ----
@@ -946,6 +959,10 @@ class TopEventsPreviewRequest(BaseModel):
 
 class GenerateAllRequest(BaseModel):
     selected_file_version_ids: Optional[List[str]] = None
+
+
+class ContinueBatchJobRequest(BaseModel):
+    stale_after_seconds: int = 300
 
 
 class KnowledgeArtifactsImportRequest(BaseModel):
@@ -1375,6 +1392,22 @@ def api_preview_top_events(req: TopEventsPreviewRequest):
 @app.post("/api/batch/generate-all")
 def api_batch_generate_all(req: Optional[GenerateAllRequest] = None):
     scoped_file_version_ids = _resolve_selected_scope((req.selected_file_version_ids if req else None))
+    existing_job = find_latest_generation_job_by_scope(
+        job_type="batch",
+        source_file_version_ids=scoped_file_version_ids,
+        statuses=["pending", "running", "partial_failed", "failed"],
+    )
+    if existing_job:
+        existing_job = refresh_generation_job(existing_job["job_id"]) or existing_job
+        return {
+            "mode": "existing_job",
+            "job_id": existing_job["job_id"],
+            "status": existing_job.get("status"),
+            "selected_file_version_ids": scoped_file_version_ids,
+            "message": "Existing batch job found for the same scope. Continue that job instead of creating a new one.",
+            "continue_endpoint": f"/api/batch/job/{existing_job['job_id']}/continue",
+        }
+
     discovery = _discover_batch_top_events_v2(scoped_file_version_ids)
     discovered = discovery["discovered"] or []
     discovery_source = discovery["discovery_source"]
@@ -1453,6 +1486,7 @@ def api_batch_generate_all(req: Optional[GenerateAllRequest] = None):
     job = create_generation_job(
         job_type="batch",
         total=len(queued_entries),
+        source_file_version_ids=scoped_file_version_ids,
         metadata={
             "discovered_total": len(discovered),
             "catalog_total": len(catalog_entries),
@@ -1511,6 +1545,37 @@ def api_batch_generate_all(req: Optional[GenerateAllRequest] = None):
         "queued_count": len(queued_entries),
         "queued_item_ids": queued_item_ids,
         "items": entry_statuses,
+    }
+
+
+@app.post("/api/batch/job/{job_id}/continue")
+def api_continue_batch_job(job_id: str, req: Optional[ContinueBatchJobRequest] = None):
+    job = get_generation_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Batch job not found")
+    if job.get("job_type") != "batch":
+        raise HTTPException(status_code=400, detail="Only batch jobs can be continued")
+
+    stale_after_seconds = max(30, min(int((req.stale_after_seconds if req else 300) or 300), 86400))
+    try:
+        prepared = prepare_generation_job_for_continue(job_id, stale_after_seconds=stale_after_seconds)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    queue_item_ids = prepared.get("queue_item_ids") or []
+    for item_id in queue_item_ids:
+        _submit_generation_item(item_id, "batch")
+
+    refreshed_job = refresh_generation_job(job_id) or job
+    return {
+        "job_id": job_id,
+        "status": refreshed_job.get("status"),
+        "selected_file_version_ids": refreshed_job.get("source_file_version_ids") or [],
+        "queued_item_ids": queue_item_ids,
+        "queued_count": len(queue_item_ids),
+        "stale_requeued_item_ids": prepared.get("stale_requeued_item_ids") or [],
+        "active_running_item_ids": prepared.get("active_running_item_ids") or [],
+        "message": "Batch job continued",
     }
 
 
