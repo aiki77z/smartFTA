@@ -27,4 +27,4 @@ Thumbs.db
 .venv/
 
 # Logs
-.txt
+*.txt
