@@ -1,8 +1,9 @@
-﻿from __future__ import annotations
+﻿# run.py
+from __future__ import annotations
 
 """
 完整流水线：
-1. 生成模式：PDF -> Markdown -> 文档分块 -> 实体提取 -> 关系提取
+1. 生成模式：PDF -> Markdown -> 清理标题层级 -> 文档分块 -> 实体提取 -> 关系提取
 2. 导入模式：直接从已有产物目录读取 chunks / entities / relations，不执行生成步骤
 """
 
@@ -15,9 +16,9 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.absolute()
 
-
 def run_command(cmd, description):
-    """执行 shell 命令，安全处理 UTF-8 输出。"""
+    """执行 shell 命令，安全处理 UTF-8 输出，并记录耗时。"""
+    start = time.time()   # === 新增 ===
     print(f"\n>>> {description}")
     print(f"命令: {' '.join(cmd)}")
 
@@ -26,6 +27,9 @@ def run_command(cmd, description):
     env["PYTHONUTF8"] = "1"
 
     result = subprocess.run(cmd, capture_output=True, text=False, env=env)
+
+    elapsed = time.time() - start   # === 新增 ===
+    print(f"耗时: {elapsed:.2f} 秒")
 
     stdout = result.stdout.decode("utf-8", errors="replace")
     stderr = result.stderr.decode("utf-8", errors="replace")
@@ -44,8 +48,6 @@ def run_command(cmd, description):
         print(stderr)
 
     return result
-
-
 
 def find_md_file(output_dir: Path, pdf_stem: str) -> Path:
     """在 MinerU 输出目录中查找生成的 .md 文件，并等待其写入完成。"""
@@ -68,8 +70,6 @@ def find_md_file(output_dir: Path, pdf_stem: str) -> Path:
 
     raise RuntimeError(f"MD 文件生成失败或为空: {candidate}")
 
-
-
 def _discover_pdf_stem(import_only_dir: Path, explicit_stem: str | None) -> str:
     if explicit_stem:
         return explicit_stem
@@ -80,8 +80,6 @@ def _discover_pdf_stem(import_only_dir: Path, explicit_stem: str | None) -> str:
 
     raise ValueError("导入模式下请提供 --pdf-stem，或保证目录中只有一个 *_chunks.json 文件")
 
-
-
 def _resolve_artifacts(import_only_dir: Path, pdf_stem: str):
     return {
         "chunks_json": import_only_dir / f"{pdf_stem}_chunks.json",
@@ -90,8 +88,6 @@ def _resolve_artifacts(import_only_dir: Path, pdf_stem: str):
         "relations_jsonl": import_only_dir / f"{pdf_stem}_relations.jsonl",
         "relations_csv": import_only_dir / f"{pdf_stem}_relations.csv",
     }
-
-
 
 def _run_import_only_mode(args) -> None:
     import_only_dir = Path(args.import_only_dir).resolve()
@@ -125,17 +121,16 @@ def _run_import_only_mode(args) -> None:
     print(f"relations_jsonl: {artifacts['relations_jsonl']}")
     print("\n说明：本模式只验证并暴露已有产物路径，供上层服务自动同步到 generate-fta。")
 
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="PDF 知识抽取完整流水线：PDF -> MD -> 分块 -> 实体 -> 关系"
+        description="PDF 知识抽取完整流水线：PDF -> MD -> 清理MD -> 分块 -> 实体 -> 关系"
     )
     parser.add_argument("--pdf", "-p", help="输入的 PDF 文件路径；导入模式下仅用于推断 pdf_stem")
-    parser.add_argument("--pdf-stem", help="导入模式下显式指定产物前缀，例如 test_cleaned")
+    # parser.add_argument("--pdf-stem", help="导入模式下显式指定产物前缀，例如 test_cleaned")
     parser.add_argument("--output-dir", "-o", default="./output", help="输出根目录（默认 ./output）")
     parser.add_argument("--chunk-size", "-s", type=int, default=800, help="分块大小（字符数），默认 800")
     parser.add_argument("--skip-mineru", action="store_true", help="跳过 MinerU 转换步骤（假设已有 MD 文件）")
+    parser.add_argument("--skip-clean", action="store_true", help="跳过 Markdown 标题层级清理步骤")
     parser.add_argument("--skip-entity", action="store_true", help="跳过实体提取（只执行到分块）")
     parser.add_argument("--skip-relation", action="store_true", help="跳过关系统取（只执行到实体合并）")
     parser.add_argument("--print-raw-text", action="store_true", help="打印 LLM 返回的原始文本（用于调试）")
@@ -161,6 +156,9 @@ def main():
     pdf_stem = pdf_path.stem
     result_dir = output_root / pdf_stem
     result_dir.mkdir(parents=True, exist_ok=True)
+
+    # === 新增：记录整个流水线的开始时间 ===
+    pipeline_start = time.time()
 
     md_file = None
     if not args.skip_mineru:
@@ -198,6 +196,26 @@ def main():
             print(f"错误: 找不到有效的 MD 文件 - {exc}")
             sys.exit(1)
 
+    if not args.skip_clean:
+        print("\n=== 步骤1.5: 清理 Markdown 标题层级 ===")
+        clean_script = SCRIPT_DIR / "clean_md.py"
+        if not clean_script.exists():
+            print(f"错误: 找不到 {clean_script}")
+            sys.exit(1)
+
+        cleaned_md_file = result_dir / f"{pdf_stem}_cleaned.md"
+        cmd_clean = [
+            sys.executable,
+            str(clean_script),
+            "--input", str(md_file),
+            "--output", str(cleaned_md_file)
+        ]
+        run_command(cmd_clean, "清理MD标题层级")
+        md_file = cleaned_md_file
+        print(f"清理后的 Markdown 文件: {md_file}")
+    else:
+        print("\n=== 跳过 Markdown 标题层级清理 ===")
+
     print("\n=== 步骤2: Markdown 分块 ===")
     chunk_script = SCRIPT_DIR / "chunk_md.py"
     if not chunk_script.exists():
@@ -220,6 +238,8 @@ def main():
 
     if args.skip_entity:
         print("已跳过实体提取，流程结束。")
+        pipeline_elapsed = time.time() - pipeline_start
+        print(f"\n=== 整个流水线耗时: {pipeline_elapsed:.2f} 秒 ===")
         return
 
     print("\n=== 步骤3: 实体提取 ===")
@@ -249,6 +269,8 @@ def main():
 
     if args.skip_relation:
         print("已跳过关系统取，流程结束。")
+        pipeline_elapsed = time.time() - pipeline_start
+        print(f"\n=== 整个流水线耗时: {pipeline_elapsed:.2f} 秒 ===")
         return
 
     print("\n=== 步骤4: 关系提取 ===")
@@ -278,7 +300,9 @@ def main():
     print(f"关系 JSON: {relations_json}")
     print(f"关系 CSV:  {relations_csv}")
 
+    pipeline_elapsed = time.time() - pipeline_start
     print("\n=== 流水线执行完成 ===")
+    print(f"整个流水线耗时: {pipeline_elapsed:.2f} 秒")
     print(f"结果存放目录: {result_dir}")
     print("生成文件:")
     print(f"  - 分块: {chunks_json}")
@@ -286,7 +310,6 @@ def main():
     print(f"  - 实体 (合并): {merged_json}")
     print(f"  - 关系 (逐块): {relations_json}")
     print(f"  - 关系 (CSV):  {relations_csv}")
-
 
 if __name__ == "__main__":
     main()

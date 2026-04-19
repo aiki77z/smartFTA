@@ -1,0 +1,273 @@
+(fta) PS D:\classes\waibao\FTAVisualSystem> python run.py -p test.pdf
+
+=== 步骤1: PDF 转 Markdown (MinerU) ===
+
+>>> MinerU 转换
+命令: D:\conda_file\envs\fta\python.exe D:\classes\waibao\FTAVisualSystem\trans_file_to_md.py -i D:\classes\waibao\FTAVisualSystem\test.pdf -o D:\classes\waibao\FTAVisualSystem\output -b pipeline -m ocr
+耗时: 154.44 秒
+执行命令: mineru -p D:\classes\waibao\FTAVisualSystem\test.pdf -o D:\classes\waibao\FTAVisualSystem\output -b pipeline -m ocr
+命令执行成功
+标准输出: Start MinerU FastAPI Service: http://127.0.0.1:61585
+API documentation: http://127.0.0.1:61585/docs
+
+
+找到 Markdown 文件: D:\classes\waibao\FTAVisualSystem\output\test\ocr\test.md (大小: 37485 字节)
+
+=== 步骤1.5: 清理 Markdown 标题层级 ===
+
+>>> 清理MD标题层级
+命令: D:\conda_file\envs\fta\python.exe D:\classes\waibao\FTAVisualSystem\clean_md.py --input D:\classes\waibao\FTAVisualSystem\output\test\ocr\test.md --output D:\classes\waibao\FTAVisualSystem\output\test\test_cleaned.md
+耗时: 100.52 秒
+正在修正标题层级...
+标题层级已修正并保存至 D:\classes\waibao\FTAVisualSystem\output\test\test_cleaned.md
+
+=== 清理标题层级耗时: 99.27 秒 ===
+
+清理后的 Markdown 文件: D:\classes\waibao\FTAVisualSystem\output\test\test_cleaned.md
+
+=== 步骤2: Markdown 分块 ===
+
+>>> 文档分块
+命令: D:\conda_file\envs\fta\python.exe D:\classes\waibao\FTAVisualSystem\chunk_md.py --input D:\classes\waibao\FTAVisualSystem\output\test\test_cleaned.md --output D:\classes\waibao\FTAVisualSystem\output\test\test_chunks.json --chunk_size 800
+耗时: 0.10 秒
+正在读取文件: D:\classes\waibao\FTAVisualSystem\output\test\test_cleaned.md ...
+✅ 文档分块完成，结果已保存到 D:\classes\waibao\FTAVisualSystem\output\test\test_chunks.json
+📊 共生成 27 个文本块
+
+=== 文档分块耗时: 0.00 秒 ===
+
+分块结果保存至: D:\classes\waibao\FTAVisualSystem\output\test\test_chunks.json
+
+=== 步骤3: 实体提取 ===
+
+>>> 实体提取
+命令: D:\conda_file\envs\fta\python.exe D:\classes\waibao\FTAVisualSystem\extract_entities.py --input D:\classes\waibao\FTAVisualSystem\output\test\test_chunks.json --output-entities D:\classes\waibao\FTAVisualSystem\output\test\test_entities.jsonl --output-merged D:\classes\waibao\FTAVisualSystem\output\test\test_entities_merged.json
+耗时: 1006.81 秒
+正在加载chunks数据: D:\classes\waibao\FTAVisualSystem\output\test\test_chunks.json
+加载完成，共 27 个chunks
+开始实体提取（多线程，并发数=10），结果将保存到: D:\classes\waibao\FTAVisualSystem\output\test\test_entities.jsonl
+待处理chunk数：27，并发数：10
+处理文档：test_cleaned，chunk_id: 0
+处理文档：test_cleaned，chunk_id: 1
+处理文档：test_cleaned，chunk_id: 2
+处理文档：test_cleaned，chunk_id: 3
+处理文档：test_cleaned，chunk_id: 4
+处理文档：test_cleaned，chunk_id: 5
+处理文档：test_cleaned，chunk_id: 6
+处理文档：test_cleaned，chunk_id: 7
+处理文档：test_cleaned，chunk_id: 8
+处理文档：test_cleaned，chunk_id: 9
+提取有效实体数：5 (chunk 6)
+处理文档：test_cleaned，chunk_id: 10
+提取有效实体数：5 (chunk 9)
+处理文档：test_cleaned，chunk_id: 11
+提取有效实体数：5 (chunk 5)
+处理文档：test_cleaned，chunk_id: 12
+提取有效实体数：7 (chunk 3)
+处理文档：test_cleaned，chunk_id: 13
+提取有效实体数：5 (chunk 1)
+处理文档：test_cleaned，chunk_id: 14
+警告: LLM输出不是有效JSON，尝试按行解析
+警告: chunk 7 第1次提取实体为空，但输出包含疑似JSON结构，将重试
+提取有效实体数：6 (chunk 4)
+处理文档：test_cleaned，chunk_id: 15
+提取有效实体数：9 (chunk 2)
+处理文档：test_cleaned，chunk_id: 16
+提取有效实体数：32 (chunk 0)
+处理文档：test_cleaned，chunk_id: 17
+提取有效实体数：18 (chunk 8)
+处理文档：test_cleaned，chunk_id: 18
+提取有效实体数：15 (chunk 12)
+处理文档：test_cleaned，chunk_id: 19
+提取有效实体数：15 (chunk 14)
+处理文档：test_cleaned，chunk_id: 20
+提取有效实体数：18 (chunk 10)
+处理文档：test_cleaned，chunk_id: 21
+提取有效实体数：22 (chunk 11)
+处理文档：test_cleaned，chunk_id: 22
+提取有效实体数：10 (chunk 15)
+处理文档：test_cleaned，chunk_id: 23
+提取有效实体数：11 (chunk 7)
+处理文档：test_cleaned，chunk_id: 24
+提取有效实体数：6 (chunk 13)
+处理文档：test_cleaned，chunk_id: 25
+提取有效实体数：12 (chunk 17)
+处理文档：test_cleaned，chunk_id: 26
+提取有效实体数：21 (chunk 18)
+警告: LLM输出不是有效JSON，尝试按行解析
+警告: chunk 16 第1次提取实体为空，但输出包含疑似JSON结构，将重试
+提取有效实体数：14 (chunk 19)
+提取有效实体数：17 (chunk 23)
+提取有效实体数：10 (chunk 22)
+提取有效实体数：13 (chunk 20)
+提取有效实体数：14 (chunk 21)
+提取有效实体数：7 (chunk 26)
+提取有效实体数：19 (chunk 25)
+提取有效实体数：18 (chunk 24)
+提取有效实体数：24 (chunk 16)
+实体提取完成，共处理 27 个chunks
+开始实体合并（含名称等价判断和LLM智能合并，并发数=10），结果将保存到: D:\classes\waibao\FTAVisualSystem\output\test\test_entities_merged.json
+合并前原始实体数量（不同标准化名称）: 337
+开始名称相似度聚类，共 337 个名称...
+相似度聚类完成，生成 268 个候选组
+开始对 268 个候选组进行并发 LLM 等价判断（并发数=10）...
+  等价判断进度: 10/268
+  等价判断进度: 20/268
+  等价判断进度: 30/268
+  等价判断进度: 40/268
+  等价判断进度: 50/268
+  等价判断进度: 60/268
+  等价判断进度: 70/268
+  等价判断进度: 80/268
+  等价判断进度: 90/268
+  等价判断进度: 100/268
+  等价判断进度: 110/268
+  等价判断进度: 120/268
+  等价判断进度: 130/268
+  等价判断进度: 140/268
+  等价判断进度: 150/268
+  等价判断进度: 160/268
+  等价判断进度: 170/268
+  等价判断进度: 180/268
+  等价判断进度: 190/268
+  等价判断进度: 200/268
+  等价判断进度: 210/268
+  等价判断进度: 220/268
+  等价判断进度: 230/268
+  等价判断进度: 240/268
+  等价判断进度: 250/268
+  等价判断进度: 260/268
+  等价判断进度: 268/268
+开始合并文本字段，共 330 个实体组（并发数=10）...
+  文本合并进度: 10/330
+  文本合并进度: 20/330
+  文本合并进度: 30/330
+  文本合并进度: 40/330
+  文本合并进度: 50/330
+  文本合并进度: 60/330
+  文本合并进度: 70/330
+  文本合并进度: 80/330
+  文本合并进度: 90/330
+  文本合并进度: 100/330
+  文本合并进度: 110/330
+  文本合并进度: 120/330
+  文本合并进度: 130/330
+  文本合并进度: 140/330
+  文本合并进度: 150/330
+  文本合并进度: 160/330
+  文本合并进度: 170/330
+  文本合并进度: 180/330
+  文本合并进度: 190/330
+  文本合并进度: 200/330
+  文本合并进度: 210/330
+  文本合并进度: 220/330
+  文本合并进度: 230/330
+  文本合并进度: 240/330
+  文本合并进度: 250/330
+  文本合并进度: 260/330
+  文本合并进度: 270/330
+  文本合并进度: 280/330
+  文本合并进度: 290/330
+  文本合并进度: 300/330
+  文本合并进度: 310/330
+  文本合并进度: 320/330
+  文本合并进度: 330/330
+实体合并完成
+
+=== 实体提取与合并耗时: 1005.58 秒 ===
+Token 用量: prompt=58763, completion=321264, total=380027
+
+=== 统计信息 ===
+合并后实体数量: 330
+
+实体结果: D:\classes\waibao\FTAVisualSystem\output\test\test_entities.jsonl
+合并实体: D:\classes\waibao\FTAVisualSystem\output\test\test_entities_merged.json
+
+=== 步骤4: 关系提取 ===
+
+>>> 关系提取
+命令: D:\conda_file\envs\fta\python.exe D:\classes\waibao\FTAVisualSystem\extract_relations.py --input-chunks D:\classes\waibao\FTAVisualSystem\output\test\test_entities.jsonl --input-entities D:\classes\waibao\FTAVisualSystem\output\test\test_entities_merged.json --output-relations D:\classes\waibao\FTAVisualSystem\output\test\test_relations.jsonl --output-csv D:\classes\waibao\FTAVisualSystem\output\test\test_relations.csv
+耗时: 521.62 秒
+正在加载chunks数据: D:\classes\waibao\FTAVisualSystem\output\test\test_entities.jsonl
+加载完成，共 27 个chunks
+使用外部实体文件: D:\classes\waibao\FTAVisualSystem\output\test\test_entities_merged.json
+从聚合实体文件生成 27 个chunk的实体数据
+开始关系提取，结果将保存到: D:\classes\waibao\FTAVisualSystem\output\test\test_relations.jsonl
+需要处理 27 个 chunk，使用多线程并发调用 LLM，并发数: 10
+处理文档关系：test_cleaned，chunk_id: 6，实体数: 5
+处理文档关系：test_cleaned，chunk_id: 9，实体数: 5
+处理文档关系：test_cleaned，chunk_id: 5，实体数: 5
+处理文档关系：test_cleaned，chunk_id: 3，实体数: 7
+处理文档关系：test_cleaned，chunk_id: 1，实体数: 5
+处理文档关系：test_cleaned，chunk_id: 4，实体数: 6
+处理文档关系：test_cleaned，chunk_id: 2，实体数: 9
+处理文档关系：test_cleaned，chunk_id: 0，实体数: 32
+处理文档关系：test_cleaned，chunk_id: 8，实体数: 18
+处理文档关系：test_cleaned，chunk_id: 12，实体数: 15
+chunk 1 提取有效关系数：4
+处理文档关系：test_cleaned，chunk_id: 14，实体数: 15
+chunk 5 提取有效关系数：1
+处理文档关系：test_cleaned，chunk_id: 10，实体数: 18
+chunk 0 提取有效关系数：5
+处理文档关系：test_cleaned，chunk_id: 11，实体数: 22
+chunk 3 提取有效关系数：2
+处理文档关系：test_cleaned，chunk_id: 15，实体数: 10
+chunk 9 提取有效关系数：1
+处理文档关系：test_cleaned，chunk_id: 7，实体数: 11
+chunk 2 提取有效关系数：4
+处理文档关系：test_cleaned，chunk_id: 13，实体数: 6
+chunk 6 提取有效关系数：0
+处理文档关系：test_cleaned，chunk_id: 17，实体数: 12
+chunk 8 提取有效关系数：12
+处理文档关系：test_cleaned，chunk_id: 18，实体数: 21
+chunk 4 提取有效关系数：1
+处理文档关系：test_cleaned，chunk_id: 19，实体数: 14
+chunk 13 提取有效关系数：0
+处理文档关系：test_cleaned，chunk_id: 23，实体数: 17
+chunk 12 提取有效关系数：6
+处理文档关系：test_cleaned，chunk_id: 22，实体数: 10
+chunk 10 提取有效关系数：6
+处理文档关系：test_cleaned，chunk_id: 20，实体数: 13
+chunk 15 提取有效关系数：6
+处理文档关系：test_cleaned，chunk_id: 21，实体数: 14
+chunk 7 提取有效关系数：0
+处理文档关系：test_cleaned，chunk_id: 26，实体数: 7
+chunk 11 提取有效关系数：12
+处理文档关系：test_cleaned，chunk_id: 25，实体数: 19
+chunk 14 提取有效关系数：7
+处理文档关系：test_cleaned，chunk_id: 24，实体数: 18
+chunk 18 提取有效关系数：0
+处理文档关系：test_cleaned，chunk_id: 16，实体数: 24
+chunk 17 提取有效关系数：5
+chunk 19 提取有效关系数：0
+chunk 23 提取有效关系数：8
+chunk 22 提取有效关系数：0
+chunk 26 提取有效关系数：4
+chunk 21 提取有效关系数：4
+chunk 25 提取有效关系数：10
+chunk 24 提取有效关系数：13
+chunk 20 提取有效关系数：10
+chunk 16 提取有效关系数：5
+关系提取完成，共处理 27 个chunks
+开始转换为CSV，结果将保存到: D:\classes\waibao\FTAVisualSystem\output\test\test_relations.csv
+已保存 126 条关系到 D:\classes\waibao\FTAVisualSystem\output\test\test_relations.csv
+CSV转换完成，共 126 个关系
+
+=== 关系提取耗时: 520.35 秒 ===
+Token 用量: prompt=36975, completion=245928, total=282903
+
+=== 统计信息 ===
+总关系数量: 126
+
+关系 JSON: D:\classes\waibao\FTAVisualSystem\output\test\test_relations.jsonl
+关系 CSV:  D:\classes\waibao\FTAVisualSystem\output\test\test_relations.csv
+
+=== 流水线执行完成 ===
+整个流水线耗时: 1783.51 秒
+结果存放目录: D:\classes\waibao\FTAVisualSystem\output\test
+生成文件:
+  - 分块: D:\classes\waibao\FTAVisualSystem\output\test\test_chunks.json
+  - 实体 (逐块): D:\classes\waibao\FTAVisualSystem\output\test\test_entities.jsonl
+  - 实体 (合并): D:\classes\waibao\FTAVisualSystem\output\test\test_entities_merged.json
+  - 关系 (逐块): D:\classes\waibao\FTAVisualSystem\output\test\test_relations.jsonl
+  - 关系 (CSV):  D:\classes\waibao\FTAVisualSystem\output\test\test_relations.csv

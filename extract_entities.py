@@ -1,35 +1,120 @@
+# extract_entities.py
 import json
 import os
 import re
 import argparse
-from typing import List, Dict, Set
+import time   # === 新增 ===
+from typing import List, Dict, Set, Any
 from generate_prompt_relation import generate_entity_prompt_and_context
-from llm_caller_relation import call_llm
+from llm_caller_relation import call_llm, reset_token_usage, get_token_usage   # === 新增 reset, get ===
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from difflib import SequenceMatcher
 
-# 文件写入锁（确保多线程写入时不会冲突）
+ALLOWED_ENTITY_TYPES = {"故障原因与现象", "逻辑与"}
+
 write_lock = threading.Lock()
 
+def standardize_entity_name(name: str) -> str:
+    # ... 原有代码保持不变 ...
+    if not name:
+        return name
+    s = name.strip()
+    s = s.replace('\u3000', ' ')
+    s = re.sub(r'\s+', ' ', s)
+    s = s.replace('（', '(').replace('）', ')')
+    s = s.replace('：', ':')
+    if s.endswith('。'):
+        s = s[:-1]
+    s = s.replace('＋', '+').replace('＆', '&')
+    s = re.sub(r'[–—－‑]', '-', s)
+    pairs = [
+        ('"', '"'), ("'", "'"),
+        ('(', ')'), ('[', ']'), ('{', '}'), ('<', '>'),
+        ('（', '）'),
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for left, right in pairs:
+            if s.startswith(left) and s.endswith(right):
+                s = s[1:-1]
+                changed = True
+                break
+    s = s.upper()
+    return s
+
 def save_json(data, file_path):
-    """保存数据到JSON文件"""
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-def parse_entities(text: str) -> List[Dict]:
-    entities = []
-    pattern = re.compile(r'实体名称[：:]\s*(.+?)\s*[，,]\s*实体类别[：:]\s*(.+)')
-    for line in text.strip().split('\n'):
-        line = line.strip()
-        if not line:
+def parse_entities(text: str, chunk: Dict) -> List[Dict]:
+    # ... 原有代码保持不变 ...
+    try:
+        data = json.loads(text)
+        entities_data = data.get("entities", [])
+    except json.JSONDecodeError:
+        print("警告: LLM输出不是有效JSON，尝试按行解析")
+        entities_data = []
+        for line in text.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            match = re.search(r'实体名称[：:]\s*(.+?)\s*[，,]\s*实体类别[：:]\s*(.+)', line)
+            if match:
+                entities_data.append({
+                    "name": match.group(1).strip(),
+                    "entity_type": match.group(2).strip(),
+                    "description": "",
+                    "rule": "",
+                    "investigateMethod": "",
+                    "repairMethod": ""
+                })
+
+    doc_name = chunk.get("document_name") or chunk.get("chunk_name", "未知文档")
+    start_line = chunk.get("start_line")
+    source = str(start_line) if start_line is not None else "未知行"
+
+    valid_entities = []
+    seen_names = set()
+    content = chunk.get("content", "")
+
+    for ent in entities_data:
+        raw_name = ent.get("name", "").strip()
+        if not raw_name:
             continue
-        match = pattern.search(line)
-        if match:
-            entity_name = match.group(1).strip()
-            entity_type = match.group(2).strip()
-            entities.append({"entity_name": entity_name, "entity_type": entity_type})
-    return entities
+        name = standardize_entity_name(raw_name)
+        if not name or name in seen_names:
+            continue
+        entity_type = ent.get("entity_type", "")
+        if entity_type not in ALLOWED_ENTITY_TYPES:
+            continue
+        if len(name) > 20:
+            continue
+
+        entity_obj = {
+            "name": name,
+            "entity_type": entity_type,
+            "description": ent.get("description", ""),
+            "errorLevel": "中",
+            "priority": 1,
+            "probability": None,
+            "showProbability": None,
+            "rule": ent.get("rule", ""),
+            "investigateMethod": ent.get("investigateMethod", ""),
+            "repairMethod": ent.get("repairMethod", ""),
+            "documents": [{
+                "document_name": doc_name,
+                "source": source
+            }],
+            "source_chunk_ids": [str(chunk.get("chunk_id") or chunk.get("id", "0"))],
+            "support_count": 1
+        }
+        valid_entities.append(entity_obj)
+        seen_names.add(name)
+
+    return valid_entities
 
 def is_entity_in_text(entity_name: str, text: str) -> bool:
     e = entity_name.strip().lower()
@@ -38,7 +123,6 @@ def is_entity_in_text(entity_name: str, text: str) -> bool:
     return re.search(pattern, t) is not None
 
 def load_processed_chunk_ids(output_file: str) -> Set[str]:
-    """加载已处理的chunk_id集合"""
     if not os.path.exists(output_file):
         return set()
     with open(output_file, "r", encoding="utf-8") as f:
@@ -46,18 +130,13 @@ def load_processed_chunk_ids(output_file: str) -> Set[str]:
     return {item["chunk_id"] for item in data}
 
 def process_single_chunk(chunk: Dict, print_raw_text: bool, write_lock, output_file: str, processed_chunk_ids: Set[str]):
-    """
-    处理单个chunk（供多线程调用）
-    返回处理结果字典，如果处理失败或chunk已处理则返回None
-    """
     chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or 0)
     if chunk_id in processed_chunk_ids:
         return None
 
-    chunk_name = chunk.get("chunk_name") or chunk.get("chunk_name", "未知文档")
+    chunk_name = chunk.get("chunk_name") or "未知文档"
     content = chunk.get("content", "")
 
-    # 构建增强上下文
     title_parts = []
     if chunk.get("section_path"):
         title_parts.append(f"章节路径: {chunk['section_path']}")
@@ -76,59 +155,57 @@ def process_single_chunk(chunk: Dict, print_raw_text: bool, write_lock, output_f
 
     print(f"处理文档：{chunk_name}，chunk_id: {chunk_id}")
 
-    try:
-        entity_prompt, entity_context = generate_entity_prompt_and_context(chunk_name, enriched_content)
-        entity_text = call_llm(entity_context, entity_prompt)
-        if print_raw_text:
-            # 打印时带上chunk_id以区分线程输出
-            print(f"LLM output for chunk {chunk_id}: {entity_text}")
+    max_retries = 3
+    entities = []
+    for attempt in range(1, max_retries + 1):
+        try:
+            entity_prompt, entity_context = generate_entity_prompt_and_context(chunk_name, enriched_content)
+            entity_text = call_llm(entity_context, entity_prompt)
+            if print_raw_text:
+                print(f"LLM output for chunk {chunk_id} (attempt {attempt}):\n{entity_text}")
 
-        entities = parse_entities(entity_text)
+            entities = parse_entities(entity_text, chunk)
+            if entities:
+                break
+            else:
+                if attempt < max_retries and ('{' in entity_text or '[' in entity_text or '实体名称' in entity_text):
+                    print(f"警告: chunk {chunk_id} 第{attempt}次提取实体为空，但输出包含疑似JSON结构，将重试")
+                else:
+                    break
+        except Exception as e:
+            print(f"chunk {chunk_id} 第{attempt}次调用出错: {e}")
+            if attempt == max_retries:
+                entities = []
+            continue
 
-        valid_entities = []
-        seen_entities = set()
-        for ent in entities:
-            name = ent["entity_name"]
-            if name not in seen_entities and is_entity_in_text(name, content) and len(name) <= 20:
-                valid_entities.append(ent)
-                seen_entities.add(name)
+    if not entities:
+        print(f"警告: chunk {chunk_id} 最终未能提取到有效实体（重试{max_retries}次）")
 
-        result = {
-            "chunk_id": chunk_id,
-            "chunk_name": chunk_name,
-            "content": content,
-            "entities": valid_entities,
-            "entity": valid_entities
-        }
+    result = {
+        "chunk_id": chunk_id,
+        "chunk_name": chunk_name,
+        "content": content,
+        "entities": entities
+    }
 
-        # 使用锁安全写入文件
-        with write_lock:
-            with open(output_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
-                f.flush()
+    with write_lock:
+        with open(output_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+            f.flush()
 
-        print(f"提取有效实体数：{len(valid_entities)} (chunk {chunk_id})")
-        return result
-
-    except Exception as e:
-        print(f"处理chunk_id {chunk_id}时出错: {e}")
-        return None
+    print(f"提取有效实体数：{len(entities)} (chunk {chunk_id})")
+    return result
 
 def extract_entities_incremental(chunks: List[Dict], output_file: str, print_raw_text: bool = False, max_workers: int = 5) -> List[Dict]:
-    """
-    增量提取实体（多线程并发版本），避免重复处理已处理的chunk
-    """
     processed_chunk_ids = load_processed_chunk_ids(output_file)
     results = []
 
-    # 加载已有结果（用于最终返回）
     if os.path.exists(output_file):
         with open(output_file, "r", encoding="utf-8") as f:
             results = [json.loads(line.strip()) for line in f]
 
-    # 过滤出需要处理的chunk
     chunks_to_process = [chunk for chunk in chunks
-                         if str(chunk.get("chunk_id") or chunk.get("id") or 0) not in processed_chunk_ids]
+                        if str(chunk.get("chunk_id") or chunk.get("id") or 0) not in processed_chunk_ids]
 
     if not chunks_to_process:
         print("所有chunk均已处理，无需提取")
@@ -136,7 +213,6 @@ def extract_entities_incremental(chunks: List[Dict], output_file: str, print_raw
 
     print(f"待处理chunk数：{len(chunks_to_process)}，并发数：{max_workers}")
 
-    # 使用线程池并发处理
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_chunk = {
             executor.submit(process_single_chunk, chunk, print_raw_text, write_lock, output_file, processed_chunk_ids): chunk
@@ -155,49 +231,270 @@ def extract_entities_incremental(chunks: List[Dict], output_file: str, print_raw
 
     return results
 
-def merge_entities(entities_results: List[Dict], output_file: str):
-    """
-    合并所有实体，记录每个实体出现的chunk_id
-    """
-    entity_map = {}
+def compute_name_similarity(name1: str, name2: str) -> float:
+    return SequenceMatcher(None, name1, name2).ratio()
 
+def cluster_names_by_similarity(names: List[str], threshold: float = 0.8) -> List[List[str]]:
+    used = set()
+    clusters = []
+    for i, name1 in enumerate(names):
+        if name1 in used:
+            continue
+        group = [name1]
+        used.add(name1)
+        for name2 in names[i+1:]:
+            if name2 in used:
+                continue
+            if compute_name_similarity(name1, name2) >= threshold:
+                group.append(name2)
+                used.add(name2)
+        clusters.append(group)
+    return clusters
+
+def llm_judge_equivalent_names(name_list: List[str]) -> tuple:
+    if len(name_list) <= 1:
+        return True, name_list[0] if name_list else ""
+
+    prompt = f"""请判断以下技术实体名称是否指向同一个实体（即同义不同表述）。如果是，请给出一个最能代表该实体的标准名称（可以从列表中选择或适当合并）；如果不是，请输出"NOT_EQUIVALENT"。
+
+名称列表：
+{chr(10).join(f'- {n}' for n in name_list)}
+
+要求：
+- 仅当所有名称都明确指向同一故障现象、原因或逻辑组合时，才视为等价。
+- 输出格式为JSON：{{"equivalent": true/false, "standard_name": "标准名称"}}（若equivalent为false，standard_name可为空字符串）。
+- 只输出JSON，不要有其他解释。
+"""
+    context = "你是一个技术文档实体对齐专家。"
+    try:
+        response = call_llm(context, prompt)
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            return data.get("equivalent", False), data.get("standard_name", "")
+        else:
+            return False, ""
+    except Exception as e:
+        print(f"LLM判断名称等价失败: {e}")
+        return False, ""
+
+def generate_merge_prompt(instances: List[Dict]) -> str:
+    instance_texts = []
+    for idx, inst in enumerate(instances, 1):
+        instance_texts.append(f"""实例 {idx}:
+- 描述: {inst['description']}
+- 排查规则: {inst['rule']}
+- 调查方法: {inst['investigateMethod']}
+- 修复方法: {inst['repairMethod']}
+""")
+    instances_block = "\n".join(instance_texts)
+
+    prompt = f"""你是一个专业的技术文档整理专家。以下有多个描述同一个技术实体的文本片段（实体名称相同），它们可能来自不同文档或不同段落。请将这些片段中的信息合并成一份简洁、连贯、不重复的完整描述。
+
+要求：
+1. 对于“描述”字段：合并所有关键信息，去除重复，保留最完整、最准确的表述。
+2. 对于“排查规则”、“调查方法”、“修复方法”字段：合并所有不重复的步骤或要点，可以按逻辑顺序重新组织，但不要遗漏重要信息。
+3. 如果某个字段在所有实例中均为空，则输出空字符串。
+4. 输出格式为严格的 JSON 对象，包含以下四个字段：
+   {{
+     "description": "合并后的描述",
+     "rule": "合并后的排查规则",
+     "investigateMethod": "合并后的调查方法",
+     "repairMethod": "合并后的修复方法"
+   }}
+5. 只输出 JSON，不要有其他解释文字。
+
+待合并的实体实例：
+{instances_block}
+"""
+    return prompt
+
+def merge_entities_with_llm(instances: List[Dict]) -> Dict:
+    if not instances:
+        return {"description": "", "rule": "", "investigateMethod": "", "repairMethod": ""}
+    if len(instances) == 1:
+        return {
+            "description": instances[0]["description"],
+            "rule": instances[0]["rule"],
+            "investigateMethod": instances[0]["investigateMethod"],
+            "repairMethod": instances[0]["repairMethod"],
+        }
+
+    merge_prompt = generate_merge_prompt(instances)
+    context = "你是一个专业的技术文档整理助手，擅长合并多个来源的相同实体信息。"
+
+    max_retries = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            response_text = call_llm(context, merge_prompt)
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                merged = json.loads(json_match.group(0))
+                for field in ["description", "rule", "investigateMethod", "repairMethod"]:
+                    if field not in merged:
+                        merged[field] = ""
+                return merged
+            else:
+                raise ValueError("LLM 返回内容不包含有效 JSON")
+        except Exception as e:
+            print(f"LLM 合并实体失败 (尝试 {attempt}/{max_retries}): {e}")
+            if attempt == max_retries:
+                merged = {}
+                for field in ["description", "rule", "investigateMethod", "repairMethod"]:
+                    values = [inst[field] for inst in instances if inst[field]]
+                    unique_values = []
+                    for v in values:
+                        if v not in unique_values:
+                            unique_values.append(v)
+                    merged[field] = "; ".join(unique_values)
+                return merged
+    return {"description": "", "rule": "", "investigateMethod": "", "repairMethod": ""}
+
+def merge_entities(entities_results: List[Dict], output_file: str, max_workers: int = 5):
+    name_to_instances = {}
     for result in entities_results:
         chunk_id = result["chunk_id"]
         for entity in result["entities"]:
-            entity_name = entity["entity_name"]
-            entity_type = entity["entity_type"]
+            name = entity["name"]
+            if name not in name_to_instances:
+                name_to_instances[name] = []
+            instance = {
+                "description": entity["description"],
+                "rule": entity["rule"],
+                "investigateMethod": entity["investigateMethod"],
+                "repairMethod": entity["repairMethod"],
+                "entity_type": entity["entity_type"],
+                "errorLevel": entity["errorLevel"],
+                "priority": entity["priority"],
+                "probability": entity["probability"],
+                "showProbability": entity["showProbability"],
+                "documents": entity["documents"].copy(),
+                "source_chunk_ids": set(entity["source_chunk_ids"]),
+                "support_count": 1
+            }
+            name_to_instances[name].append(instance)
 
-            if entity_name in entity_map:
-                entity_map[entity_name]["chunk_ids"].add(chunk_id)
-            else:
-                entity_map[entity_name] = {
-                    "entity_name": entity_name,
-                    "entity_type": entity_type,
-                    "chunk_ids": {chunk_id}
-                }
+    if not name_to_instances:
+        save_json([], output_file)
+        return
 
-    merged_entities = [
-        {
-            "entity_name": entity["entity_name"],
-            "entity_type": entity["entity_type"],
-            "chunk_ids": list(entity["chunk_ids"]),
-            "count": len(entity["chunk_ids"])
+    print(f"合并前原始实体数量（不同标准化名称）: {len(name_to_instances)}")
+
+    all_names = list(name_to_instances.keys())
+    print(f"开始名称相似度聚类，共 {len(all_names)} 个名称...")
+    similarity_clusters = cluster_names_by_similarity(all_names, threshold=0.8)
+    print(f"相似度聚类完成，生成 {len(similarity_clusters)} 个候选组")
+
+    final_groups = []
+    name_to_standard = {}
+
+    def process_equivalence_cluster(cluster):
+        if len(cluster) == 1:
+            return cluster, True, cluster[0]
+        else:
+            equivalent, standard_name = llm_judge_equivalent_names(cluster)
+            return cluster, equivalent, standard_name
+
+    total_clusters = len(similarity_clusters)
+    print(f"开始对 {total_clusters} 个候选组进行并发 LLM 等价判断（并发数={max_workers}）...")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_cluster = {
+            executor.submit(process_equivalence_cluster, cluster): cluster
+            for cluster in similarity_clusters
         }
-        for entity in entity_map.values()
-    ]
+        for idx, future in enumerate(as_completed(future_to_cluster), 1):
+            if idx % 10 == 0 or idx == total_clusters:
+                print(f"  等价判断进度: {idx}/{total_clusters}")
+            cluster, equivalent, standard_name = future.result()
+            if equivalent and standard_name:
+                final_groups.append(cluster)
+                for name in cluster:
+                    name_to_standard[name] = standard_name
+            else:
+                for name in cluster:
+                    final_groups.append([name])
+                    name_to_standard[name] = name
+
+    print(f"开始合并文本字段，共 {len(final_groups)} 个实体组（并发数={max_workers}）...")
+
+    def process_merge_group(group):
+        all_instances = []
+        for name in group:
+            all_instances.extend(name_to_instances[name])
+        if not all_instances:
+            return None
+        standard_name = name_to_standard[group[0]]
+        merged_texts = merge_entities_with_llm(all_instances)
+        return {
+            "standard_name": standard_name,
+            "all_instances": all_instances,
+            "merged_texts": merged_texts
+        }
+
+    merge_results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_group = {
+            executor.submit(process_merge_group, group): group
+            for group in final_groups
+        }
+        for idx, future in enumerate(as_completed(future_to_group), 1):
+            if idx % 10 == 0 or idx == len(final_groups):
+                print(f"  文本合并进度: {idx}/{len(final_groups)}")
+            result = future.result()
+            if result:
+                merge_results.append(result)
+
+    merged_entities = []
+    for res in merge_results:
+        all_instances = res["all_instances"]
+        first = all_instances[0]
+        entity_type = first["entity_type"]
+        errorLevel = first["errorLevel"]
+        priority = first["priority"]
+        probability = first["probability"]
+        showProbability = first["showProbability"]
+
+        merged_docs = []
+        merged_chunk_ids = set()
+        for inst in all_instances:
+            for doc in inst["documents"]:
+                if not any(d.get("document_name") == doc.get("document_name") and d.get("source") == doc.get("source") for d in merged_docs):
+                    merged_docs.append(doc)
+            merged_chunk_ids.update(inst["source_chunk_ids"])
+
+        merged_entity = {
+            "name": res["standard_name"],
+            "entity_type": entity_type,
+            "description": res["merged_texts"]["description"],
+            "errorLevel": errorLevel,
+            "priority": priority,
+            "probability": probability,
+            "showProbability": showProbability,
+            "rule": res["merged_texts"]["rule"],
+            "investigateMethod": res["merged_texts"]["investigateMethod"],
+            "repairMethod": res["merged_texts"]["repairMethod"],
+            "documents": merged_docs,
+            "source_chunk_ids": list(merged_chunk_ids),
+            "support_count": len(merged_chunk_ids)
+        }
+        merged_entities.append(merged_entity)
 
     save_json(merged_entities, output_file)
 
 def main():
-    parser = argparse.ArgumentParser(description='实体识别和合并工具（支持多线程并发）')
+    parser = argparse.ArgumentParser(description='实体识别和合并工具（支持多线程并发，支持名称等价合并）')
     parser.add_argument('--input', '-i', required=True, help='输入chunks JSON文件路径')
-    parser.add_argument('--output-entities', '-oe', required=True, help='输出实体JSON文件路径')
+    parser.add_argument('--output-entities', '-oe', required=True, help='输出实体JSON文件路径（每行一个chunk结果）')
     parser.add_argument('--output-merged', '-om', required=True, help='输出合并实体JSON文件路径')
     parser.add_argument('--skip-entity-extraction', action='store_true', help='跳过实体提取，只进行合并')
     parser.add_argument('--print-raw-text', '-p', action='store_true', help='打印LLM返回的原始实体文本（用于调试）')
-    parser.add_argument('--max-workers', '-w', type=int, default=5, help='并发线程数（默认5）')
+    parser.add_argument('--max-workers', '-w', type=int, default=10, help='并发线程数（实体提取和合并共用，默认10）')
 
     args = parser.parse_args()
+
+    # === 新增：记录开始时间，重置 token 统计 ===
+    start_time = time.time()
+    reset_token_usage()
 
     print(f"正在加载chunks数据: {args.input}")
     with open(args.input, "r", encoding="utf-8") as f:
@@ -219,20 +516,20 @@ def main():
             print(f"错误: 实体结果文件不存在: {args.output_entities}")
             return
 
-    print(f"开始实体合并，结果将保存到: {args.output_merged}")
-    merge_entities(entities_results, args.output_merged)
+    print(f"开始实体合并（含名称等价判断和LLM智能合并，并发数={args.max_workers}），结果将保存到: {args.output_merged}")
+    merge_entities(entities_results, args.output_merged, max_workers=args.max_workers)
     print("实体合并完成")
 
     with open(args.output_merged, "r", encoding="utf-8") as f:
         merged_entities = json.load(f)
 
+    # === 新增：打印耗时和 token 统计 ===
+    elapsed = time.time() - start_time
+    usage = get_token_usage()
+    print(f"\n=== 实体提取与合并耗时: {elapsed:.2f} 秒 ===")
+    print(f"Token 用量: prompt={usage['prompt_tokens']}, completion={usage['completion_tokens']}, total={usage['total_tokens']}")
     print(f"\n=== 统计信息 ===")
-    print(f"总实体数量: {len(merged_entities)}")
-    # 可选：按类型统计
-    # type_counter = Counter(entity["entity_type"] for entity in merged_entities)
-    # print("实体类型分布:")
-    # for entity_type, count in type_counter.most_common():
-    #     print(f"  {entity_type}: {count}")
+    print(f"合并后实体数量: {len(merged_entities)}")
 
 if __name__ == "__main__":
     main()

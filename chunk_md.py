@@ -1,8 +1,10 @@
+# chunk_md.py
 import os
 import re
 import json
 import argparse
 import bisect
+import time   # === 新增 ===
 
 def save_json(data, file_path):
     with open(file_path, 'w', encoding='utf-8') as f:
@@ -28,7 +30,6 @@ def load_single_file(file_path):
     return file_name, content
 
 def extract_image_path(text):
-    """从给定文本中提取第一个 Markdown 图片路径，若无则返回空字符串"""
     match = re.search(r'!\[[^\]]*\]\(([^\s\)]+)(?:\s+["\'][^"\']*["\'])?\)', text)
     return match.group(1) if match else ""
 
@@ -47,7 +48,6 @@ def split_text_by_tables(text):
     n = len(lines)
 
     def is_md_table_start(idx):
-        """判断是否为 Markdown 表格起始行（当前行包含 |，且下一行是分隔线）"""
         if idx >= n - 1:
             return False
         line = lines[idx].strip()
@@ -79,7 +79,7 @@ def split_text_by_tables(text):
             while end_idx < n and depth > 0:
                 if '<table' in lines[end_idx].lower():
                     depth += 1
-                if '</table>' in lines[end_idx].lower():
+                if '<td>' in lines[end_idx].lower():
                     depth -= 1
                 end_idx += 1
         table_text = '\n'.join(lines[start_idx:end_idx])
@@ -105,12 +105,6 @@ def split_text_by_tables(text):
     return segments
 
 def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
-    """
-    分块策略：
-    1. 按标题（#）划分文档，每个标题及其后续内容构成一个逻辑块。
-    2. 每个逻辑块内，先通过 split_text_by_tables 分离表格和普通段落。
-    3. 表格段整体保留为一个块（不切分），普通段若超长则按换行符二次分割。
-    """
     lines_with_breaks = content.splitlines(keepends=True)
     line_starts = []
     pos = 0
@@ -256,7 +250,6 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
             continue
 
         source_line = get_line_number(title_start, line_starts)
-
         segments = split_text_by_tables(full_block)
 
         for seg_text, is_table in segments:
@@ -371,6 +364,9 @@ def main():
     parser.add_argument('--chunk_size', '-s', type=int, default=800, help='分块大小（字符数）')
     args = parser.parse_args()
 
+    # === 新增：记录开始时间 ===
+    start_time = time.time()
+
     if os.path.isdir(args.input):
         print(f"❌ 错误: 输入路径 '{args.input}' 是一个文件夹，请提供具体的文件路径。")
         return
@@ -382,6 +378,10 @@ def main():
         print(f"📊 共生成 {len(chunks)} 个文本块")
     else:
         print("⚠️ 未生成任何分块结果")
+
+    # === 新增：打印耗时 ===
+    elapsed = time.time() - start_time
+    print(f"\n=== 文档分块耗时: {elapsed:.2f} 秒 ===")
 
 if __name__ == "__main__":
     main()
