@@ -69,6 +69,11 @@ class PipelineJobRequest(BaseModel):
     )
     # 下游（FTA-GNR）版本化知识库模式禁止 clear_graph=true
     clear_graph_before_import: bool = False
+    # 同步到 FTA-GNR 时显式传入，需与 chunks/relations 产物中的 file_id 一致（通常为 pdf_stem）
+    file_name: Optional[str] = Field(
+        None,
+        description="展示用原始文件名；缺省时用 pdf_path 的文件名或 {pdf_stem}.pdf",
+    )
 
 
 class Neo4jImportRequest(BaseModel):
@@ -191,7 +196,23 @@ def _build_artifacts_for_dir(pdf_stem: str, result_dir: Path) -> Dict[str, str]:
 
 
 
-def _build_generate_fta_contract(artifacts: Dict[str, str], base_url: str, clear_graph: bool) -> Dict[str, object]:
+def _resolve_import_display_file_name(request: PipelineJobRequest, pdf_stem: str) -> str:
+    explicit = (request.file_name or "").strip()
+    if explicit:
+        return explicit
+    if request.pdf_path:
+        return Path(request.pdf_path).name
+    return f"{pdf_stem}.pdf"
+
+
+def _build_generate_fta_contract(
+    artifacts: Dict[str, str],
+    base_url: str,
+    clear_graph: bool,
+    *,
+    pdf_stem: str,
+    file_name: str,
+) -> Dict[str, object]:
     endpoint = base_url.rstrip("/") + "/api/integration/import-knowledge-artifacts"
     payload = {
         "chunks_file": artifacts["chunks_json"],
@@ -200,6 +221,8 @@ def _build_generate_fta_contract(artifacts: Dict[str, str], base_url: str, clear
         "clear_graph": clear_graph,
         "import_relations": True,
         "source": "knowledge_base_construction",
+        "file_id": pdf_stem,
+        "file_name": file_name,
     }
     return {
         "generate_fta_endpoint": endpoint,
@@ -213,8 +236,14 @@ def _build_generate_fta_contract(artifacts: Dict[str, str], base_url: str, clear
 
 
 
-def _post_generate_fta_import(job_id: str, request: PipelineJobRequest, artifacts: Dict[str, str]) -> Dict[str, object]:
+def _post_generate_fta_import(
+    job_id: str,
+    request: PipelineJobRequest,
+    artifacts: Dict[str, str],
+    pdf_stem: str,
+) -> Dict[str, object]:
     endpoint = request.generate_fta_base_url.rstrip("/") + "/api/integration/import-knowledge-artifacts"
+    display_name = _resolve_import_display_file_name(request, pdf_stem)
     payload = {
         "chunks_file": artifacts["chunks_json"],
         "entities_file": None if request.skip_entity else artifacts["entities_merged_json"],
@@ -223,6 +252,9 @@ def _post_generate_fta_import(job_id: str, request: PipelineJobRequest, artifact
         "clear_graph": request.clear_graph_before_import,
         "import_relations": not request.skip_relation,
         "source": f"knowledge_base_construction:{job_id}",
+        # 与产物内 file_id 对齐，避免 GNR 自建 file_* 导致 Mongo/Neo4j 与 chunks 元数据分裂
+        "file_id": pdf_stem,
+        "file_name": display_name,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib_request.Request(
@@ -245,6 +277,7 @@ def _post_generate_fta_import(job_id: str, request: PipelineJobRequest, artifact
 
 def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
     pdf_stem = _resolve_pdf_stem(request.pdf_path, request.pdf_stem, request.import_only_dir)
+    display_file_name = _resolve_import_display_file_name(request, pdf_stem)
     artifacts = _build_artifacts(pdf_stem, request.output_dir, request.import_only_dir)
     started_at = time.time()
 
@@ -279,7 +312,13 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
             "request": request.model_dump(),
             "pdf_stem": pdf_stem,
             "artifacts": artifacts,
-            "integration": _build_generate_fta_contract(artifacts, request.generate_fta_base_url, request.clear_graph_before_import),
+            "integration": _build_generate_fta_contract(
+                artifacts,
+                request.generate_fta_base_url,
+                request.clear_graph_before_import,
+                pdf_stem=pdf_stem,
+                file_name=display_file_name,
+            ),
             "command": cmd,
         },
     )
@@ -432,7 +471,7 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
     _update_stage("syncing", "同步到故障树后端（导入 chunks/entities/relations）…")
     _set_job(job_id, {**base_patch, "status": "syncing", "sync_status": "running"})
     try:
-        sync_response = _post_generate_fta_import(job_id, request, artifacts)
+        sync_response = _post_generate_fta_import(job_id, request, artifacts, pdf_stem)
         _set_job(
             job_id,
             {
@@ -519,6 +558,7 @@ def run_pipeline_job(request: PipelineJobRequest):
         raise HTTPException(status_code=500, detail="找不到 run.py，无法启动知识库构建流水线")
 
     pdf_stem = _resolve_pdf_stem(normalized_request.pdf_path, normalized_request.pdf_stem, normalized_request.import_only_dir)
+    display_file_name = _resolve_import_display_file_name(normalized_request, pdf_stem)
     artifacts = _build_artifacts(pdf_stem, normalized_request.output_dir, normalized_request.import_only_dir)
     job_id = f"kb_{uuid.uuid4().hex[:12]}"
 
@@ -540,6 +580,8 @@ def run_pipeline_job(request: PipelineJobRequest):
                 artifacts,
                 normalized_request.generate_fta_base_url,
                 normalized_request.clear_graph_before_import,
+                pdf_stem=pdf_stem,
+                file_name=display_file_name,
             ),
         },
     )
@@ -626,6 +668,7 @@ async def run_pipeline_job_upload(
         sync_to_generate_fta=bool(sync_to_generate_fta),
         generate_fta_base_url=str(generate_fta_base_url or DEFAULT_GENERATE_FTA_BASE_URL),
         clear_graph_before_import=bool(clear_graph_before_import),
+        file_name=safe_name,
     )
     resp = run_pipeline_job(req)
     try:
