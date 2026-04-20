@@ -1415,7 +1415,7 @@ def api_generate(req: GenerateRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Prompt parse failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Top event resolution failed: {exc}")
 
     requested_top_event = resolution["requested_top_event"]
     requirements = resolution.get("requirements", "")

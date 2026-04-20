@@ -19,6 +19,7 @@ from openai import OpenAI
 
 from config import (
     EMBEDDING_API_KEY,
+    EMBEDDING_BATCH_SIZE,
     EMBEDDING_BASE_URL,
     EMBEDDING_MODEL,
     SEMANTIC_SIMILARITY_THRESHOLD,
@@ -123,7 +124,7 @@ def _embed_strings_ordered(strings: List[str]) -> List[Optional[List[float]]]:
             to_request.append(text)
             request_slot.append(i)
 
-    batch_size = 64
+    batch_size = max(1, int(EMBEDDING_BATCH_SIZE or 10))
     for start in range(0, len(to_request), batch_size):
         chunk = to_request[start : start + batch_size]
         try:

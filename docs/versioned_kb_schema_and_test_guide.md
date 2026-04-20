@@ -169,6 +169,7 @@
 - 当前 scope 下如果没有 `top_event_catalog`，后端会先按选中的 `file_version_id` 自动重建目录
 - 如果没有精确命中，则在当前 scope 的 `top_event_catalog` 内做向量/语义匹配，并把候选返回给用户确认
 - 若未配置 `EMBEDDING_MODEL` 或向量请求失败，则回退为基于名称的 lexical 候选排序
+- 若使用阿里云百炼 OpenAI 兼容 embedding，建议配置 `EMBEDDING_BATCH_SIZE=10`
 
 用途：
 

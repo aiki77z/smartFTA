@@ -12,6 +12,7 @@ from pymongo import ASCENDING, DESCENDING, MongoClient
 
 from config import (
     EMBEDDING_API_KEY,
+    EMBEDDING_BATCH_SIZE,
     EMBEDDING_BASE_URL,
     EMBEDDING_MODEL,
     MONGO_DB_NAME,
@@ -159,7 +160,7 @@ def _embed_strings_ordered(strings: List[str]) -> List[Optional[List[float]]]:
             to_request.append(text)
             request_slots.append(index)
 
-    batch_size = 64
+    batch_size = max(1, int(EMBEDDING_BATCH_SIZE or 10))
     for start in range(0, len(to_request), batch_size):
         chunk = to_request[start : start + batch_size]
         try:
@@ -2219,7 +2220,7 @@ def search_top_event_catalog_semantic(
     if version_filter:
         query = {"$and": [query, version_filter]}
 
-    docs = list(top_event_catalog_col.find(query, {"_id": 0}))
+    docs = list(top_event_catalog_col.find(query))
     if not docs:
         return []
 
