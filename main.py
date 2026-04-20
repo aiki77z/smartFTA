@@ -20,6 +20,8 @@ from database import (
     activate_file_version,
     archive_file,
     append_generation_job_item_event,
+    assert_chunk_artifacts_align_with_file_version,
+    assert_relation_artifacts_align_with_file_version,
     claim_generation_job_item,
     collect_subgraph_chunks,
     create_file_version_record,
@@ -1450,6 +1452,7 @@ class KnowledgeArtifactsImportRequest(BaseModel):
     relations_file: Optional[str] = None
     file_id: Optional[str] = None
     file_name: Optional[str] = None
+    file_version_id: Optional[str] = None
     chunks_import_mode: str = "replace"
     clear_graph: bool = False
     import_relations: bool = True
@@ -1604,6 +1607,12 @@ def _import_relations_from_file(
     if not NEO4J_PASSWORD:
         raise ValueError("未配置 NEO4J_PASSWORD，无法导入图谱关系")
 
+    raw_rows = load_json(relations_file, is_active=True)
+    assert_relation_artifacts_align_with_file_version(
+        raw_rows,
+        file_id=file_id,
+        file_version_id=file_version_id,
+    )
     rows = load_json(
         relations_file,
         file_id=file_id,
@@ -1757,12 +1766,18 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
         file_version = create_file_version_record(
             file_name=file_name,
             file_id=req.file_id,
+            file_version_id=req.file_version_id,
             source=req.source,
             metadata={
                 "chunks_file": str(chunks_path),
                 "entities_file": str(entities_path) if entities_path else None,
                 "relations_file": str(relations_path) if relations_path else None,
             },
+        )
+        assert_chunk_artifacts_align_with_file_version(
+            chunks,
+            file_id=file_version["file_id"],
+            file_version_id=file_version["file_version_id"],
         )
 
         chunk_import_result = import_chunks_to_db(

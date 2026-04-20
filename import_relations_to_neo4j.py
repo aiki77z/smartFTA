@@ -123,9 +123,9 @@ def _normalize_relation(
 
     return {
         "chunk_id": chunk_id,
-        "file_id": _clean(rel.get("file_id")) or _clean(file_id),
-        "file_version_id": _clean(rel.get("file_version_id")) or _clean(file_version_id),
-        "file_name": _clean(rel.get("file_name")) or _clean(file_name),
+        "file_id": _clean(file_id) or _clean(rel.get("file_id")),
+        "file_version_id": _clean(file_version_id) or _clean(rel.get("file_version_id")),
+        "file_name": _clean(file_name) or _clean(rel.get("file_name")),
         "is_active": bool(rel.get("is_active", is_active)),
         "entity1": entity1,
         "entity2": entity2,

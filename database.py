@@ -324,14 +324,95 @@ def _normalize_chunk_import_doc(
         normalized["chunk_id"] = doc_id
     if doc_id in (None, "") and chunk_id not in (None, ""):
         normalized["id"] = chunk_id
-    normalized_file_id = _normalize_identifier(normalized.get("file_id")) or _normalize_identifier(file_id)
-    normalized_file_version_id = _normalize_identifier(normalized.get("file_version_id")) or _normalize_identifier(file_version_id)
+    normalized_file_id = _normalize_identifier(file_id) or _normalize_identifier(normalized.get("file_id"))
+    normalized_file_version_id = _normalize_identifier(file_version_id) or _normalize_identifier(normalized.get("file_version_id"))
     normalized["file_id"] = normalized_file_id
     normalized["file_version_id"] = normalized_file_version_id
     normalized["is_active"] = bool(normalized.get("is_active", is_active))
     if normalized_file_version_id and normalized.get("chunk_id") not in (None, ""):
         normalized["chunk_uid"] = _make_chunk_ref(normalized_file_version_id, normalized.get("chunk_id"))
     return normalized
+
+
+def _format_scope_mismatch_examples(mismatches: List[str], *, max_items: int = 5) -> str:
+    preview = mismatches[:max_items]
+    suffix = "" if len(mismatches) <= max_items else f" ... (+{len(mismatches) - max_items} more)"
+    return "; ".join(preview) + suffix
+
+
+def assert_chunk_artifacts_align_with_file_version(
+    chunks: List[Dict[str, Any]],
+    *,
+    file_id: str,
+    file_version_id: str,
+) -> None:
+    normalized_file_id = _normalize_identifier(file_id)
+    normalized_file_version_id = _normalize_identifier(file_version_id)
+    mismatches: List[str] = []
+    for index, chunk in enumerate(chunks or []):
+        if not isinstance(chunk, dict):
+            continue
+        chunk_label = _normalize_identifier(chunk.get("chunk_id") or chunk.get("id")) or f"index={index}"
+        embedded_file_id = _normalize_identifier(chunk.get("file_id"))
+        embedded_file_version_id = _normalize_identifier(chunk.get("file_version_id"))
+        if embedded_file_id and embedded_file_id != normalized_file_id:
+            mismatches.append(
+                f"chunk {chunk_label} file_id={embedded_file_id} != expected {normalized_file_id}"
+            )
+        if embedded_file_version_id and embedded_file_version_id != normalized_file_version_id:
+            mismatches.append(
+                f"chunk {chunk_label} file_version_id={embedded_file_version_id} != expected {normalized_file_version_id}"
+            )
+    if mismatches:
+        raise ValueError(
+            "Chunk artifacts do not align with target file version: "
+            + _format_scope_mismatch_examples(mismatches)
+        )
+
+
+def assert_relation_artifacts_align_with_file_version(
+    relation_rows: List[Dict[str, Any]],
+    *,
+    file_id: str,
+    file_version_id: str,
+) -> None:
+    normalized_file_id = _normalize_identifier(file_id)
+    normalized_file_version_id = _normalize_identifier(file_version_id)
+    mismatches: List[str] = []
+    for row_index, row in enumerate(relation_rows or []):
+        if not isinstance(row, dict):
+            continue
+        chunk_label = _normalize_identifier(row.get("chunk_id")) or f"row={row_index}"
+        row_file_id = _normalize_identifier(row.get("file_id"))
+        row_file_version_id = _normalize_identifier(row.get("file_version_id"))
+        if row_file_id and row_file_id != normalized_file_id:
+            mismatches.append(
+                f"relation row {chunk_label} file_id={row_file_id} != expected {normalized_file_id}"
+            )
+        if row_file_version_id and row_file_version_id != normalized_file_version_id:
+            mismatches.append(
+                f"relation row {chunk_label} file_version_id={row_file_version_id} != expected {normalized_file_version_id}"
+            )
+        for rel_index, rel in enumerate(row.get("relations") or []):
+            if not isinstance(rel, dict):
+                continue
+            rel_file_id = _normalize_identifier(rel.get("file_id"))
+            rel_file_version_id = _normalize_identifier(rel.get("file_version_id"))
+            rel_label = (
+                f"relation row {chunk_label} item={rel_index} "
+                f"({rel.get('entity1') or '?'}->{rel.get('entity2') or '?'})"
+            )
+            if rel_file_id and rel_file_id != normalized_file_id:
+                mismatches.append(f"{rel_label} file_id={rel_file_id} != expected {normalized_file_id}")
+            if rel_file_version_id and rel_file_version_id != normalized_file_version_id:
+                mismatches.append(
+                    f"{rel_label} file_version_id={rel_file_version_id} != expected {normalized_file_version_id}"
+                )
+    if mismatches:
+        raise ValueError(
+            "Relation artifacts do not align with target file version: "
+            + _format_scope_mismatch_examples(mismatches)
+        )
 
 
 def _coerce_int_identifier(value: Any) -> Optional[int]:
@@ -1334,8 +1415,8 @@ def import_entity_reverse_index(
         if not isinstance(entry, dict):
             continue
         copied = dict(entry)
-        copied["file_id"] = _normalize_identifier(copied.get("file_id")) or _normalize_identifier(file_id)
-        copied["file_version_id"] = _normalize_identifier(copied.get("file_version_id")) or _normalize_identifier(file_version_id)
+        copied["file_id"] = _normalize_identifier(file_id) or _normalize_identifier(copied.get("file_id"))
+        copied["file_version_id"] = _normalize_identifier(file_version_id) or _normalize_identifier(copied.get("file_version_id"))
         copied["is_active"] = bool(copied.get("is_active", is_active))
         scoped_entries.append(copied)
 
@@ -1505,10 +1586,34 @@ def get_file_version(file_version_id: str) -> Optional[Dict[str, Any]]:
     return _strip_mongo_id(file_versions_col.find_one({"file_version_id": file_version_id}))
 
 
+def _parse_version_no_from_explicit_file_version_id(
+    file_version_id: str,
+    *,
+    file_id: Optional[str] = None,
+) -> tuple[str, int]:
+    normalized_file_version_id = _normalize_identifier(file_version_id)
+    match = re.fullmatch(r"(.+)_v(\d+)", normalized_file_version_id)
+    if not match:
+        raise ValueError(
+            f"Invalid file_version_id '{normalized_file_version_id}', expected format '<file_id>_v<version_no>'"
+        )
+    parsed_file_id = _normalize_identifier(match.group(1))
+    version_no = int(match.group(2))
+    normalized_file_id = _normalize_identifier(file_id)
+    if normalized_file_id and parsed_file_id != normalized_file_id:
+        raise ValueError(
+            f"file_version_id '{normalized_file_version_id}' does not belong to file_id '{normalized_file_id}'"
+        )
+    if version_no <= 0:
+        raise ValueError(f"Invalid version number in file_version_id '{normalized_file_version_id}'")
+    return parsed_file_id, version_no
+
+
 def create_file_version_record(
     *,
     file_name: str,
     file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
     source: str = "knowledge_import",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -1517,16 +1622,30 @@ def create_file_version_record(
         raise ValueError("file_name is required")
 
     now = _now()
+    normalized_explicit_file_version_id = _normalize_identifier(file_version_id)
+    explicit_file_id = ""
+    explicit_version_no: Optional[int] = None
+    if normalized_explicit_file_version_id:
+        explicit_file_id, explicit_version_no = _parse_version_no_from_explicit_file_version_id(
+            normalized_explicit_file_version_id,
+            file_id=file_id,
+        )
+
     file_doc = None
-    normalized_file_id = _normalize_identifier(file_id)
+    normalized_file_id = _normalize_identifier(file_id) or explicit_file_id
     if normalized_file_id:
         file_doc = files_col.find_one({"_id": normalized_file_id})
     if not file_doc:
         file_doc = files_col.find_one({"normalized_name": normalized_file_name})
+        if file_doc and normalized_file_id and file_doc.get("_id") != normalized_file_id:
+            raise ValueError(
+                f"file_name '{file_name}' is already associated with file_id '{file_doc.get('_id')}', "
+                f"not '{normalized_file_id}'"
+            )
 
     if file_doc:
         normalized_file_id = file_doc["_id"]
-        version_no = int(file_doc.get("latest_version_no") or 0) + 1
+        version_no = explicit_version_no if explicit_version_no is not None else int(file_doc.get("latest_version_no") or 0) + 1
         files_col.update_one(
             {"_id": normalized_file_id},
             {
@@ -1541,7 +1660,7 @@ def create_file_version_record(
         )
     else:
         normalized_file_id = normalized_file_id or f"file_{uuid4().hex[:12]}"
-        version_no = 1
+        version_no = explicit_version_no if explicit_version_no is not None else 1
         files_col.insert_one(
             {
                 "_id": normalized_file_id,
@@ -1550,17 +1669,49 @@ def create_file_version_record(
                 "normalized_name": normalized_file_name,
                 "status": "processing",
                 "source": source,
-                "latest_version_no": 0,
+                "latest_version_no": int(version_no or 0),
                 "current_file_version_id": None,
                 "created_at": now,
                 "updated_at": now,
             }
         )
 
-    file_version_id = f"{normalized_file_id}_v{version_no}"
+    if explicit_version_no is not None:
+        files_col.update_one(
+            {"_id": normalized_file_id},
+            {
+                "$max": {"latest_version_no": explicit_version_no},
+                "$set": {"updated_at": now},
+            },
+        )
+
+    resolved_file_version_id = normalized_explicit_file_version_id or f"{normalized_file_id}_v{version_no}"
+    existing_version = file_versions_col.find_one({"_id": resolved_file_version_id})
+    if existing_version:
+        if existing_version.get("file_id") != normalized_file_id:
+            raise ValueError(
+                f"file_version_id '{resolved_file_version_id}' is already bound to file_id '{existing_version.get('file_id')}'"
+            )
+        file_versions_col.update_one(
+            {"_id": resolved_file_version_id},
+            {
+                "$set": {
+                    "file_name": file_name,
+                    "normalized_file_name": normalized_file_name,
+                    "version_no": int(existing_version.get("version_no") or version_no),
+                    "status": "processing",
+                    "is_active": False,
+                    "source": source,
+                    "metadata": metadata or {},
+                    "updated_at": now,
+                }
+            },
+        )
+        return get_file_version(resolved_file_version_id) or {}
+
     doc = {
-        "_id": file_version_id,
-        "file_version_id": file_version_id,
+        "_id": resolved_file_version_id,
+        "file_version_id": resolved_file_version_id,
         "file_id": normalized_file_id,
         "file_name": file_name,
         "normalized_file_name": normalized_file_name,
