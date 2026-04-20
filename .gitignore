@@ -29,4 +29,7 @@ Thumbs.db
 # Logs
 *.txt
 
+# test_files
+*.pdf
+
 uploads/

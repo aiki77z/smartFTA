@@ -185,7 +185,6 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
 
     pending_chunks = []
     for chunk in chunks:
-        # 修复：正确处理 chunk_id 为 0 的情况（不能使用 or 短路，因为 0 是 falsy）
         chunk_id_val = chunk.get("chunk_id")
         if chunk_id_val is None:
             chunk_id_val = chunk.get("id")
@@ -205,6 +204,12 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
     def process_one(chunk_id: str, chunk: Dict):
         chunk_name = chunk.get("chunk_name") or "未知文档"
         content = chunk.get("content", "")
+        
+        # 提取 chunk 元数据（用于输出）
+        file_id = chunk.get("file_id", "")
+        file_version_id = chunk.get("file_version_id", "")
+        is_active = chunk.get("is_active", True)
+        file_name = chunk.get("file", "")  # 原始文件名
         
         # 拼接章节信息
         title_parts = []
@@ -267,10 +272,37 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
                             elif relation_type == "修复":
                                 ent2.setdefault("repair_methods", []).append(ent1.get("name") or ent1.get("entity_name"))
                         else:
+                            # 构建实体属性，并补充元数据、转换 documents 格式
+                            props1 = build_entity_props(ent1)
+                            props2 = build_entity_props(ent2)
+                            
+                            # 添加 chunk 元数据到 props
+                            for props in (props1, props2):
+                                props["file_id"] = file_id
+                                props["file_version_id"] = file_version_id
+                                props["is_active"] = is_active
+                                # 转换 documents 格式：使用 source_chunk_ids 生成 [{"chunk_id": ...}]
+                                source_ids = props.get("source_chunk_ids", [])
+                                if source_ids:
+                                    props["documents"] = [{"chunk_id": cid} for cid in source_ids]
+                                else:
+                                    props["documents"] = []
+                                # 确保 normalized_name 经过标准化
+                                raw_name = props.get("name", "")
+                                props["normalized_name"] = normalize_entity_name(raw_name)
+                            
                             rel["entity1_type"] = ent1.get("entity_type", "")
                             rel["entity2_type"] = ent2.get("entity_type", "")
-                            rel["entity1_props"] = build_entity_props(ent1)
-                            rel["entity2_props"] = build_entity_props(ent2)
+                            rel["entity1_props"] = props1
+                            rel["entity2_props"] = props2
+                            
+                            # 为每个关系添加 chunk 元数据
+                            rel["chunk_id"] = chunk_id
+                            rel["file_id"] = file_id
+                            rel["file_version_id"] = file_version_id
+                            rel["file_name"] = file_name
+                            rel["is_active"] = is_active
+                            
                             valid_relations.append(rel)
                     else:
                         if print_raw_text:
@@ -278,6 +310,10 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
 
             result = {
                 "chunk_id": chunk_id,
+                "file_id": file_id,
+                "file_version_id": file_version_id,
+                "file_name": file_name,
+                "is_active": is_active,
                 "relations": valid_relations,
             }
             print(f"chunk {chunk_id} 提取有效关系数：{len(valid_relations)}")
@@ -387,7 +423,7 @@ def main():
     all_relations = []
     for result in relations_results:
         for rel in result.get("relations", []):
-            rel["chunk_id"] = result["chunk_id"]
+            # 确保每个关系已有 chunk_id 等字段（已在 process_one 中添加）
             all_relations.append(rel)
     save_relations_to_csv_second(all_relations, args.output_csv)
     print(f"CSV转换完成，共 {len(all_relations)} 个关系")

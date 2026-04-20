@@ -4,7 +4,7 @@ import re
 import json
 import argparse
 import bisect
-import time   # === 新增 ===
+import time
 
 def save_json(data, file_path):
     with open(file_path, 'w', encoding='utf-8') as f:
@@ -29,9 +29,14 @@ def load_single_file(file_path):
     file_name = os.path.splitext(os.path.basename(file_path))[0]
     return file_name, content
 
-def extract_image_path(text):
-    match = re.search(r'!\[[^\]]*\]\(([^\s\)]+)(?:\s+["\'][^"\']*["\'])?\)', text)
-    return match.group(1) if match else ""
+def extract_image_paths(text):
+    """
+    提取文本中所有 Markdown 图片路径，返回列表。
+    匹配格式: ![alt](path) 或 ![alt](path "title")
+    """
+    pattern = r'!\[[^\]]*\]\(([^\s\)]+)(?:\s+["\'][^"\']*["\'])?\)'
+    matches = re.findall(pattern, text)
+    return matches  # 返回列表，可能为空
 
 def get_line_number(pos, line_starts):
     idx = bisect.bisect_right(line_starts, pos) - 1
@@ -79,7 +84,7 @@ def split_text_by_tables(text):
             while end_idx < n and depth > 0:
                 if '<table' in lines[end_idx].lower():
                     depth += 1
-                if '<td>' in lines[end_idx].lower():
+                if '<tr>' in lines[end_idx].lower():
                     depth -= 1
                 end_idx += 1
         table_text = '\n'.join(lines[start_idx:end_idx])
@@ -104,7 +109,7 @@ def split_text_by_tables(text):
                 segments.append((para_text, False))
     return segments
 
-def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
+def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id, file_version_id):
     lines_with_breaks = content.splitlines(keepends=True)
     line_starts = []
     pos = 0
@@ -132,20 +137,24 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
         if len(block_content) <= chunk_size:
             line_no = get_line_number(0, line_starts)
             chunk_obj = {
-                "id": 0,
+                "id": "0",
                 "chunk_name": doc_name,
-                "key_word": "",
                 "content": block_content,
                 "chapter": "",
                 "section": "",
                 "subsection": "",
                 "section_path": "0.0.0",
                 "source": line_no,
-                "file": source_file
+                "file": source_file,
+                "chunk_id": "0",
+                "file_id": file_id,
+                "file_version_id": file_version_id,
+                "is_active": True,
+                "chunk_uid": f"{file_version_id}::0"
             }
-            img = extract_image_path(block_content)
-            if img:
-                chunk_obj["image_path"] = img
+            img_paths = extract_image_paths(block_content)
+            if img_paths:
+                chunk_obj["image_paths"] = img_paths
             if block_content.strip():
                 all_chunks.append(chunk_obj)
         else:
@@ -159,20 +168,24 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
                     chunk_text = ''.join(current_lines)
                     line_no = get_line_number(line_starts[0], line_starts)
                     chunk_obj = {
-                        "id": chunk_id,
+                        "id": str(chunk_id),
                         "chunk_name": doc_name,
-                        "key_word": "",
                         "content": chunk_text,
                         "chapter": "",
                         "section": "",
                         "subsection": "",
                         "section_path": "0.0.0",
                         "source": line_no,
-                        "file": source_file
+                        "file": source_file,
+                        "chunk_id": str(chunk_id),
+                        "file_id": file_id,
+                        "file_version_id": file_version_id,
+                        "is_active": True,
+                        "chunk_uid": f"{file_version_id}::{chunk_id}"
                     }
-                    img = extract_image_path(chunk_text)
-                    if img:
-                        chunk_obj["image_path"] = img
+                    img_paths = extract_image_paths(chunk_text)
+                    if img_paths:
+                        chunk_obj["image_paths"] = img_paths
                     if chunk_text.strip():
                         all_chunks.append(chunk_obj)
                         chunk_id += 1
@@ -184,20 +197,24 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
                 chunk_text = ''.join(current_lines)
                 line_no = get_line_number(line_starts[0], line_starts)
                 chunk_obj = {
-                    "id": chunk_id,
+                    "id": str(chunk_id),
                     "chunk_name": doc_name,
-                    "key_word": "",
                     "content": chunk_text,
                     "chapter": "",
                     "section": "",
                     "subsection": "",
                     "section_path": "0.0.0",
                     "source": line_no,
-                    "file": source_file
+                    "file": source_file,
+                    "chunk_id": str(chunk_id),
+                    "file_id": file_id,
+                    "file_version_id": file_version_id,
+                    "is_active": True,
+                    "chunk_uid": f"{file_version_id}::{chunk_id}"
                 }
-                img = extract_image_path(chunk_text)
-                if img:
-                    chunk_obj["image_path"] = img
+                img_paths = extract_image_paths(chunk_text)
+                if img_paths:
+                    chunk_obj["image_paths"] = img_paths
                 if chunk_text.strip():
                     all_chunks.append(chunk_obj)
         return all_chunks
@@ -257,10 +274,10 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
                 continue
 
             if is_table:
+                # 表格段落：不进行长度切分，直接作为一个块
                 chunk_obj = {
-                    "id": chunk_id,
+                    "id": str(chunk_id),
                     "chunk_name": doc_name,
-                    "key_word": "",
                     "content": seg_text,
                     "chapter": cur_chapter_name,
                     "section": cur_section_name,
@@ -268,30 +285,40 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
                     "section_path": f"{cur_chapter_num}.{cur_section_num}.{cur_subsection_num}",
                     "source": source_line,
                     "file": source_file,
+                    "chunk_id": str(chunk_id),
+                    "file_id": file_id,
+                    "file_version_id": file_version_id,
+                    "is_active": True,
+                    "chunk_uid": f"{file_version_id}::{chunk_id}",
                     "table": seg_text
                 }
-                img = extract_image_path(seg_text)
-                if img:
-                    chunk_obj["image_path"] = img
+                img_paths = extract_image_paths(seg_text)
+                if img_paths:
+                    chunk_obj["image_paths"] = img_paths
                 all_chunks.append(chunk_obj)
                 chunk_id += 1
             else:
+                # 普通段落：可能超过 chunk_size 需要切分
                 if len(seg_text) <= chunk_size:
                     chunk_obj = {
-                        "id": chunk_id,
+                        "id": str(chunk_id),
                         "chunk_name": doc_name,
-                        "key_word": "",
                         "content": seg_text,
                         "chapter": cur_chapter_name,
                         "section": cur_section_name,
                         "subsection": cur_subsection_name,
                         "section_path": f"{cur_chapter_num}.{cur_section_num}.{cur_subsection_num}",
                         "source": source_line,
-                        "file": source_file
+                        "file": source_file,
+                        "chunk_id": str(chunk_id),
+                        "file_id": file_id,
+                        "file_version_id": file_version_id,
+                        "is_active": True,
+                        "chunk_uid": f"{file_version_id}::{chunk_id}"
                     }
-                    img = extract_image_path(seg_text)
-                    if img:
-                        chunk_obj["image_path"] = img
+                    img_paths = extract_image_paths(seg_text)
+                    if img_paths:
+                        chunk_obj["image_paths"] = img_paths
                     all_chunks.append(chunk_obj)
                     chunk_id += 1
                 else:
@@ -304,20 +331,24 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
                             chunk_text = ''.join(current_lines)
                             if chunk_text.strip():
                                 chunk_obj = {
-                                    "id": chunk_id,
+                                    "id": str(chunk_id),
                                     "chunk_name": doc_name,
-                                    "key_word": "",
                                     "content": chunk_text,
                                     "chapter": cur_chapter_name,
                                     "section": cur_section_name,
                                     "subsection": cur_subsection_name,
                                     "section_path": f"{cur_chapter_num}.{cur_section_num}.{cur_subsection_num}",
                                     "source": source_line,
-                                    "file": source_file
+                                    "file": source_file,
+                                    "chunk_id": str(chunk_id),
+                                    "file_id": file_id,
+                                    "file_version_id": file_version_id,
+                                    "is_active": True,
+                                    "chunk_uid": f"{file_version_id}::{chunk_id}"
                                 }
-                                img = extract_image_path(chunk_text)
-                                if img:
-                                    chunk_obj["image_path"] = img
+                                img_paths = extract_image_paths(chunk_text)
+                                if img_paths:
+                                    chunk_obj["image_paths"] = img_paths
                                 all_chunks.append(chunk_obj)
                                 chunk_id += 1
                             current_lines = []
@@ -328,32 +359,36 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file):
                         chunk_text = ''.join(current_lines)
                         if chunk_text.strip():
                             chunk_obj = {
-                                "id": chunk_id,
+                                "id": str(chunk_id),
                                 "chunk_name": doc_name,
-                                "key_word": "",
                                 "content": chunk_text,
                                 "chapter": cur_chapter_name,
                                 "section": cur_section_name,
                                 "subsection": cur_subsection_name,
                                 "section_path": f"{cur_chapter_num}.{cur_section_num}.{cur_subsection_num}",
                                 "source": source_line,
-                                "file": source_file
+                                "file": source_file,
+                                "chunk_id": str(chunk_id),
+                                "file_id": file_id,
+                                "file_version_id": file_version_id,
+                                "is_active": True,
+                                "chunk_uid": f"{file_version_id}::{chunk_id}"
                             }
-                            img = extract_image_path(chunk_text)
-                            if img:
-                                chunk_obj["image_path"] = img
+                            img_paths = extract_image_paths(chunk_text)
+                            if img_paths:
+                                chunk_obj["image_paths"] = img_paths
                             all_chunks.append(chunk_obj)
                             chunk_id += 1
 
     return all_chunks
 
-def process_single_document_flow(input_file_path, chunk_size):
+def process_single_document_flow(input_file_path, chunk_size, file_id, file_version_id):
     doc_name, content = load_single_file(input_file_path)
     if not content:
         print("内容为空，跳过处理。")
         return []
     all_chunks = parse_markdown_hierarchy(
-        content, chunk_size, doc_name, os.path.basename(input_file_path)
+        content, chunk_size, doc_name, os.path.basename(input_file_path), file_id, file_version_id
     )
     return all_chunks
 
@@ -362,16 +397,17 @@ def main():
     parser.add_argument('--input', '-i', required=True, help='输入Markdown文件的完整路径 (.md)')
     parser.add_argument('--output', '-o', required=True, help='输出JSON文件路径')
     parser.add_argument('--chunk_size', '-s', type=int, default=800, help='分块大小（字符数）')
+    parser.add_argument('--file_id', required=True, help='文件ID')
+    parser.add_argument('--file_version_id', required=True, help='文件版本ID')
     args = parser.parse_args()
 
-    # === 新增：记录开始时间 ===
     start_time = time.time()
 
     if os.path.isdir(args.input):
         print(f"❌ 错误: 输入路径 '{args.input}' 是一个文件夹，请提供具体的文件路径。")
         return
 
-    chunks = process_single_document_flow(args.input, args.chunk_size)
+    chunks = process_single_document_flow(args.input, args.chunk_size, args.file_id, args.file_version_id)
     if chunks:
         save_json(chunks, args.output)
         print(f"✅ 文档分块完成，结果已保存到 {args.output}")
@@ -379,7 +415,6 @@ def main():
     else:
         print("⚠️ 未生成任何分块结果")
 
-    # === 新增：打印耗时 ===
     elapsed = time.time() - start_time
     print(f"\n=== 文档分块耗时: {elapsed:.2f} 秒 ===")
 

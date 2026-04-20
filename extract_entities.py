@@ -50,7 +50,6 @@ def save_json(data, file_path):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 def parse_entities(text: str, chunk: Dict) -> List[Dict]:
-    # ... 原有代码保持不变 ...
     try:
         data = json.loads(text)
         entities_data = data.get("entities", [])
@@ -73,8 +72,7 @@ def parse_entities(text: str, chunk: Dict) -> List[Dict]:
                 })
 
     doc_name = chunk.get("document_name") or chunk.get("chunk_name", "未知文档")
-    start_line = chunk.get("start_line")
-    source = str(start_line) if start_line is not None else "未知行"
+    source = chunk.get("source", "未知行")
 
     valid_entities = []
     seen_names = set()

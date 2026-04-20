@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -17,8 +18,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.absolute()
 
 def run_command(cmd, description):
-    """执行 shell 命令，安全处理 UTF-8 输出，并记录耗时。"""
-    start = time.time()   # === 新增 ===
+    """执行 shell 命令，安全处理 UTF-8 输出，并记录耗时。返回 subprocess.CompletedProcess。"""
+    start = time.time()
     print(f"\n>>> {description}")
     print(f"命令: {' '.join(cmd)}")
 
@@ -28,7 +29,7 @@ def run_command(cmd, description):
 
     result = subprocess.run(cmd, capture_output=True, text=False, env=env)
 
-    elapsed = time.time() - start   # === 新增 ===
+    elapsed = time.time() - start
     print(f"耗时: {elapsed:.2f} 秒")
 
     stdout = result.stdout.decode("utf-8", errors="replace")
@@ -49,19 +50,17 @@ def run_command(cmd, description):
 
     return result
 
-def find_md_file(output_dir: Path, pdf_stem: str) -> Path:
-    """在 MinerU 输出目录中查找生成的 .md 文件，并等待其写入完成。"""
-    candidate = output_dir / pdf_stem / f"{pdf_stem}.md"
+def find_md_file(version_dir: Path, pdf_stem: str) -> Path:
+    """在版本目录中查找生成的 .md 文件，并等待其写入完成。"""
+    candidate = version_dir / f"{pdf_stem}.md"
     if not candidate.exists():
-        candidate = output_dir / pdf_stem / "ocr" / f"{pdf_stem}.md"
+        candidate = version_dir / "ocr" / f"{pdf_stem}.md"
     if not candidate.exists():
-        candidate = output_dir / f"{pdf_stem}.md"
-    if not candidate.exists():
-        md_files = list(output_dir.rglob("*.md"))
+        md_files = list(version_dir.rglob("*.md"))
         if md_files:
             candidate = md_files[0]
         else:
-            raise FileNotFoundError(f"未在 {output_dir} 中找到任何 .md 文件")
+            raise FileNotFoundError(f"未在 {version_dir} 中找到任何 .md 文件")
 
     for _ in range(30):
         if candidate.exists() and candidate.stat().st_size > 100:
@@ -69,6 +68,27 @@ def find_md_file(output_dir: Path, pdf_stem: str) -> Path:
         time.sleep(1)
 
     raise RuntimeError(f"MD 文件生成失败或为空: {candidate}")
+
+def get_latest_version_dir(output_root: Path, file_id: str) -> Path:
+    """获取指定 file_id 下版本号最大的版本目录，例如 output_root/file_id/file_id_vN"""
+    base_dir = output_root / file_id
+    if not base_dir.exists():
+        raise FileNotFoundError(f"未找到 file_id 目录: {base_dir}")
+
+    pattern = re.compile(rf"^{re.escape(file_id)}_v(\d+)$")
+    max_version = -1
+    latest_dir = None
+    for item in base_dir.iterdir():
+        if item.is_dir():
+            match = pattern.match(item.name)
+            if match:
+                ver = int(match.group(1))
+                if ver > max_version:
+                    max_version = ver
+                    latest_dir = item
+    if latest_dir is None:
+        raise FileNotFoundError(f"在 {base_dir} 下未找到任何版本目录 (格式: {file_id}_vN)")
+    return latest_dir
 
 def _discover_pdf_stem(import_only_dir: Path, explicit_stem: str | None) -> str:
     if explicit_stem:
@@ -128,7 +148,7 @@ def main():
     parser.add_argument("--pdf", "-p", help="输入的 PDF 文件路径；导入模式下仅用于推断 pdf_stem")
     parser.add_argument(
         "--pdf-stem",
-        help="显式指定产物前缀（pdf_stem）。导入模式下用于定位 *_chunks.json；生成模式下可用于兼容上层服务参数契约。",
+        help="显式指定产物前缀（pdf_stem）。导入模式下用于定位 *_chunks.json；生成模式下可用于兼容上层服务参数契约。"
     )
     parser.add_argument("--output-dir", "-o", default="./output", help="输出根目录（默认 ./output）")
     parser.add_argument("--chunk-size", "-s", type=int, default=800, help="分块大小（字符数），默认 800")
@@ -157,13 +177,11 @@ def main():
     output_root.mkdir(parents=True, exist_ok=True)
 
     pdf_stem = pdf_path.stem
-    result_dir = output_root / pdf_stem
-    result_dir.mkdir(parents=True, exist_ok=True)
 
-    # === 新增：记录整个流水线的开始时间 ===
+    # === 整个流水线开始时间 ===
     pipeline_start = time.time()
 
-    md_file = None
+    # 确定版本目录和 MD 文件路径
     if not args.skip_mineru:
         print("\n=== 步骤1: PDF 转 Markdown (MinerU) ===")
         mineru_script = SCRIPT_DIR / "trans_file_to_md.py"
@@ -183,21 +201,57 @@ def main():
             "-m",
             "ocr",
         ]
-        run_command(cmd, "MinerU 转换")
+        result = run_command(cmd, "MinerU 转换")
+
+        # 从输出中解析 VERSION_DIR
+        version_dir = None
+        for line in result.stdout.splitlines():
+            if line.startswith("VERSION_DIR="):
+                version_dir = Path(line.split("=", 1)[1].strip())
+                break
+        if version_dir is None or not version_dir.exists():
+            # 降级：尝试根据 pdf_stem 查找最新版本目录
+            try:
+                version_dir = get_latest_version_dir(output_root, pdf_stem)
+                print(f"未从 MinerU 输出解析到 VERSION_DIR，使用最新版本目录: {version_dir}")
+            except FileNotFoundError as e:
+                print(f"错误: {e}")
+                sys.exit(1)
 
         try:
-            md_file = find_md_file(output_root, pdf_stem)
+            md_file = find_md_file(version_dir, pdf_stem)
             print(f"找到 Markdown 文件: {md_file} (大小: {md_file.stat().st_size} 字节)")
         except (FileNotFoundError, RuntimeError) as exc:
             print(f"错误: {exc}")
             sys.exit(1)
     else:
+        # 跳过 MinerU，需要找到已有的版本目录
+        if args.pdf_stem:
+            file_id = args.pdf_stem
+        else:
+            file_id = pdf_stem
         try:
-            md_file = find_md_file(output_root, pdf_stem)
+            version_dir = get_latest_version_dir(output_root, file_id)
+            print(f"使用最新版本目录: {version_dir}")
+        except FileNotFoundError as e:
+            print(f"错误: {e}")
+            sys.exit(1)
+
+        try:
+            md_file = find_md_file(version_dir, pdf_stem)
             print(f"使用现有 Markdown 文件: {md_file}")
         except (FileNotFoundError, RuntimeError) as exc:
             print(f"错误: 找不到有效的 MD 文件 - {exc}")
             sys.exit(1)
+
+    # 提取 file_version_id（如 test_v1 中的 "v1"）
+    file_version_id = version_dir.name.split("_v")[-1] if "_v" in version_dir.name else "v1"
+    # 确保 file_version_id 格式一致（不带下划线前缀）
+    if not file_version_id.startswith("v"):
+        file_version_id = f"v{file_version_id}"
+
+    # 后续所有产物都保存在版本目录中
+    result_dir = version_dir
 
     if not args.skip_clean:
         print("\n=== 步骤1.5: 清理 Markdown 标题层级 ===")
@@ -229,12 +283,11 @@ def main():
     cmd_chunk = [
         sys.executable,
         str(chunk_script),
-        "--input",
-        str(md_file),
-        "--output",
-        str(chunks_json),
-        "--chunk_size",
-        str(args.chunk_size),
+        "--input", str(md_file),
+        "--output", str(chunks_json),
+        "--chunk_size", str(args.chunk_size),
+        "--file_id", pdf_stem,
+        "--file_version_id", file_version_id,
     ]
     run_command(cmd_chunk, "文档分块")
     print(f"分块结果保存至: {chunks_json}")
@@ -257,12 +310,9 @@ def main():
     cmd_entity = [
         sys.executable,
         str(entity_script),
-        "--input",
-        str(chunks_json),
-        "--output-entities",
-        str(entities_json),
-        "--output-merged",
-        str(merged_json),
+        "--input", str(chunks_json),
+        "--output-entities", str(entities_json),
+        "--output-merged", str(merged_json),
     ]
     if args.print_raw_text:
         cmd_entity.append("--print-raw-text")
@@ -282,20 +332,16 @@ def main():
         print(f"错误: 找不到 {relation_script}")
         sys.exit(1)
 
-    relations_json = result_dir / f"{pdf_stem}_chunks.json"
+    relations_json = result_dir / f"{pdf_stem}_relations.jsonl"
     relations_csv = result_dir / f"{pdf_stem}_relations.csv"
 
     cmd_relation = [
         sys.executable,
         str(relation_script),
-        "--input-chunks",
-        str(entities_json),
-        "--input-entities",
-        str(merged_json),
-        "--output-relations",
-        str(relations_json),
-        "--output-csv",
-        str(relations_csv),
+        "--input-chunks", str(chunks_json),
+        "--input-entities", str(merged_json),
+        "--output-relations", str(relations_json),
+        "--output-csv", str(relations_csv),
     ]
     if args.print_raw_text:
         cmd_relation.append("--print-raw-text")
