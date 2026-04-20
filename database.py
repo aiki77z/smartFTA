@@ -2093,18 +2093,7 @@ def list_top_event_catalog(
     *,
     selected_file_version_ids: Optional[List[Any]] = None,
 ) -> List[Dict[str, Any]]:
-    explicit_scope = bool(_normalize_file_version_ids(selected_file_version_ids, fallback_to_active=False))
-    scoped_file_version_ids = resolve_selected_file_version_ids(
-        selected_file_version_ids,
-        fallback_to_active=True,
-        require_active=False,
-    )
-    query: Dict[str, Any] = {}
-    if not explicit_scope:
-        query["is_active"] = True
-    version_filter = _build_file_version_filter(scoped_file_version_ids)
-    if version_filter:
-        query = {"$and": [query, version_filter]}
+    query, _ = _build_scoped_top_event_catalog_query(selected_file_version_ids)
 
     docs = list(top_event_catalog_col.find(query, {"_id": 0}).sort("name", ASCENDING))
     merged_by_name: Dict[str, List[Dict[str, Any]]] = {}
@@ -2117,6 +2106,102 @@ def list_top_event_catalog(
     if limit:
         items = items[:limit]
     return items
+
+
+def _build_scoped_top_event_catalog_query(
+    selected_file_version_ids: Optional[List[Any]] = None,
+) -> tuple[Dict[str, Any], List[str]]:
+    explicit_scope = bool(_normalize_file_version_ids(selected_file_version_ids, fallback_to_active=False))
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    query: Dict[str, Any] = {}
+    if not explicit_scope:
+        query["is_active"] = True
+    version_filter = _build_file_version_filter(scoped_file_version_ids)
+    if version_filter:
+        query = {"$and": [query, version_filter]}
+    return query, scoped_file_version_ids
+
+
+def ensure_top_event_catalog_embeddings(
+    *,
+    selected_file_version_ids: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    query, scoped_file_version_ids = _build_scoped_top_event_catalog_query(selected_file_version_ids)
+    docs = list(top_event_catalog_col.find(query))
+    if not docs:
+        return {
+            "scope_file_version_ids": scoped_file_version_ids,
+            "total_docs": 0,
+            "refreshed_docs": 0,
+            "embedding_enabled": bool(EMBEDDING_MODEL and _embedding_openai()),
+        }
+
+    refreshed_docs = 0
+    semantic_updates: List[Dict[str, Any]] = []
+    refresh_docs: List[Dict[str, Any]] = []
+    refresh_texts: List[str] = []
+    for doc in docs:
+        semantic_text = doc.get("semantic_text") or _build_top_event_semantic_text(
+            doc.get("name") or "",
+            normalized_name=doc.get("normalized_name"),
+            aliases=(doc.get("aliases") or []) + (doc.get("normalized_aliases") or []),
+        )
+        if semantic_text != doc.get("semantic_text"):
+            semantic_updates.append(
+                {
+                    "_id": doc["_id"],
+                    "semantic_text": semantic_text,
+                }
+            )
+            doc["semantic_text"] = semantic_text
+
+        needs_embedding = bool(
+            EMBEDDING_MODEL
+            and (
+                not isinstance(doc.get("embedding"), list)
+                or not doc.get("embedding")
+                or doc.get("embedding_model") != EMBEDDING_MODEL
+            )
+        )
+        if needs_embedding:
+            refresh_docs.append(doc)
+            refresh_texts.append(doc["semantic_text"])
+
+    for item in semantic_updates:
+        top_event_catalog_col.update_one(
+            {"_id": item["_id"]},
+            {"$set": {"semantic_text": item["semantic_text"], "updated_at": _now()}},
+        )
+
+    if refresh_docs:
+        refreshed_embeddings = _embed_strings_ordered(refresh_texts)
+        for doc, embedding in zip(refresh_docs, refreshed_embeddings):
+            if not embedding:
+                continue
+            refreshed_docs += 1
+            top_event_catalog_col.update_one(
+                {"_id": doc["_id"]},
+                {
+                    "$set": {
+                        "semantic_text": doc["semantic_text"],
+                        "embedding": embedding,
+                        "embedding_model": EMBEDDING_MODEL,
+                        "embedding_updated_at": _now(),
+                        "updated_at": _now(),
+                    }
+                },
+            )
+
+    return {
+        "scope_file_version_ids": scoped_file_version_ids,
+        "total_docs": len(docs),
+        "refreshed_docs": refreshed_docs,
+        "embedding_enabled": bool(EMBEDDING_MODEL and _embedding_openai()),
+    }
 
 
 def ensure_top_event_catalog_for_scope(
@@ -2144,9 +2229,11 @@ def ensure_top_event_catalog_for_scope(
 
     if rebuilt_file_version_ids:
         catalog = list_top_event_catalog(selected_file_version_ids=scoped_file_version_ids)
+    embedding_result = ensure_top_event_catalog_embeddings(selected_file_version_ids=scoped_file_version_ids)
     return {
         "catalog": catalog,
         "rebuilt_file_version_ids": rebuilt_file_version_ids,
+        "embedding_result": embedding_result,
     }
 
 
@@ -2207,26 +2294,14 @@ def search_top_event_catalog_semantic(
     limit: int = TOP_EVENT_VECTOR_CANDIDATE_LIMIT,
 ) -> List[Dict[str, Any]]:
     limit = max(1, min(int(limit or TOP_EVENT_VECTOR_CANDIDATE_LIMIT), TOP_EVENT_VECTOR_CANDIDATE_MAX))
-    explicit_scope = bool(_normalize_file_version_ids(selected_file_version_ids, fallback_to_active=False))
-    scoped_file_version_ids = resolve_selected_file_version_ids(
-        selected_file_version_ids,
-        fallback_to_active=True,
-        require_active=False,
-    )
-    query: Dict[str, Any] = {}
-    if not explicit_scope:
-        query["is_active"] = True
-    version_filter = _build_file_version_filter(scoped_file_version_ids)
-    if version_filter:
-        query = {"$and": [query, version_filter]}
+    query, scoped_file_version_ids = _build_scoped_top_event_catalog_query(selected_file_version_ids)
 
+    ensure_top_event_catalog_embeddings(selected_file_version_ids=scoped_file_version_ids)
     docs = list(top_event_catalog_col.find(query))
     if not docs:
         return []
 
     query_embedding = _embed_strings_ordered([query_text])[0] if EMBEDDING_MODEL else None
-    docs_to_refresh: List[Dict[str, Any]] = []
-    refresh_texts: List[str] = []
     for doc in docs:
         semantic_text = doc.get("semantic_text") or _build_top_event_semantic_text(
             doc.get("name") or "",
@@ -2234,38 +2309,6 @@ def search_top_event_catalog_semantic(
             aliases=(doc.get("aliases") or []) + (doc.get("normalized_aliases") or []),
         )
         doc["semantic_text"] = semantic_text
-        needs_embedding = bool(
-            query_embedding
-            and (
-                not isinstance(doc.get("embedding"), list)
-                or not doc.get("embedding")
-                or doc.get("embedding_model") != EMBEDDING_MODEL
-            )
-        )
-        if needs_embedding:
-            docs_to_refresh.append(doc)
-            refresh_texts.append(semantic_text)
-
-    if docs_to_refresh:
-        refreshed_embeddings = _embed_strings_ordered(refresh_texts)
-        for doc, embedding in zip(docs_to_refresh, refreshed_embeddings):
-            if not embedding:
-                continue
-            doc["embedding"] = embedding
-            doc["embedding_model"] = EMBEDDING_MODEL
-            doc["embedding_updated_at"] = _now()
-            top_event_catalog_col.update_one(
-                {"_id": doc["_id"]},
-                {
-                    "$set": {
-                        "semantic_text": doc["semantic_text"],
-                        "embedding": embedding,
-                        "embedding_model": EMBEDDING_MODEL,
-                        "embedding_updated_at": doc["embedding_updated_at"],
-                        "updated_at": _now(),
-                    }
-                },
-            )
 
     grouped: Dict[str, Dict[str, Any]] = {}
     for doc in docs:

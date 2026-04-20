@@ -28,6 +28,7 @@ from database import (
     create_tree,
     expand_scoped_local_fault_subgraph,
     ensure_top_event_catalog_for_scope,
+    ensure_top_event_catalog_embeddings,
     find_active_job_item_by_top_event,
     find_active_job_item_by_top_event_and_scope,
     find_latest_generation_job_by_scope,
@@ -585,6 +586,16 @@ def _agent_from_log_line(line: str) -> str:
         return "调度器"
     if text.startswith("[timing]"):
         return "计时器"
+    if text.startswith("[graph-draft]"):
+        return "草稿生成"
+    if text.startswith("[graph-validate]"):
+        return "结构校验"
+    if text.startswith("[graph-regenerate]"):
+        return "重新生成"
+    if text.startswith("[history-repair]"):
+        return "历史修正"
+    if text.startswith("[graph-persist]"):
+        return "版本持久化"
     return "Agent"
 
 
@@ -896,6 +907,21 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
         subgraph_node_ids = retrieval.get("subgraph_node_ids") or []
         resolved_source_file_version_ids = retrieval.get("source_file_version_ids") or selected_file_version_ids
 
+        _append_event(
+            item_id,
+            agent="版本持久化",
+            text=f"[graph-persist] saving tree tree_id={tree_id}",
+            stage="persistence",
+            progress=90,
+        )
+        for mid in mirror_item_ids or []:
+            _append_event(
+                mid,
+                agent="版本持久化",
+                text=f"[graph-persist] saving tree tree_id={tree_id}",
+                stage="persistence",
+                progress=90,
+            )
         version = save_version(
             tree_id=tree_id,
             tree_data=tree_data,
@@ -909,6 +935,21 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             evidence_chunk_ids=evidence_chunk_ids,
             subgraph_node_ids=subgraph_node_ids,
         )
+        _append_event(
+            item_id,
+            agent="版本持久化",
+            text=f"[graph-persist] saved tree tree_id={tree_id} version={version}",
+            stage="persistence",
+            progress=95,
+        )
+        for mid in mirror_item_ids or []:
+            _append_event(
+                mid,
+                agent="版本持久化",
+                text=f"[graph-persist] saved tree tree_id={tree_id} version={version}",
+                stage="persistence",
+                progress=95,
+            )
 
         update_generation_job_item(
             item_id,
@@ -1266,11 +1307,13 @@ def _resolve_debug_top_event(req: GraphRecallDebugRequest) -> Dict[str, object]:
 
 def _discover_batch_top_events(selected_file_version_ids: Optional[List[str]] = None) -> Dict[str, object]:
     scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
-    catalog_top_events = list_top_event_catalog(selected_file_version_ids=scoped_file_version_ids)
+    ensured_catalog = ensure_top_event_catalog_for_scope(selected_file_version_ids=scoped_file_version_ids)
+    catalog_top_events = ensured_catalog.get("catalog") or []
     if catalog_top_events:
         return {
             "discovered": catalog_top_events,
             "discovery_source": "scoped_top_event_catalog",
+            "embedding_result": ensured_catalog.get("embedding_result") or {},
         }
 
     graph_top_events = list_graph_top_event_candidates(selected_file_version_ids=scoped_file_version_ids)
@@ -1286,7 +1329,8 @@ def _discover_batch_top_events(selected_file_version_ids: Optional[List[str]] = 
 def _discover_batch_top_events_v2(selected_file_version_ids: Optional[List[str]] = None) -> Dict[str, object]:
     scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
     graph_top_events = list_graph_top_event_candidates(selected_file_version_ids=scoped_file_version_ids)
-    catalog_top_events = list_top_event_catalog(selected_file_version_ids=scoped_file_version_ids)
+    ensured_catalog = ensure_top_event_catalog_for_scope(selected_file_version_ids=scoped_file_version_ids)
+    catalog_top_events = ensured_catalog.get("catalog") or []
     discovered = _merge_discovered_top_events(
         graph_top_events=graph_top_events,
         catalog_top_events=catalog_top_events,
@@ -1306,6 +1350,7 @@ def _discover_batch_top_events_v2(selected_file_version_ids: Optional[List[str]]
         "discovery_source": discovery_source,
         "graph_total": len(graph_top_events),
         "catalog_total": len(catalog_top_events),
+        "embedding_result": ensured_catalog.get("embedding_result") or {},
     }
 
 

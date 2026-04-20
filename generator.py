@@ -620,20 +620,34 @@ def generate_fault_tree(
                 evidence_chunks=raw_chunks,
                 requirements=requirements,
             )
+            emit(
+                f"[graph-draft] generated draft attempt={attempt} "
+                f"nodes={len(draft_tree.get('nodeList') or [])} links={len(draft_tree.get('linkList') or [])}"
+            )
         except ValueError as exc:
+            emit(f"[graph-draft] draft generation error attempt={attempt} error={exc}")
             if attempt > MAX_RETRY:
                 raise
             previous_issues = [{"level": "ERROR", "message": str(exc)}]
+            emit(f"[graph-regenerate] retrying draft generation next_attempt={attempt + 1}")
             continue
 
+        emit(f"[graph-validate] validating draft attempt={attempt}")
         validation = validate_full(draft_tree, skip_semantic=True)
         draft_tree["validation"] = validation
         if validation["passed"]:
+            emit(
+                f"[graph-validate] validation passed attempt={attempt} "
+                f"errors={validation['error_count']} warnings={validation['warning_count']}"
+            )
             break
         previous_issues = validation["issues"]
         emit(
-            f"[graph-llm] draft validation failed errors={validation['error_count']} warnings={validation['warning_count']}"
+            f"[graph-validate] validation failed attempt={attempt} "
+            f"errors={validation['error_count']} warnings={validation['warning_count']}"
         )
+        if attempt <= MAX_RETRY:
+            emit(f"[graph-regenerate] retrying draft generation next_attempt={attempt + 1}")
         if attempt > MAX_RETRY:
             break
 
@@ -646,20 +660,35 @@ def generate_fault_tree(
 
         corrections = get_relevant_corrections(draft_tree)
         if corrections:
-            emit(f"[repair] applying {len(corrections)} relevant corrections")
+            emit(f"[history-repair] applying {len(corrections)} relevant corrections")
             repaired = repair_fault_tree(draft_tree, format_corrections_for_repair(corrections), raw_chunks)
+            emit("[graph-validate] validating repaired draft")
             repair_validation = validate_full(repaired, skip_semantic=True)
             if repair_validation["passed"]:
                 repaired["validation"] = repair_validation
                 final_tree = repaired
-                emit("[repair] repaired draft accepted")
+                emit(
+                    f"[history-repair] repaired draft accepted "
+                    f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
+                )
             else:
-                emit("[repair] repaired draft rejected, keeping original draft")
+                emit(
+                    f"[history-repair] repaired draft rejected "
+                    f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
+                )
+        else:
+            emit("[history-repair] no relevant corrections, skipped")
     except Exception as exc:
-        emit(f"[repair] skipped due to error: {exc}")
+        emit(f"[history-repair] skipped due to error: {exc}")
 
+    emit("[graph-validate] validating final tree")
     final_validation = validate_full(final_tree, skip_semantic=False)
     final_tree["validation"] = final_validation
+    emit(
+        f"[graph-validate] final validation "
+        f"{'passed' if final_validation['passed'] else 'failed'} "
+        f"errors={final_validation['error_count']} warnings={final_validation['warning_count']}"
+    )
     evidence_chunk_ids = [chunk.get("chunk_uid") or chunk.get("chunk_id") for chunk in raw_chunks if chunk.get("chunk_uid") or chunk.get("chunk_id")]
     subgraph_node_ids = [node.get("graph_node_id") for node in (subgraph_bundle.get("nodes") or []) if node.get("graph_node_id")]
     final_tree["retrieval"] = {
@@ -856,20 +885,34 @@ def generate_fault_tree(
                 evidence_chunks=raw_chunks,
                 requirements=requirements,
             )
+            emit(
+                f"[graph-draft] generated draft attempt={attempt} "
+                f"nodes={len(draft_tree.get('nodeList') or [])} links={len(draft_tree.get('linkList') or [])}"
+            )
         except ValueError as exc:
+            emit(f"[graph-draft] draft generation error attempt={attempt} error={exc}")
             if attempt > MAX_RETRY:
                 raise
             previous_issues = [{"level": "ERROR", "message": str(exc)}]
+            emit(f"[graph-regenerate] retrying draft generation next_attempt={attempt + 1}")
             continue
 
+        emit(f"[graph-validate] validating draft attempt={attempt}")
         validation = validate_full(draft_tree, skip_semantic=True)
         draft_tree["validation"] = validation
         if validation["passed"]:
+            emit(
+                f"[graph-validate] validation passed attempt={attempt} "
+                f"errors={validation['error_count']} warnings={validation['warning_count']}"
+            )
             break
         previous_issues = validation["issues"]
         emit(
-            f"[graph-llm] draft validation failed errors={validation['error_count']} warnings={validation['warning_count']}"
+            f"[graph-validate] validation failed attempt={attempt} "
+            f"errors={validation['error_count']} warnings={validation['warning_count']}"
         )
+        if attempt <= MAX_RETRY:
+            emit(f"[graph-regenerate] retrying draft generation next_attempt={attempt + 1}")
         if attempt > MAX_RETRY:
             break
 
@@ -882,20 +925,35 @@ def generate_fault_tree(
 
         corrections = get_relevant_corrections(draft_tree)
         if corrections:
-            emit(f"[repair] applying {len(corrections)} relevant corrections")
+            emit(f"[history-repair] applying {len(corrections)} relevant corrections")
             repaired = repair_fault_tree(draft_tree, format_corrections_for_repair(corrections), raw_chunks)
+            emit("[graph-validate] validating repaired draft")
             repair_validation = validate_full(repaired, skip_semantic=True)
             if repair_validation["passed"]:
                 repaired["validation"] = repair_validation
                 final_tree = repaired
-                emit("[repair] repaired draft accepted")
+                emit(
+                    f"[history-repair] repaired draft accepted "
+                    f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
+                )
             else:
-                emit("[repair] repaired draft rejected, keeping original draft")
+                emit(
+                    f"[history-repair] repaired draft rejected "
+                    f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
+                )
+        else:
+            emit("[history-repair] no relevant corrections, skipped")
     except Exception as exc:
-        emit(f"[repair] skipped due to error: {exc}")
+        emit(f"[history-repair] skipped due to error: {exc}")
 
+    emit("[graph-validate] validating final tree")
     final_validation = validate_full(final_tree, skip_semantic=False)
     final_tree["validation"] = final_validation
+    emit(
+        f"[graph-validate] final validation "
+        f"{'passed' if final_validation['passed'] else 'failed'} "
+        f"errors={final_validation['error_count']} warnings={final_validation['warning_count']}"
+    )
     evidence_chunk_ids = [chunk.get("chunk_uid") or chunk.get("chunk_id") for chunk in raw_chunks if chunk.get("chunk_uid") or chunk.get("chunk_id")]
     subgraph_node_ids = [node.get("graph_node_id") for node in (subgraph_bundle.get("nodes") or []) if node.get("graph_node_id")]
     final_tree["retrieval"] = {
