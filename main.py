@@ -1066,6 +1066,7 @@ def _queue_single_generation(
     catalog: Dict[str, Any],
     graph_node_id_override: Optional[str] = None,
     selected_file_version_ids: Optional[List[str]] = None,
+    async_mode: bool = False,
 ) -> Dict:
     scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
     resolved_top_event = catalog["name"]
@@ -1143,6 +1144,23 @@ def _queue_single_generation(
             "selected_file_version_ids": scoped_file_version_ids,
         },
     )
+
+    if async_mode:
+        _start_dedicated_generation_thread(item["item_id"])
+        return {
+            "mode": "queued",
+            "job_id": job["job_id"],
+            "item_id": item["item_id"],
+            "status": "queued",
+            "selected_file_version_ids": scoped_file_version_ids,
+            "parsed_prompt": {
+                "requested_top_event": requested_top_event,
+                "resolved_top_event": resolved_top_event,
+                "normalized_top_event": normalized_top_event,
+                "requirements": requirements,
+            },
+        }
+
     return _wait_for_single_item_result(
         item_id=item["item_id"],
         selected_file_version_ids=scoped_file_version_ids,
@@ -1206,6 +1224,9 @@ class GenerateRequest(BaseModel):
     confirmed_top_event: Optional[str] = None
     confirmed_normalized_top_event: Optional[str] = None
     confirmed_graph_node_id: Optional[str] = None
+    # 若为 True：同步等待生成完成并返回 tree_data（默认兼容旧行为）
+    # 若为 False：异步排队，立即返回 mode=queued + job_id/item_id，供前端轮询 events 实时展示进度
+    sync: bool = True
 
 
 class ResolveTopEventRequest(BaseModel):
@@ -1492,12 +1513,31 @@ def api_generate(req: GenerateRequest):
             raise HTTPException(status_code=500, detail=f"Confirm top event failed: {exc}")
 
     try:
+        graph_node_id_override = (
+            (confirmed_graph_node_id or _graph_node_id_from_catalog(catalog))
+            if any([confirmed_top_event, confirmed_normalized_top_event, confirmed_graph_node_id])
+            else None
+        )
+        if not bool(req.sync):
+            # async: create item and run in background, return queued result for polling
+            result = _queue_single_generation(
+                req.prompt,
+                requested_top_event,
+                requirements,
+                catalog,
+                graph_node_id_override=graph_node_id_override,
+                selected_file_version_ids=scoped_file_version_ids,
+                async_mode=True,
+            )
+            return result
+
+        # sync (default): block until finished and return tree_data
         return _queue_single_generation(
             req.prompt,
             requested_top_event,
             requirements,
             catalog,
-            graph_node_id_override=(confirmed_graph_node_id or _graph_node_id_from_catalog(catalog)) if any([confirmed_top_event, confirmed_normalized_top_event, confirmed_graph_node_id]) else None,
+            graph_node_id_override=graph_node_id_override,
             selected_file_version_ids=scoped_file_version_ids,
         )
     except ValueError as exc:
