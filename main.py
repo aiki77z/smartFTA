@@ -37,6 +37,7 @@ from database import (
     import_chunks as import_chunks_to_db,
     import_entity_reverse_index as import_entity_reverse_index_to_db,
     get_chunk_by_id,
+    list_all_chunks,
     get_generation_job,
     get_generation_job_item,
     get_tree_meta,
@@ -2064,6 +2065,51 @@ def api_get_chunk(chunk_id: str):
         raise HTTPException(status_code=404, detail=f"chunk {chunk_id} 不存在")
     chunk.pop("_id", None)
     return chunk
+
+
+@app.get("/api/chunks")
+def api_list_chunks(
+    file_names: Optional[List[str]] = None,
+    file_version_ids: Optional[List[str]] = None,
+    limit: int = 200,
+):
+    """
+    供前端「按文件名预览 chunks」使用：
+    - file_names 可重复传参（?file_names=a.pdf&file_names=b.txt）
+    - 后端按 chunk 的 file/source/path/doc_name 等字段做 basename 子串匹配
+    """
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    names = [str(n or "").strip() for n in (file_names or []) if str(n or "").strip()]
+    fvs = [str(v or "").strip() for v in (file_version_ids or []) if str(v or "").strip()]
+
+    # 防止误返回“全库 chunks”：必须给出过滤条件（文件名或 file_version_id）
+    if not names and not fvs:
+        return {"chunks": [], "total": 0}
+
+    chunks = list_all_chunks(selected_file_version_ids=fvs or None)
+    if not names:
+        return {"chunks": chunks[:safe_limit], "total": len(chunks)}
+
+    lowered = []
+    for n in names:
+        base = n.replace("\\\\", "/").split("/")[-1].lower()
+        lowered.append(base)
+
+    def _hit(doc: Dict[str, Any]) -> bool:
+        blob = " ".join(
+            [
+                str(doc.get("file") or ""),
+                str(doc.get("source") or ""),
+                str(doc.get("path") or ""),
+                str(doc.get("doc_name") or ""),
+                str(doc.get("chunk_name") or ""),
+                str(doc.get("section_path") or ""),
+            ]
+        ).lower()
+        return any(b and b in blob for b in lowered)
+
+    filtered = [c for c in chunks if _hit(c)]
+    return {"chunks": filtered[:safe_limit], "total": len(filtered)}
 
 
 @app.get("/api/corrections/{tree_id}")
