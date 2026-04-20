@@ -90,6 +90,127 @@ single_generation_queue: Queue[str] = Queue()
 batch_generation_queue: Queue[str] = Queue()
 generation_worker_threads: List[threading.Thread] = []
 
+
+class GraphCypherQueryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cypher: str
+    params: Optional[Dict[str, Any]] = None
+    database: Optional[str] = None
+    limit: int = 200
+
+
+def _ensure_readonly_cypher(cypher: str) -> str:
+    text = (cypher or "").strip()
+    if not text:
+        raise ValueError("Cypher 为空")
+    lowered = re.sub(r"\s+", " ", text).lower()
+    # very defensive: block writes & dangerous procedures.
+    blocked = [
+        " create ",
+        " merge ",
+        " set ",
+        " delete ",
+        " detach delete ",
+        " remove ",
+        " drop ",
+        " call dbms",
+        " call apoc",
+        " load csv",
+    ]
+    padded = f" {lowered} "
+    for token in blocked:
+        if token in padded:
+            raise ValueError(f"仅允许只读 Cypher（检测到禁用语句片段：{token.strip()}）")
+    if ";" in text:
+        raise ValueError("不支持多语句查询（请去掉分号）")
+    return text
+
+
+def _graph_cypher_available() -> bool:
+    return bool(GraphDatabase and NEO4J_PASSWORD)
+
+
+def _normalize_graph_bundle(nodes: Dict[str, Dict[str, Any]], edges: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "nodes": list(nodes.values()),
+        "edges": edges,
+    }
+
+
+def _extract_graph_items(value: Any, nodes_by_id: Dict[str, Dict[str, Any]], edges: List[Dict[str, Any]]):
+    if value is None:
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _extract_graph_items(item, nodes_by_id, edges)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _extract_graph_items(item, nodes_by_id, edges)
+        return
+
+    # neo4j driver graph types
+    try:
+        from neo4j.graph import Node as Neo4jNode
+        from neo4j.graph import Relationship as Neo4jRel
+        from neo4j.graph import Path as Neo4jPath
+    except Exception:
+        Neo4jNode = None
+        Neo4jRel = None
+        Neo4jPath = None
+
+    if Neo4jPath is not None and isinstance(value, Neo4jPath):
+        for n in value.nodes:
+            _extract_graph_items(n, nodes_by_id, edges)
+        for r in value.relationships:
+            _extract_graph_items(r, nodes_by_id, edges)
+        return
+
+    if Neo4jNode is not None and isinstance(value, Neo4jNode):
+        node_id = value.element_id
+        nodes_by_id.setdefault(
+            node_id,
+            {
+                "graph_node_id": node_id,
+                "labels": list(value.labels),
+                "props": dict(value),
+            },
+        )
+        return
+
+    if Neo4jRel is not None and isinstance(value, Neo4jRel):
+        start_id = value.start_node.element_id
+        end_id = value.end_node.element_id
+        nodes_by_id.setdefault(
+            start_id,
+            {
+                "graph_node_id": start_id,
+                "labels": list(value.start_node.labels),
+                "props": dict(value.start_node),
+            },
+        )
+        nodes_by_id.setdefault(
+            end_id,
+            {
+                "graph_node_id": end_id,
+                "labels": list(value.end_node.labels),
+                "props": dict(value.end_node),
+            },
+        )
+        edges.append(
+            {
+                "source_graph_node_id": start_id,
+                "target_graph_node_id": end_id,
+                "rel_type": getattr(value, "type", None) or getattr(value, "__class__", type("X", (), {})).__name__,
+                "rel_props": dict(value),
+                "graph_rel_id": getattr(value, "element_id", None),
+            }
+        )
+        return
+
 app = FastAPI(title="故障树智能生成系统", version="4.0.0")
 
 app.add_middleware(
@@ -120,6 +241,65 @@ def _dedupe_keep_order(values: Optional[List[str]]) -> List[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+@app.post("/api/graph/cypher")
+def api_graph_cypher_query(req: GraphCypherQueryRequest):
+    if not _graph_cypher_available():
+        raise HTTPException(status_code=400, detail="Neo4j 未配置。请设置 NEO4J_PASSWORD 并安装 neo4j 包。")
+    try:
+        cypher = _ensure_readonly_cypher(req.cypher)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    limit = max(1, min(int(req.limit or 200), 1000))
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        db = str(req.database or "").strip() or NEO4J_DATABASE
+        params = dict(req.params or {})
+        # If query doesn't include LIMIT, add a safe one.
+        if not re.search(r"(?is)\blimit\b", cypher):
+            cypher = f"{cypher}\nLIMIT $limit"
+            params["limit"] = limit
+        with driver.session(database=db) as session:
+            result = session.run(cypher, **params)
+            nodes_by_id: Dict[str, Dict[str, Any]] = {}
+            edges: List[Dict[str, Any]] = []
+            row_count = 0
+            for record in result:
+                row_count += 1
+                # record.values() may contain nodes, rels, paths, lists/dicts etc.
+                for v in record.values():
+                    _extract_graph_items(v, nodes_by_id, edges)
+                if len(nodes_by_id) >= limit * 5:
+                    break
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Cypher 查询失败: {exc}")
+    finally:
+        driver.close()
+
+    # de-dupe edges by (source,target,type,rel_id)
+    seen = set()
+    deduped_edges = []
+    for e in edges:
+        key = (
+            e.get("source_graph_node_id"),
+            e.get("target_graph_node_id"),
+            e.get("rel_type"),
+            e.get("graph_rel_id"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_edges.append(e)
+
+    return {
+        "query": {"database": db, "limit": limit},
+        "graph": _normalize_graph_bundle(nodes_by_id, deduped_edges),
+        "stats": {"rows_scanned": row_count},
+    }
 
 
 def _ensure_catalog_entry(

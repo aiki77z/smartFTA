@@ -2363,6 +2363,111 @@ def search_top_event_catalog_semantic(
     return ranked[:limit]
 
 
+_FAULT_LIKE_KEYWORDS = ("故障", "异常", "报警", "停机", "失败", "触发", "错误", "失效")
+
+
+def _fault_like_name_heuristic(name: str) -> bool:
+    text = _normalize_text(name)
+    if not text or len(text) < 2 or len(text) > 80:
+        return False
+    return any(k in text for k in _FAULT_LIKE_KEYWORDS)
+
+
+def _normalize_candidate_label_from_text(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    value = value.replace("（", "(").replace("）", ")")
+    value = re.sub(r"\s+", " ", value).strip()
+    value = value.strip("\"'[]{}<>")
+    # 取第一行 / 首段，避免整段正文进入目录名
+    line = value.split("\n", 1)[0].strip()
+    if len(line) > 120:
+        line = line[:120].rsplit(" ", 1)[0] if " " in line else line[:120]
+    return line
+
+
+def _top_event_candidates_from_entity_reverse_index(file_id: str, file_version_id: str, limit: int = 400) -> List[Dict[str, Any]]:
+    """当 Neo4j 中尚无可用实体时，从 Mongo entity_reverse_index 推导顶事件候选（与 generator.discover_top_events_from_entity_index 对齐思路）。"""
+    entries = list_entity_reverse_index(selected_file_version_ids=[file_version_id])
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for entry in entries or []:
+        raw = str(entry.get("entity_name") or entry.get("name") or "").strip()
+        name = _normalize_candidate_label_from_text(raw)
+        if not _fault_like_name_heuristic(name):
+            continue
+        nn = _normalize_text(name)
+        if not nn or nn in seen:
+            continue
+        seen.add(nn)
+        chunk_ids = entry.get("chunk_ids") or []
+        out.append(
+            {
+                "graph_node_id": None,
+                "name": name,
+                "normalized_name": nn,
+                "file_id": file_id,
+                "file_version_id": file_version_id,
+                "support_count": int(entry.get("count") or len(chunk_ids) or 0),
+                "source_chunk_ids": list(chunk_ids)[:80],
+                "source_chunk_refs": [],
+                "documents": [],
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _top_event_candidates_from_chunks_fallback(file_id: str, file_version_id: str, limit: int = 40) -> List[Dict[str, Any]]:
+    """最后手段：从已导入的 chunks 标题/章节路径中提取短标签作为候选（图为空且实体索引极少时）。"""
+    fv = _normalize_identifier(file_version_id)
+    if not fv:
+        return []
+    q: Dict[str, Any] = {"file_version_id": fv}
+    docs = list(
+        chunks_col.find(
+            q,
+            {"_id": 0, "chunk_id": 1, "id": 1, "section_path": 1, "chunk_name": 1, "text": 1, "content": 1},
+        ).limit(400),
+    )
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for doc in docs or []:
+        chunk_id = doc.get("chunk_id") if doc.get("chunk_id") not in (None, "") else doc.get("id")
+        sp = str(doc.get("section_path") or "").strip()
+        cn = str(doc.get("chunk_name") or "").strip()
+        blob = str(doc.get("text") or doc.get("content") or "").strip()
+        label = cn or (sp.split("/")[-1].strip() if sp else "") or _normalize_candidate_label_from_text(blob)
+        if not label:
+            continue
+        if not _fault_like_name_heuristic(label):
+            continue
+        name = label if len(label) <= 120 else label[:120]
+        nn = _normalize_text(name)
+        if not nn or nn in seen:
+            continue
+        seen.add(nn)
+        scid = chunk_id if chunk_id not in (None, "") else None
+        out.append(
+            {
+                "graph_node_id": None,
+                "name": name,
+                "normalized_name": nn,
+                "file_id": file_id,
+                "file_version_id": file_version_id,
+                "support_count": 1,
+                "source_chunk_ids": [scid] if scid is not None else [],
+                "source_chunk_refs": [_make_chunk_ref(fv, scid)] if scid is not None else [],
+                "documents": [],
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 def rebuild_top_event_catalog_for_file_version(file_version_id: str) -> List[Dict[str, Any]]:
     file_version = get_file_version(file_version_id)
     if not file_version:
@@ -2370,6 +2475,16 @@ def rebuild_top_event_catalog_for_file_version(file_version_id: str) -> List[Dic
 
     top_event_catalog_col.delete_many({"file_version_id": file_version_id})
     candidates = list_graph_top_event_candidates(selected_file_version_ids=[file_version_id])
+    if not candidates:
+        candidates = _top_event_candidates_from_entity_reverse_index(
+            str(file_version.get("file_id") or ""),
+            file_version_id,
+        )
+    if not candidates:
+        candidates = _top_event_candidates_from_chunks_fallback(
+            str(file_version.get("file_id") or ""),
+            file_version_id,
+        )
     created = []
     for item in candidates:
         name = _normalize_text(item.get("name"))
