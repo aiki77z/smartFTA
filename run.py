@@ -279,7 +279,7 @@ def main():
         print(f"错误: 找不到 {relation_script}")
         sys.exit(1)
 
-    relations_json = result_dir / f"{pdf_stem}_relations.jsonl"
+    relations_json = result_dir / f"{pdf_stem}_chunks.json"
     relations_csv = result_dir / f"{pdf_stem}_relations.csv"
 
     cmd_relation = [
