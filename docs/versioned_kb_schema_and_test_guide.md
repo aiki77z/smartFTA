@@ -155,6 +155,21 @@
 
 ### 2.5 top_event_catalog
 
+新增字段（2026-04 prompt 解析改造）：
+
+- `display_name`: 前端展示用标准名称，当前与 `name` 保持一致
+- `semantic_text`: 顶事件语义匹配文本
+- `embedding`: 顶事件向量，供当前 scope 内候选召回使用
+- `embedding_model`: 当前 embedding 模型名
+- `embedding_updated_at`: 向量更新时间
+
+新增行为：
+
+- `prompt` 先由 LLM 提取 `requested_top_event` 和 `requirements`
+- 当前 scope 下如果没有 `top_event_catalog`，后端会先按选中的 `file_version_id` 自动重建目录
+- 如果没有精确命中，则在当前 scope 的 `top_event_catalog` 内做向量/语义匹配，并把候选返回给用户确认
+- 若未配置 `EMBEDDING_MODEL` 或向量请求失败，则回退为基于名称的 lexical 候选排序
+
 用途：
 
 - 保存“每个文件版本自己的顶事件目录”
@@ -185,6 +200,12 @@
 
 ### 2.6 fault_trees
 
+新增字段（2026-04 prompt 解析改造）：
+
+- `requested_top_event`: 用户原始请求中的顶事件
+- `resolved_top_event`: 系统精确命中或用户确认后的显示名
+- `graph_node_id`: 用户确认后锁定的图节点 ID；若为精确命中可为空
+
 用途：
 
 - 保存一棵故障树的元信息
@@ -214,6 +235,12 @@
 - 同一个顶事件，在不同 `selected_file_version_ids` 下可以得到不同树版本，不会串用
 
 ### 2.7 fault_tree_versions
+
+新增字段（2026-04 prompt 解析改造）：
+
+- `requested_top_event`
+- `resolved_top_event`
+- `normalized_top_event`
 
 用途：
 
@@ -269,6 +296,17 @@
 | `duration_seconds` | float | 耗时 |
 
 ### 2.9 generation_job_items
+
+新增字段（2026-04 prompt 解析改造）：
+
+- `requested_top_event`
+- `resolved_top_event`
+- `graph_node_id`
+
+说明：
+
+- 单次生成任务会把“用户原始顶事件 / 最终生成顶事件 / 用户确认后的图节点”一并落库
+- 如果前端先调用顶事件解析接口，再把候选确认结果传给 `generate`，后端会直接使用该 `graph_node_id` 生成，避免二次歧义匹配
 
 用途：
 
@@ -621,6 +659,16 @@ curl -X POST "http://127.0.0.1:8000/api/debug/graph-recall" `
 curl -X POST "http://127.0.0.1:8000/api/tree/generate" `
   -H "Content-Type: application/json" `
   -d "{\"prompt\":\"分析 XXX 故障\",\"selected_file_version_ids\":[\"fv_test_part1_cleaned_v1\"]}"
+
+如果当前 scope 下不是精确命中，建议先调用：
+
+```powershell
+curl -X POST "http://127.0.0.1:8000/api/tree/resolve-top-event" `
+  -H "Content-Type: application/json" `
+  -d "{\"prompt\":\"请为我生成顶事件为XXX的故障树，要求给出主要原因\",\"selected_file_version_ids\":[\"fv_test_part1_cleaned_v1\"],\"candidate_limit\":10}"
+```
+
+返回 `status = need_user_confirmation` 时，前端应把用户最终选择的 `confirmed_top_event`、`confirmed_normalized_top_event`、`confirmed_graph_node_id` 再传回 `POST /api/tree/generate`。
 ```
 
 返回后记录：
@@ -751,4 +799,3 @@ curl "http://127.0.0.1:8000/api/tree/你的tree_id/version/1"
 3. `/api/tree/{tree_id}/version/{version}` 里是否能看到 `source_file_version_ids`、`evidence_chunk_ids`、`subgraph_node_ids`
 
 如果这 3 个都对，说明这次改造的主链路基本已经通了。
-

@@ -127,6 +127,7 @@ uvicorn main:app --reload --port 8000
 主要接口：
 
 - `POST /api/tree/generate`
+- `POST /api/tree/resolve-top-event`
 - `POST /api/batch/preview-top-events`
 - `POST /api/batch/generate-all`
 - `POST /api/debug/graph-recall`

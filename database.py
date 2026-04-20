@@ -2,13 +2,25 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import math
 import re
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from openai import OpenAI
 from pymongo import ASCENDING, DESCENDING, MongoClient
 
-from config import MONGO_DB_NAME, MONGO_URI, NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
+from config import (
+    EMBEDDING_API_KEY,
+    EMBEDDING_BASE_URL,
+    EMBEDDING_MODEL,
+    MONGO_DB_NAME,
+    MONGO_URI,
+    NEO4J_DATABASE,
+    NEO4J_PASSWORD,
+    NEO4J_URI,
+    NEO4J_USER,
+)
 
 try:
     from neo4j import GraphDatabase
@@ -42,6 +54,11 @@ GRAPH_PROPERTY_UPDATE_FIELDS = {
 
 STATUS_INACTIVE_VALUES = ("deleted", "archived")
 CHUNK_REF_SEPARATOR = "::"
+TOP_EVENT_VECTOR_CANDIDATE_LIMIT = 10
+TOP_EVENT_VECTOR_CANDIDATE_MAX = 15
+
+_embedding_client: Optional[OpenAI] = None
+_top_event_embedding_cache: Dict[str, List[float]] = {}
 
 
 def _now() -> datetime:
@@ -90,6 +107,89 @@ def _split_chunk_ref(value: Any) -> tuple[Optional[str], str]:
 
 def _make_catalog_doc_id(file_version_id: Any, normalized_name: Any) -> str:
     return f"{_normalize_identifier(file_version_id)}::{_normalize_identifier(normalized_name)}"
+
+
+def _embedding_openai() -> Optional[OpenAI]:
+    global _embedding_client
+    if not EMBEDDING_API_KEY or not EMBEDDING_MODEL:
+        return None
+    if _embedding_client is None:
+        _embedding_client = OpenAI(api_key=EMBEDDING_API_KEY, base_url=EMBEDDING_BASE_URL)
+    return _embedding_client
+
+
+def _build_top_event_semantic_text(
+    name: str,
+    *,
+    normalized_name: Optional[str] = None,
+    aliases: Optional[List[str]] = None,
+) -> str:
+    cleaned_aliases = _dedupe_keep_order([_normalize_identifier(alias) for alias in aliases or [] if _normalize_identifier(alias)])
+    lines = [
+        f"top_event:{_normalize_identifier(name)}",
+        f"normalized_name:{_normalize_identifier(normalized_name) or _normalize_identifier(name)}",
+    ]
+    if cleaned_aliases:
+        lines.append(f"aliases:{' | '.join(cleaned_aliases)}")
+    return "\n".join(line for line in lines if line.strip())
+
+
+def _embed_strings_ordered(strings: List[str]) -> List[Optional[List[float]]]:
+    if not strings or not EMBEDDING_MODEL:
+        return [None] * len(strings)
+    client = _embedding_openai()
+    if not client:
+        return [None] * len(strings)
+
+    unique: List[str] = []
+    seen: Dict[str, int] = {}
+    for text in strings:
+        key = text or ""
+        if key not in seen:
+            seen[key] = len(unique)
+            unique.append(key)
+
+    vecs_for_unique: List[Optional[List[float]]] = [None] * len(unique)
+    to_request: List[str] = []
+    request_slots: List[int] = []
+    for index, text in enumerate(unique):
+        if text in _top_event_embedding_cache:
+            vecs_for_unique[index] = _top_event_embedding_cache[text]
+        else:
+            to_request.append(text)
+            request_slots.append(index)
+
+    batch_size = 64
+    for start in range(0, len(to_request), batch_size):
+        chunk = to_request[start : start + batch_size]
+        try:
+            response = client.embeddings.create(model=EMBEDDING_MODEL, input=chunk)
+            for offset, item in enumerate(response.data):
+                vec = item.embedding
+                text = chunk[offset]
+                _top_event_embedding_cache[text] = vec
+                vecs_for_unique[request_slots[start + offset]] = vec
+        except Exception:
+            for offset, text in enumerate(chunk):
+                vecs_for_unique[request_slots[start + offset]] = _top_event_embedding_cache.get(text)
+
+    lookup = {text: vecs_for_unique[index] for index, text in enumerate(unique)}
+    return [lookup.get(text or "") for text in strings]
+
+
+def _cosine_similarity(left: Optional[List[float]], right: Optional[List[float]]) -> float:
+    if not left or not right or len(left) != len(right):
+        return -1.0
+    numerator = 0.0
+    left_norm = 0.0
+    right_norm = 0.0
+    for lvalue, rvalue in zip(left, right):
+        numerator += float(lvalue) * float(rvalue)
+        left_norm += float(lvalue) * float(lvalue)
+        right_norm += float(rvalue) * float(rvalue)
+    if left_norm <= 0.0 or right_norm <= 0.0:
+        return -1.0
+    return numerator / (math.sqrt(left_norm) * math.sqrt(right_norm))
 
 
 def _normalize_chunk_refs(
@@ -633,6 +733,43 @@ def match_top_event_from_graph(
     }
 
 
+def get_graph_node_by_id(
+    graph_node_id: str,
+    *,
+    selected_file_version_ids: Optional[List[Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    driver = _get_neo4j_driver()
+    if driver is None:
+        return None
+    graph_node_id = _normalize_identifier(graph_node_id)
+    if not graph_node_id:
+        return None
+
+    explicit_scope = bool(_normalize_file_version_ids(selected_file_version_ids, fallback_to_active=False))
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    with driver.session(database=NEO4J_DATABASE) as session:
+        row = session.run(
+            """
+            MATCH (n)
+            WHERE elementId(n) = $graph_node_id
+              AND ($enforce_active_only = false OR coalesce(n.is_active, true) = true)
+              AND ($selected_file_version_ids = [] OR coalesce(n.file_version_id, '') IN $selected_file_version_ids)
+            RETURN elementId(n) AS graph_node_id, labels(n) AS labels, properties(n) AS props
+            LIMIT 1
+            """,
+            graph_node_id=graph_node_id,
+            selected_file_version_ids=scoped_file_version_ids,
+            enforce_active_only=(not explicit_scope),
+        ).single()
+    if not row:
+        return None
+    return _decode_graph_node(dict(row))
+
+
 def expand_local_fault_subgraph(
     root_node_id: str,
     max_depth: int = 3,
@@ -1059,6 +1196,7 @@ def _ensure_indexes():
         (top_event_catalog_col, [("normalized_name", ASCENDING)]),
         (top_event_catalog_col, [("normalized_aliases", ASCENDING)]),
         (top_event_catalog_col, [("file_version_id", ASCENDING), ("normalized_name", ASCENDING)]),
+        (top_event_catalog_col, [("graph_node_id", ASCENDING)]),
         (generation_jobs_col, [("status", ASCENDING), ("updated_at", DESCENDING)]),
         (generation_jobs_col, [("job_type", ASCENDING), ("source_scope_key", ASCENDING), ("updated_at", DESCENDING)]),
         (generation_job_items_col, [("job_id", ASCENDING), ("status", ASCENDING)]),
@@ -1608,6 +1746,9 @@ def create_tree(
     top_event: str,
     catalog_name: Optional[str] = None,
     normalized_top_event: Optional[str] = None,
+    requested_top_event: Optional[str] = None,
+    resolved_top_event: Optional[str] = None,
+    graph_node_id: Optional[str] = None,
     aliases: Optional[List[str]] = None,
     source_chunk_ids: Optional[List[int]] = None,
     source_file_version_ids: Optional[List[str]] = None,
@@ -1619,8 +1760,11 @@ def create_tree(
         {
             "_id": tree_id,
             "top_event": top_event,
+            "requested_top_event": requested_top_event or top_event,
+            "resolved_top_event": resolved_top_event or catalog_name or top_event,
             "catalog_name": catalog_name or top_event,
             "normalized_top_event": normalized_top_event or top_event,
+            "graph_node_id": graph_node_id,
             "query_aliases": _dedupe_keep_order(aliases),
             "source_chunk_ids": _dedupe_keep_order(source_chunk_ids),
             "source_file_version_ids": _dedupe_keep_order(source_file_version_ids),
@@ -1702,6 +1846,9 @@ def save_version(
     description: str,
     is_ai: bool,
     *,
+    requested_top_event: Optional[str] = None,
+    resolved_top_event: Optional[str] = None,
+    normalized_top_event: Optional[str] = None,
     source_file_version_ids: Optional[List[Any]] = None,
     evidence_chunk_ids: Optional[List[Any]] = None,
     subgraph_node_ids: Optional[List[Any]] = None,
@@ -1718,6 +1865,9 @@ def save_version(
             "created_at": _now(),
             "editor": editor,
             "description": description,
+            "requested_top_event": requested_top_event,
+            "resolved_top_event": resolved_top_event,
+            "normalized_top_event": normalized_top_event,
             "source_scope_key": source_scope_key,
             "source_file_version_ids": _dedupe_keep_order(source_file_version_ids),
             "evidence_chunk_ids": _dedupe_keep_order(evidence_chunk_ids),
@@ -1733,6 +1883,9 @@ def save_version(
                 "current_version": new_version,
                 "updated_at": _now(),
                 "status": "ai_generated" if is_ai else "expert_modified",
+                "requested_top_event": requested_top_event,
+                "resolved_top_event": resolved_top_event,
+                "normalized_top_event": normalized_top_event,
                 "source_scope_key": source_scope_key,
                 "source_file_version_ids": _dedupe_keep_order(source_file_version_ids),
                 "source_chunk_ids": _dedupe_keep_order(evidence_chunk_ids),
@@ -1789,6 +1942,11 @@ def upsert_top_event_catalog_entry(
     normalized_aliases = _dedupe_keep_order(
         [alias for alias in normalized_aliases or [] if alias and alias != normalized_name]
     )
+    semantic_text = _build_top_event_semantic_text(
+        name,
+        normalized_name=normalized_name,
+        aliases=aliases + normalized_aliases,
+    )
     source_chunk_ids = _normalize_chunk_refs(source_chunk_ids, file_version_id=normalized_file_version_id)
     doc_id = _make_catalog_doc_id(normalized_file_version_id, normalized_name)
     existing = top_event_catalog_col.find_one({"_id": doc_id})
@@ -1803,11 +1961,21 @@ def upsert_top_event_catalog_entry(
             (existing.get("source_chunk_ids") or []) + source_chunk_ids,
             file_version_id=normalized_file_version_id,
         )
+        previous_semantic_text = existing.get("semantic_text") or ""
+        embedding_payload = {}
+        if previous_semantic_text != semantic_text:
+            embedding_payload = {
+                "semantic_text": semantic_text,
+                "embedding": None,
+                "embedding_model": None,
+                "embedding_updated_at": None,
+            }
         top_event_catalog_col.update_one(
             {"_id": doc_id},
             {
                 "$set": {
                     "name": name,
+                    "display_name": name,
                     "updated_at": now,
                     "file_id": normalized_file_id,
                     "file_version_id": normalized_file_version_id,
@@ -1816,6 +1984,7 @@ def upsert_top_event_catalog_entry(
                     "normalized_aliases": merged_normalized_aliases,
                     "source_chunk_ids": merged_source_chunk_ids,
                     "graph_node_id": graph_node_id or existing.get("graph_node_id"),
+                    **embedding_payload,
                 }
             },
         )
@@ -1827,9 +1996,14 @@ def upsert_top_event_catalog_entry(
                 "file_version_id": normalized_file_version_id,
                 "is_active": bool(is_active),
                 "name": name,
+                "display_name": name,
                 "normalized_name": normalized_name,
                 "aliases": aliases,
                 "normalized_aliases": normalized_aliases,
+                "semantic_text": semantic_text,
+                "embedding": None,
+                "embedding_model": None,
+                "embedding_updated_at": None,
                 "source_chunk_ids": source_chunk_ids,
                 "graph_node_id": graph_node_id,
                 "created_at": now,
@@ -1847,6 +2021,7 @@ def _merge_catalog_entries(entries: List[Dict[str, Any]]) -> Optional[Dict[str, 
     primary = cleaned[0]
     return {
         "name": primary.get("name"),
+        "display_name": primary.get("display_name") or primary.get("name"),
         "normalized_name": primary.get("normalized_name"),
         "aliases": _dedupe_keep_order([alias for entry in cleaned for alias in (entry.get("aliases") or [])]),
         "normalized_aliases": _dedupe_keep_order(
@@ -1856,11 +2031,16 @@ def _merge_catalog_entries(entries: List[Dict[str, Any]]) -> Optional[Dict[str, 
             [chunk_id for entry in cleaned for chunk_id in (entry.get("source_chunk_ids") or [])],
             file_version_id=primary.get("file_version_id"),
         ),
+        "graph_node_id": primary.get("graph_node_id"),
         "graph_node_ids": _dedupe_keep_order([entry.get("graph_node_id") for entry in cleaned if entry.get("graph_node_id")]),
         "file_ids": _dedupe_keep_order([entry.get("file_id") for entry in cleaned if entry.get("file_id")]),
         "file_version_ids": _dedupe_keep_order(
             [entry.get("file_version_id") for entry in cleaned if entry.get("file_version_id")]
         ),
+        "semantic_text": primary.get("semantic_text"),
+        "embedding": primary.get("embedding"),
+        "embedding_model": primary.get("embedding_model"),
+        "embedding_updated_at": primary.get("embedding_updated_at"),
         "catalog_entries": cleaned,
     }
 
@@ -1873,7 +2053,7 @@ def get_top_event_catalog(
     query: Dict[str, Any] = {"normalized_name": normalized_name}
     if file_version_id:
         query["file_version_id"] = _normalize_identifier(file_version_id)
-    docs = list(top_event_catalog_col.find(query, {"_id": 0}))
+    docs = list(top_event_catalog_col.find(query))
     return _merge_catalog_entries(docs)
 
 
@@ -1936,6 +2116,207 @@ def list_top_event_catalog(
     if limit:
         items = items[:limit]
     return items
+
+
+def ensure_top_event_catalog_for_scope(
+    *,
+    selected_file_version_ids: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    catalog = list_top_event_catalog(selected_file_version_ids=scoped_file_version_ids)
+    existing_version_ids = set(
+        top_event_catalog_col.distinct(
+            "file_version_id",
+            {"file_version_id": {"$in": scoped_file_version_ids}},
+        )
+    )
+    rebuilt_file_version_ids: List[str] = []
+    for file_version_id in scoped_file_version_ids:
+        if file_version_id in existing_version_ids:
+            continue
+        rebuild_top_event_catalog_for_file_version(file_version_id)
+        rebuilt_file_version_ids.append(file_version_id)
+
+    if rebuilt_file_version_ids:
+        catalog = list_top_event_catalog(selected_file_version_ids=scoped_file_version_ids)
+    return {
+        "catalog": catalog,
+        "rebuilt_file_version_ids": rebuilt_file_version_ids,
+    }
+
+
+def get_top_event_catalog_by_graph_node_id(
+    graph_node_id: str,
+    *,
+    selected_file_version_ids: Optional[List[Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    graph_node_id = _normalize_identifier(graph_node_id)
+    if not graph_node_id:
+        return None
+
+    explicit_scope = bool(_normalize_file_version_ids(selected_file_version_ids, fallback_to_active=False))
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    query: Dict[str, Any] = {"graph_node_id": graph_node_id}
+    if not explicit_scope:
+        query["is_active"] = True
+    version_filter = _build_file_version_filter(scoped_file_version_ids)
+    if version_filter:
+        query = {"$and": [query, version_filter]}
+    docs = list(top_event_catalog_col.find(query, {"_id": 0}).sort("updated_at", DESCENDING))
+    return _merge_catalog_entries(docs)
+
+
+def _fallback_top_event_similarity(query_text: str, entry: Dict[str, Any]) -> float:
+    query_compact = _compact_text(query_text)
+    names = _dedupe_keep_order(
+        [
+            entry.get("name"),
+            entry.get("normalized_name"),
+            *(entry.get("aliases") or []),
+            *(entry.get("normalized_aliases") or []),
+        ]
+    )
+    best = 0.0
+    for name in names:
+        candidate = _compact_text(name)
+        if not query_compact or not candidate:
+            continue
+        if query_compact == candidate:
+            return 1.0
+        overlap = 0
+        if query_compact in candidate or candidate in query_compact:
+            overlap = min(len(query_compact), len(candidate))
+        score = overlap / max(len(query_compact), len(candidate))
+        best = max(best, score)
+    return best
+
+
+def search_top_event_catalog_semantic(
+    query_text: str,
+    *,
+    selected_file_version_ids: Optional[List[Any]] = None,
+    limit: int = TOP_EVENT_VECTOR_CANDIDATE_LIMIT,
+) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit or TOP_EVENT_VECTOR_CANDIDATE_LIMIT), TOP_EVENT_VECTOR_CANDIDATE_MAX))
+    explicit_scope = bool(_normalize_file_version_ids(selected_file_version_ids, fallback_to_active=False))
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    query: Dict[str, Any] = {}
+    if not explicit_scope:
+        query["is_active"] = True
+    version_filter = _build_file_version_filter(scoped_file_version_ids)
+    if version_filter:
+        query = {"$and": [query, version_filter]}
+
+    docs = list(top_event_catalog_col.find(query, {"_id": 0}))
+    if not docs:
+        return []
+
+    query_embedding = _embed_strings_ordered([query_text])[0] if EMBEDDING_MODEL else None
+    docs_to_refresh: List[Dict[str, Any]] = []
+    refresh_texts: List[str] = []
+    for doc in docs:
+        semantic_text = doc.get("semantic_text") or _build_top_event_semantic_text(
+            doc.get("name") or "",
+            normalized_name=doc.get("normalized_name"),
+            aliases=(doc.get("aliases") or []) + (doc.get("normalized_aliases") or []),
+        )
+        doc["semantic_text"] = semantic_text
+        needs_embedding = bool(
+            query_embedding
+            and (
+                not isinstance(doc.get("embedding"), list)
+                or not doc.get("embedding")
+                or doc.get("embedding_model") != EMBEDDING_MODEL
+            )
+        )
+        if needs_embedding:
+            docs_to_refresh.append(doc)
+            refresh_texts.append(semantic_text)
+
+    if docs_to_refresh:
+        refreshed_embeddings = _embed_strings_ordered(refresh_texts)
+        for doc, embedding in zip(docs_to_refresh, refreshed_embeddings):
+            if not embedding:
+                continue
+            doc["embedding"] = embedding
+            doc["embedding_model"] = EMBEDDING_MODEL
+            doc["embedding_updated_at"] = _now()
+            top_event_catalog_col.update_one(
+                {"_id": doc["_id"]},
+                {
+                    "$set": {
+                        "semantic_text": doc["semantic_text"],
+                        "embedding": embedding,
+                        "embedding_model": EMBEDDING_MODEL,
+                        "embedding_updated_at": doc["embedding_updated_at"],
+                        "updated_at": _now(),
+                    }
+                },
+            )
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for doc in docs:
+        normalized_name = doc.get("normalized_name") or doc.get("name")
+        if not normalized_name:
+            continue
+        similarity = (
+            _cosine_similarity(query_embedding, doc.get("embedding"))
+            if query_embedding and isinstance(doc.get("embedding"), list)
+            else _fallback_top_event_similarity(query_text, doc)
+        )
+        score = float(similarity if similarity >= 0.0 else 0.0)
+        bucket = grouped.setdefault(
+            normalized_name,
+            {
+                "name": doc.get("name"),
+                "display_name": doc.get("display_name") or doc.get("name"),
+                "normalized_name": normalized_name,
+                "aliases": [],
+                "normalized_aliases": [],
+                "graph_node_id": doc.get("graph_node_id"),
+                "graph_node_ids": [],
+                "file_ids": [],
+                "file_version_ids": [],
+                "source_chunk_ids": [],
+                "score": score,
+                "match_type": "vector" if query_embedding else "lexical",
+            },
+        )
+        bucket["aliases"] = _dedupe_keep_order((bucket.get("aliases") or []) + (doc.get("aliases") or []))
+        bucket["normalized_aliases"] = _dedupe_keep_order((bucket.get("normalized_aliases") or []) + (doc.get("normalized_aliases") or []))
+        bucket["graph_node_ids"] = _dedupe_keep_order((bucket.get("graph_node_ids") or []) + ([doc.get("graph_node_id")] if doc.get("graph_node_id") else []))
+        bucket["file_ids"] = _dedupe_keep_order((bucket.get("file_ids") or []) + ([doc.get("file_id")] if doc.get("file_id") else []))
+        bucket["file_version_ids"] = _dedupe_keep_order((bucket.get("file_version_ids") or []) + ([doc.get("file_version_id")] if doc.get("file_version_id") else []))
+        bucket["source_chunk_ids"] = _normalize_chunk_refs(
+            (bucket.get("source_chunk_ids") or []) + (doc.get("source_chunk_ids") or []),
+            file_version_id=doc.get("file_version_id"),
+        )
+        if score > float(bucket.get("score") or 0.0):
+            bucket["score"] = score
+            bucket["name"] = doc.get("name")
+            bucket["display_name"] = doc.get("display_name") or doc.get("name")
+            bucket["graph_node_id"] = doc.get("graph_node_id")
+
+    ranked = sorted(
+        grouped.values(),
+        key=lambda item: (
+            -float(item.get("score") or 0.0),
+            item.get("display_name") or item.get("name") or "",
+        ),
+    )
+    return ranked[:limit]
 
 
 def rebuild_top_event_catalog_for_file_version(file_version_id: str) -> List[Dict[str, Any]]:
@@ -2050,6 +2431,9 @@ def create_generation_job_item(
     job_id: str,
     top_event: str,
     normalized_top_event: str,
+    requested_top_event: Optional[str] = None,
+    resolved_top_event: Optional[str] = None,
+    graph_node_id: Optional[str] = None,
     aliases: Optional[List[str]] = None,
     source_chunk_ids: Optional[List[int]] = None,
     source_file_version_ids: Optional[List[Any]] = None,
@@ -2064,7 +2448,10 @@ def create_generation_job_item(
         "item_id": item_id,
         "job_id": job_id,
         "top_event": top_event,
+        "requested_top_event": requested_top_event or top_event,
+        "resolved_top_event": resolved_top_event or top_event,
         "normalized_top_event": normalized_top_event,
+        "graph_node_id": graph_node_id,
         "aliases": _dedupe_keep_order(aliases),
         "source_chunk_ids": _dedupe_keep_order(source_chunk_ids),
         "source_file_version_ids": scope_ids,

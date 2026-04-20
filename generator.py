@@ -32,6 +32,7 @@ from config import (
 from database import (
     collect_subgraph_chunks,
     expand_scoped_local_fault_subgraph,
+    get_graph_node_by_id,
     hydrate_documents_by_chunk_ids,
     list_graph_top_event_candidates,
     match_top_event_from_graph,
@@ -696,6 +697,244 @@ def generate_fault_tree_with_progress(
         top_event,
         requirements,
         selected_file_version_ids=selected_file_version_ids,
+        log_callback=log_callback,
+    )
+
+    if progress_callback:
+        progress_callback(90, "persistence", "Generation completed, persisting result")
+    return tree_data
+
+
+def parse_user_prompt(prompt: str) -> dict:
+    raw = str(prompt or "").strip()
+    if not raw:
+        raise ValueError("prompt 不能为空")
+
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    prompt_text = f"""
+你是工业设备故障树系统的提示词解析器。请优先从用户输入中提取：
+1. top_event：用户要分析或生成故障树的顶事件
+2. requirements：额外要求，没有就返回空字符串
+只输出 JSON：{{
+  "top_event": "...",
+  "requirements": "..."
+}}
+
+用户输入：{normalized}
+"""
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt_text}],
+            temperature=0.1,
+            max_tokens=LLM_PARSE_MAX_TOKENS,
+        )
+        parsed = _parse_json(response.choices[0].message.content)
+        top_event = normalize_top_event_name(parsed.get("top_event"))
+        if top_event:
+            return {"top_event": top_event, "requirements": str(parsed.get("requirements") or "").strip()}
+    except Exception:
+        pass
+
+    patterns = [
+        r"顶事件(?:为|是)?[:：]?\s*(.+)$",
+        r"分析(.+?)(?:故障树|故障|异常)?$",
+        r"生成(.+?)(?:故障树)?$",
+        r"针对(.+?)(?:进行|生成|分析)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            top_event = normalize_top_event_name(match.group(1))
+            if top_event:
+                return {"top_event": top_event, "requirements": ""}
+
+    if len(normalized) <= 40 and "\n" not in normalized:
+        return {"top_event": normalize_top_event_name(normalized), "requirements": ""}
+
+    raise ValueError("无法从 prompt 中提取顶事件")
+
+
+def generate_fault_tree(
+    top_event: str,
+    requirements: str = "",
+    selected_file_version_ids: Optional[List[str]] = None,
+    root_graph_node_id: Optional[str] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    def emit(message: str):
+        try:
+            print(message)
+        finally:
+            if log_callback:
+                try:
+                    log_callback(message)
+                except Exception:
+                    pass
+
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    if root_graph_node_id:
+        emit(f"[graph-match] using confirmed graph node '{root_graph_node_id}' for top event '{top_event}'")
+        matched_node = get_graph_node_by_id(
+            root_graph_node_id,
+            selected_file_version_ids=scoped_file_version_ids,
+        )
+        if not matched_node:
+            raise ValueError(f"Confirmed graph node not found in current scope: {root_graph_node_id}")
+        matched = {
+            "matched_node_id": matched_node.get("graph_node_id"),
+            "matched_name": matched_node.get("name") or top_event,
+            "matched_node": matched_node,
+            "matched_nodes": [
+                {
+                    "graph_node_id": matched_node.get("graph_node_id"),
+                    "name": matched_node.get("name"),
+                    "normalized_name": matched_node.get("normalized_name"),
+                    "file_id": matched_node.get("file_id"),
+                    "file_version_id": matched_node.get("file_version_id"),
+                }
+            ],
+            "alternatives": [],
+        }
+        root_node_ids = [matched_node.get("graph_node_id")]
+        emit(f"[graph-match] confirmed '{top_event}' -> '{matched['matched_name']}'")
+    else:
+        normalized_candidates = build_top_event_normalized_candidates(top_event, [top_event])
+        emit(f"[graph-match] matching top event '{top_event}'")
+        matched = match_top_event_from_graph(
+            top_event,
+            normalized_candidates=normalized_candidates,
+            selected_file_version_ids=scoped_file_version_ids,
+        )
+        matched_node = matched["matched_node"]
+        emit(f"[graph-match] matched '{top_event}' -> '{matched['matched_name']}'")
+        root_node_ids = [item.get("graph_node_id") for item in (matched.get("matched_nodes") or []) if item.get("graph_node_id")]
+
+    subgraph_bundle = expand_scoped_local_fault_subgraph(
+        root_node_ids or [matched["matched_node_id"]],
+        max_depth=GRAPH_TREE_MAX_DEPTH,
+        max_nodes=GRAPH_TREE_MAX_NODES,
+        selected_file_version_ids=scoped_file_version_ids,
+    )
+    emit(
+        f"[graph-subgraph] root={matched['matched_name']} roots={len(subgraph_bundle.get('roots') or [])} "
+        f"nodes={len(subgraph_bundle.get('nodes') or [])} edges={len(subgraph_bundle.get('edges') or [])}"
+    )
+
+    chunk_ids = collect_subgraph_chunks(subgraph_bundle, chunk_limit=MAX_CHUNKS_FOR_PROMPT)
+    evidence_chunks = hydrate_documents_by_chunk_ids(chunk_ids, selected_file_version_ids=scoped_file_version_ids)
+    raw_chunk_docs = []
+    chunk_doc_map = {
+        str(item.get("chunk_uid") or item["chunk_id"]): item
+        for item in evidence_chunks
+    }
+    for chunk_id in chunk_ids:
+        doc = chunk_doc_map.get(str(chunk_id))
+        if doc:
+            raw_chunk_docs.append(doc)
+    from database import get_chunks_by_ids  # local import to keep module surface small
+
+    raw_chunks = get_chunks_by_ids(
+        chunk_ids,
+        limit=max(len(chunk_ids), 1),
+        selected_file_version_ids=scoped_file_version_ids,
+    )
+    emit(f"[graph-chunks] collected {len(raw_chunks)} evidence chunks")
+
+    draft_tree = None
+    previous_issues = None
+    for attempt in range(1, MAX_RETRY + 2):
+        emit(f"[graph-llm] generating draft tree attempt={attempt}")
+        try:
+            draft_tree = build_fault_tree_from_subgraph_and_chunks(
+                top_event=matched["matched_name"],
+                subgraph_bundle=subgraph_bundle,
+                evidence_chunks=raw_chunks,
+                requirements=requirements,
+            )
+        except ValueError as exc:
+            if attempt > MAX_RETRY:
+                raise
+            previous_issues = [{"level": "ERROR", "message": str(exc)}]
+            continue
+
+        validation = validate_full(draft_tree, skip_semantic=True)
+        draft_tree["validation"] = validation
+        if validation["passed"]:
+            break
+        previous_issues = validation["issues"]
+        emit(
+            f"[graph-llm] draft validation failed errors={validation['error_count']} warnings={validation['warning_count']}"
+        )
+        if attempt > MAX_RETRY:
+            break
+
+    if draft_tree is None:
+        raise ValueError(f"Failed to build tree for '{top_event}'")
+
+    final_tree = draft_tree
+    try:
+        from diff_analyzer import format_corrections_for_repair, get_relevant_corrections
+
+        corrections = get_relevant_corrections(draft_tree)
+        if corrections:
+            emit(f"[repair] applying {len(corrections)} relevant corrections")
+            repaired = repair_fault_tree(draft_tree, format_corrections_for_repair(corrections), raw_chunks)
+            repair_validation = validate_full(repaired, skip_semantic=True)
+            if repair_validation["passed"]:
+                repaired["validation"] = repair_validation
+                final_tree = repaired
+                emit("[repair] repaired draft accepted")
+            else:
+                emit("[repair] repaired draft rejected, keeping original draft")
+    except Exception as exc:
+        emit(f"[repair] skipped due to error: {exc}")
+
+    final_validation = validate_full(final_tree, skip_semantic=False)
+    final_tree["validation"] = final_validation
+    evidence_chunk_ids = [chunk.get("chunk_uid") or chunk.get("chunk_id") for chunk in raw_chunks if chunk.get("chunk_uid") or chunk.get("chunk_id")]
+    subgraph_node_ids = [node.get("graph_node_id") for node in (subgraph_bundle.get("nodes") or []) if node.get("graph_node_id")]
+    final_tree["retrieval"] = {
+        "source": "graph_local_subgraph",
+        "matched_top_event": matched["matched_name"],
+        "matched_node_id": matched["matched_node_id"],
+        "matched_node_ids": root_node_ids or [matched["matched_node_id"]],
+        "alternatives": matched.get("alternatives") or [],
+        "source_file_version_ids": scoped_file_version_ids,
+        "subgraph_node_count": len(subgraph_bundle.get("nodes") or []),
+        "subgraph_edge_count": len(subgraph_bundle.get("edges") or []),
+        "chunk_ids": chunk_ids,
+        "evidence_chunk_ids": evidence_chunk_ids,
+        "subgraph_node_ids": subgraph_node_ids,
+    }
+    final_tree["source_file_version_ids"] = scoped_file_version_ids
+    return final_tree
+
+
+def generate_fault_tree_with_progress(
+    top_event: str,
+    requirements: str = "",
+    selected_file_version_ids: Optional[List[str]] = None,
+    root_graph_node_id: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    if progress_callback:
+        progress_callback(10, "prepare", "Preparing generation request")
+        progress_callback(25, "graph_match", "Matching top event from graph")
+        progress_callback(40, "graph_subgraph", "Expanding local graph subgraph")
+        progress_callback(55, "graph_chunks", "Collecting subgraph evidence chunks")
+        progress_callback(70, "graph_llm", "Building fault tree from subgraph and chunks")
+
+    tree_data = generate_fault_tree(
+        top_event,
+        requirements,
+        selected_file_version_ids=selected_file_version_ids,
+        root_graph_node_id=root_graph_node_id,
         log_callback=log_callback,
     )
 

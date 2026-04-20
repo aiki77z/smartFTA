@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
 from database import (
@@ -27,10 +27,12 @@ from database import (
     create_generation_job_item,
     create_tree,
     expand_scoped_local_fault_subgraph,
+    ensure_top_event_catalog_for_scope,
     find_active_job_item_by_top_event,
     find_active_job_item_by_top_event_and_scope,
     find_latest_generation_job_by_scope,
     find_tree_by_top_event,
+    get_top_event_catalog_by_graph_node_id,
     get_chunks_by_ids,
     import_chunks as import_chunks_to_db,
     import_entity_reverse_index as import_entity_reverse_index_to_db,
@@ -54,6 +56,7 @@ from database import (
     resolve_top_event_catalog,
     rollback_version,
     save_version,
+    search_top_event_catalog_semantic,
     top_event_catalog_col,
     try_mark_job_completion_logged,
     update_graph_node_properties,
@@ -79,6 +82,8 @@ from validator import validate_full, validate_semantics
 MAX_GENERATION_WORKERS = max(1, int(os.getenv("MAX_GENERATION_WORKERS", "2")))
 RESERVED_SINGLE_WORKERS = 1 if MAX_GENERATION_WORKERS > 1 else 0
 SHARED_WORKERS = max(1, MAX_GENERATION_WORKERS - RESERVED_SINGLE_WORKERS)
+DEFAULT_TOP_EVENT_CANDIDATE_LIMIT = 10
+MAX_TOP_EVENT_CANDIDATE_LIMIT = 15
 single_generation_queue: Queue[str] = Queue()
 batch_generation_queue: Queue[str] = Queue()
 generation_worker_threads: List[threading.Thread] = []
@@ -164,6 +169,168 @@ def _ensure_catalog_entry(
         return resolved
 
     raise ValueError(f"当前选源范围内未找到顶事件: {canonical_name}")
+
+
+def _graph_node_id_from_catalog(entry: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not entry:
+        return None
+    return entry.get("graph_node_id") or ((entry.get("graph_node_ids") or [None])[0])
+
+
+def _normalize_candidate_limit(value: Optional[int]) -> int:
+    return max(1, min(int(value or DEFAULT_TOP_EVENT_CANDIDATE_LIMIT), MAX_TOP_EVENT_CANDIDATE_LIMIT))
+
+
+def _clean_optional_text(value: Optional[str]) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.lower() in {"string", "null", "none", "undefined"}:
+        return None
+    return text
+
+
+def _build_top_event_resolution_payload(
+    *,
+    status: str,
+    requested_top_event: str,
+    requirements: str,
+    selected_file_version_ids: List[str],
+    catalog_entry: Optional[Dict[str, Any]] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    catalog_generated: bool = False,
+    source: str = "prompt",
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": status,
+        "requested_top_event": requested_top_event,
+        "requirements": requirements,
+        "selected_file_version_ids": selected_file_version_ids,
+        "catalog_generated": bool(catalog_generated),
+        "source": source,
+    }
+    if catalog_entry:
+        payload.update(
+            {
+                "resolved_top_event": catalog_entry["name"],
+                "normalized_top_event": catalog_entry["normalized_name"],
+                "graph_node_id": _graph_node_id_from_catalog(catalog_entry),
+                "catalog_entry": {
+                    "name": catalog_entry["name"],
+                    "display_name": catalog_entry.get("display_name") or catalog_entry["name"],
+                    "normalized_name": catalog_entry["normalized_name"],
+                    "aliases": catalog_entry.get("aliases") or [],
+                    "graph_node_id": _graph_node_id_from_catalog(catalog_entry),
+                    "graph_node_ids": catalog_entry.get("graph_node_ids") or [],
+                    "file_version_ids": catalog_entry.get("file_version_ids") or [],
+                    "source_chunk_ids": catalog_entry.get("source_chunk_ids") or [],
+                },
+            }
+        )
+    if candidates is not None:
+        payload["candidate_count"] = len(candidates)
+        payload["candidates"] = candidates
+    return payload
+
+
+def _resolve_prompt_top_event(
+    *,
+    prompt: str,
+    selected_file_version_ids: Optional[List[str]] = None,
+    candidate_limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    parsed_prompt = parse_user_prompt(prompt)
+    requested_top_event = parsed_prompt["top_event"]
+    requirements = parsed_prompt.get("requirements", "")
+    scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
+    ensured_catalog = ensure_top_event_catalog_for_scope(selected_file_version_ids=scoped_file_version_ids)
+    existing_catalog = ensured_catalog.get("catalog") or []
+    catalog_generated = bool(ensured_catalog.get("rebuilt_file_version_ids") or [])
+    if not existing_catalog:
+        raise ValueError("当前选源范围内没有可用顶事件")
+
+    normalized_candidates = build_top_event_normalized_candidates(requested_top_event, [requested_top_event])
+    exact_entry = resolve_top_event_catalog(
+        normalized_candidates=normalized_candidates,
+        selected_file_version_ids=scoped_file_version_ids,
+    )
+    if exact_entry:
+        payload = _build_top_event_resolution_payload(
+            status="exact_match",
+            requested_top_event=requested_top_event,
+            requirements=requirements,
+            selected_file_version_ids=scoped_file_version_ids,
+            catalog_entry=exact_entry,
+            candidates=[],
+            catalog_generated=catalog_generated,
+        )
+        payload["parsed_prompt"] = parsed_prompt
+        return payload
+
+    candidates = search_top_event_catalog_semantic(
+        requested_top_event,
+        selected_file_version_ids=scoped_file_version_ids,
+        limit=_normalize_candidate_limit(candidate_limit),
+    )
+    if not candidates:
+        raise ValueError("当前选源范围内没有找到可供确认的顶事件候选")
+    payload = _build_top_event_resolution_payload(
+        status="need_user_confirmation",
+        requested_top_event=requested_top_event,
+        requirements=requirements,
+        selected_file_version_ids=scoped_file_version_ids,
+        candidates=[
+            {
+                "rank": index + 1,
+                "display_name": item.get("display_name") or item.get("name"),
+                "name": item.get("name"),
+                "normalized_top_event": item.get("normalized_name"),
+                "graph_node_id": item.get("graph_node_id") or ((item.get("graph_node_ids") or [None])[0]),
+                "graph_node_ids": item.get("graph_node_ids") or [],
+                "aliases": item.get("aliases") or [],
+                "file_version_ids": item.get("file_version_ids") or [],
+                "score": round(float(item.get("score") or 0.0), 4),
+                "match_type": item.get("match_type") or "vector",
+            }
+            for index, item in enumerate(candidates)
+        ],
+        catalog_generated=catalog_generated,
+    )
+    payload["parsed_prompt"] = parsed_prompt
+    return payload
+
+
+def _resolve_confirmed_top_event(
+    *,
+    confirmed_top_event: Optional[str],
+    confirmed_normalized_top_event: Optional[str],
+    confirmed_graph_node_id: Optional[str],
+    selected_file_version_ids: List[str],
+) -> Dict[str, Any]:
+    if confirmed_graph_node_id:
+        entry = get_top_event_catalog_by_graph_node_id(
+            confirmed_graph_node_id,
+            selected_file_version_ids=selected_file_version_ids,
+        )
+        if entry:
+            return entry
+
+    candidate_values = _dedupe_keep_order(
+        [
+            confirmed_top_event,
+            confirmed_normalized_top_event,
+        ]
+    )
+    normalized_candidates = []
+    for value in candidate_values:
+        normalized_candidates.extend(build_top_event_normalized_candidates(value, [value]))
+    entry = resolve_top_event_catalog(
+        normalized_candidates=_dedupe_keep_order(normalized_candidates),
+        selected_file_version_ids=selected_file_version_ids,
+    )
+    if entry:
+        return entry
+    raise ValueError("当前选源范围内未找到用户确认的顶事件")
 
 
 def _merge_discovered_top_events(
@@ -452,9 +619,11 @@ def _build_single_generate_result(
     version: int,
     tree_data: Dict[str, Any],
     selected_file_version_ids: List[str],
-    parsed_top_event: str,
-    catalog_top_event: str,
+    requested_top_event: str,
+    resolved_top_event: str,
+    normalized_top_event: str,
     requirements: str,
+    graph_node_id: Optional[str] = None,
     job_id: Optional[str] = None,
     item_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -464,12 +633,15 @@ def _build_single_generate_result(
         "version": version,
         "selected_file_version_ids": selected_file_version_ids,
         "parsed_prompt": {
-            "top_event": parsed_top_event,
-            "catalog_top_event": catalog_top_event,
+            "requested_top_event": requested_top_event,
+            "resolved_top_event": resolved_top_event,
+            "normalized_top_event": normalized_top_event,
             "requirements": requirements,
         },
         "tree_data": tree_data,
     }
+    if graph_node_id:
+        payload["graph_node_id"] = graph_node_id
     if job_id:
         payload["job_id"] = job_id
     if item_id:
@@ -481,9 +653,11 @@ def _wait_for_single_item_result(
     *,
     item_id: str,
     selected_file_version_ids: List[str],
-    parsed_top_event: str,
-    catalog_top_event: str,
+    requested_top_event: str,
+    resolved_top_event: str,
+    normalized_top_event: str,
     requirements: str,
+    graph_node_id: Optional[str] = None,
     job_id: Optional[str] = None,
     execute_if_pending: bool = False,
 ) -> Dict[str, Any]:
@@ -510,9 +684,11 @@ def _wait_for_single_item_result(
                 version=int(version_doc.get("version") or 1),
                 tree_data=version_doc.get("tree_data") or {},
                 selected_file_version_ids=selected_file_version_ids,
-                parsed_top_event=parsed_top_event,
-                catalog_top_event=catalog_top_event,
+                requested_top_event=requested_top_event,
+                resolved_top_event=resolved_top_event,
+                normalized_top_event=normalized_top_event,
                 requirements=requirements,
+                graph_node_id=graph_node_id,
                 job_id=job_id or item.get("job_id"),
                 item_id=item_id,
             )
@@ -555,7 +731,10 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
     wall_started = time.perf_counter()
     job_id = item["job_id"]
     top_event = item["top_event"]
+    requested_top_event = item.get("requested_top_event") or top_event
+    resolved_top_event = item.get("resolved_top_event") or top_event
     normalized_top_event = item["normalized_top_event"]
+    graph_node_id = item.get("graph_node_id")
     aliases = _dedupe_keep_order(item.get("aliases") or [])
     requirements = item.get("requirements") or ""
     selected_file_version_ids = _resolve_selected_scope(item.get("source_file_version_ids") or [])
@@ -632,9 +811,12 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
         tree_id = f"ft_{uuid.uuid4().hex[:8]}"
         create_tree(
             tree_id=tree_id,
-            top_event=top_event,
-            catalog_name=top_event,
+            top_event=resolved_top_event,
+            requested_top_event=requested_top_event,
+            resolved_top_event=resolved_top_event,
+            catalog_name=resolved_top_event,
             normalized_top_event=normalized_top_event,
+            graph_node_id=graph_node_id,
             aliases=aliases,
             source_chunk_ids=item.get("source_chunk_ids") or [],
             source_file_version_ids=selected_file_version_ids,
@@ -694,14 +876,21 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
                 _append_event(mid, agent=agent, text=line)
 
         tree_data = generate_fault_tree_with_progress(
-            top_event=top_event,
+            top_event=resolved_top_event,
             requirements=requirements,
             selected_file_version_ids=selected_file_version_ids,
+            root_graph_node_id=graph_node_id,
             progress_callback=progress_callback,
             log_callback=log_callback,
         )
 
         retrieval = tree_data.get("retrieval") or {}
+        tree_data["resolution"] = {
+            "requested_top_event": requested_top_event,
+            "resolved_top_event": resolved_top_event,
+            "normalized_top_event": normalized_top_event,
+            "graph_node_id": graph_node_id or retrieval.get("matched_node_id"),
+        }
         evidence_chunk_ids = retrieval.get("evidence_chunk_ids") or retrieval.get("chunk_ids") or []
         subgraph_node_ids = retrieval.get("subgraph_node_ids") or []
         resolved_source_file_version_ids = retrieval.get("source_file_version_ids") or selected_file_version_ids
@@ -710,8 +899,11 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             tree_id=tree_id,
             tree_data=tree_data,
             editor="AI",
-            description=f"AI initial generation for top event: {top_event}",
+            description=f"AI initial generation for top event: {resolved_top_event}",
             is_ai=True,
+            requested_top_event=requested_top_event,
+            resolved_top_event=resolved_top_event,
+            normalized_top_event=normalized_top_event,
             source_file_version_ids=resolved_source_file_version_ids,
             evidence_chunk_ids=evidence_chunk_ids,
             subgraph_node_ids=subgraph_node_ids,
@@ -827,23 +1019,23 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
 
 def _queue_single_generation(
     prompt: str,
-    parsed_top_event: str,
+    requested_top_event: str,
     requirements: str,
+    catalog: Dict[str, Any],
+    graph_node_id_override: Optional[str] = None,
     selected_file_version_ids: Optional[List[str]] = None,
 ) -> Dict:
     scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
-    catalog = _ensure_catalog_entry(
-        parsed_top_event,
-        aliases=[parsed_top_event],
-        selected_file_version_ids=scoped_file_version_ids,
-    )
-    aliases = _dedupe_keep_order((catalog.get("aliases") or []) + [parsed_top_event])
+    resolved_top_event = catalog["name"]
+    normalized_top_event = catalog["normalized_name"]
+    graph_node_id = graph_node_id_override
+    aliases = _dedupe_keep_order((catalog.get("aliases") or []) + [requested_top_event, resolved_top_event])
 
     reused = find_tree_by_top_event(
-        top_event=catalog["name"],
-        normalized_top_event=catalog["normalized_name"],
+        top_event=resolved_top_event,
+        normalized_top_event=normalized_top_event,
         aliases=aliases,
-        catalog_name=catalog["name"],
+        catalog_name=resolved_top_event,
         source_file_version_ids=scoped_file_version_ids,
     )
     if reused:
@@ -853,19 +1045,23 @@ def _queue_single_generation(
             version=reused["version"],
             tree_data=reused["tree_data"],
             selected_file_version_ids=scoped_file_version_ids,
-            parsed_top_event=parsed_top_event,
-            catalog_top_event=catalog["name"],
+            requested_top_event=requested_top_event,
+            resolved_top_event=resolved_top_event,
+            normalized_top_event=normalized_top_event,
             requirements=requirements,
+            graph_node_id=graph_node_id,
         )
 
-    active_item = find_active_job_item_by_top_event_and_scope(catalog["normalized_name"], scoped_file_version_ids)
+    active_item = find_active_job_item_by_top_event_and_scope(normalized_top_event, scoped_file_version_ids)
     if active_item:
         return _wait_for_single_item_result(
             item_id=active_item["item_id"],
             selected_file_version_ids=scoped_file_version_ids,
-            parsed_top_event=parsed_top_event,
-            catalog_top_event=catalog["name"],
+            requested_top_event=requested_top_event,
+            resolved_top_event=resolved_top_event,
+            normalized_top_event=normalized_top_event,
             requirements=requirements,
+            graph_node_id=graph_node_id,
             job_id=active_item.get("job_id"),
             execute_if_pending=(active_item.get("status") == "pending"),
         )
@@ -873,34 +1069,46 @@ def _queue_single_generation(
     job = create_generation_job(
         job_type="single",
         total=1,
-        top_event=catalog["name"],
+        top_event=resolved_top_event,
         source_file_version_ids=scoped_file_version_ids,
         metadata={
             "requested_prompt": prompt,
             "source": "/api/tree/generate",
+            "requested_top_event": requested_top_event,
+            "resolved_top_event": resolved_top_event,
+            "normalized_top_event": normalized_top_event,
+            "graph_node_id": graph_node_id,
             "selected_file_version_ids": scoped_file_version_ids,
         },
     )
     item = create_generation_job_item(
         job_id=job["job_id"],
-        top_event=catalog["name"],
-        normalized_top_event=catalog["normalized_name"],
+        top_event=resolved_top_event,
+        requested_top_event=requested_top_event,
+        resolved_top_event=resolved_top_event,
+        normalized_top_event=normalized_top_event,
+        graph_node_id=graph_node_id,
         aliases=aliases,
         source_chunk_ids=catalog.get("source_chunk_ids") or [],
         source_file_version_ids=scoped_file_version_ids,
         requirements=requirements,
         metadata={
             "requested_prompt": prompt,
-            "query_top_event": parsed_top_event,
+            "query_top_event": requested_top_event,
+            "resolved_top_event": resolved_top_event,
+            "normalized_top_event": normalized_top_event,
+            "graph_node_id": graph_node_id,
             "selected_file_version_ids": scoped_file_version_ids,
         },
     )
     return _wait_for_single_item_result(
         item_id=item["item_id"],
         selected_file_version_ids=scoped_file_version_ids,
-        parsed_top_event=parsed_top_event,
-        catalog_top_event=catalog["name"],
+        requested_top_event=requested_top_event,
+        resolved_top_event=resolved_top_event,
+        normalized_top_event=normalized_top_event,
         requirements=requirements,
+        graph_node_id=graph_node_id,
         job_id=job["job_id"],
         execute_if_pending=True,
     )
@@ -941,8 +1149,36 @@ if _VALIDATOR_DIR.exists():
 
 
 class GenerateRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "prompt": "生成我一个顶事件为核心组件故障的故障树",
+                "selected_file_version_ids": ["fv_test_part1_cleaned_v1", "fv_test_part2_cleaned_v1"],
+                "candidate_limit": 10,
+            }
+        }
+    )
     prompt: str
     selected_file_version_ids: Optional[List[str]] = None
+    candidate_limit: int = DEFAULT_TOP_EVENT_CANDIDATE_LIMIT
+    confirmed_top_event: Optional[str] = None
+    confirmed_normalized_top_event: Optional[str] = None
+    confirmed_graph_node_id: Optional[str] = None
+
+
+class ResolveTopEventRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "prompt": "生成我一个顶事件为核心组件故障的故障树",
+                "selected_file_version_ids": ["fv_test_part1_cleaned_v1", "fv_test_part2_cleaned_v1"],
+                "candidate_limit": 10,
+            }
+        }
+    )
+    prompt: str
+    selected_file_version_ids: Optional[List[str]] = None
+    candidate_limit: int = DEFAULT_TOP_EVENT_CANDIDATE_LIMIT
 
 
 class GraphRecallDebugRequest(BaseModel):
@@ -1154,23 +1390,69 @@ def _import_relations_from_file(
     }
 
 
+@app.post("/api/tree/resolve-top-event")
+def api_resolve_top_event(req: ResolveTopEventRequest):
+    try:
+        return _resolve_prompt_top_event(
+            prompt=req.prompt,
+            selected_file_version_ids=req.selected_file_version_ids,
+            candidate_limit=req.candidate_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Resolve top event failed: {exc}")
+
+
 @app.post("/api/tree/generate")
 def api_generate(req: GenerateRequest):
     try:
-        parsed = parse_user_prompt(req.prompt)
-        top_event = parsed["top_event"]
-        requirements = parsed.get("requirements", "")
+        resolution = _resolve_prompt_top_event(
+            prompt=req.prompt,
+            selected_file_version_ids=req.selected_file_version_ids,
+            candidate_limit=req.candidate_limit,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Prompt parse failed: {exc}")
 
+    requested_top_event = resolution["requested_top_event"]
+    requirements = resolution.get("requirements", "")
+    scoped_file_version_ids = resolution["selected_file_version_ids"]
+    exact_catalog = resolution.get("catalog_entry")
+    confirmed_top_event = _clean_optional_text(req.confirmed_top_event)
+    confirmed_normalized_top_event = _clean_optional_text(req.confirmed_normalized_top_event)
+    confirmed_graph_node_id = _clean_optional_text(req.confirmed_graph_node_id)
+
+    if not any([confirmed_top_event, confirmed_normalized_top_event, confirmed_graph_node_id]):
+        if resolution["status"] != "exact_match":
+            return {
+                "mode": "need_confirmation",
+                **resolution,
+            }
+        catalog = exact_catalog
+    else:
+        try:
+            catalog = _resolve_confirmed_top_event(
+                confirmed_top_event=confirmed_top_event,
+                confirmed_normalized_top_event=confirmed_normalized_top_event,
+                confirmed_graph_node_id=confirmed_graph_node_id,
+                selected_file_version_ids=scoped_file_version_ids,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Confirm top event failed: {exc}")
+
     try:
         return _queue_single_generation(
             req.prompt,
-            top_event,
+            requested_top_event,
             requirements,
-            selected_file_version_ids=req.selected_file_version_ids,
+            catalog,
+            graph_node_id_override=(confirmed_graph_node_id or _graph_node_id_from_catalog(catalog)) if any([confirmed_top_event, confirmed_normalized_top_event, confirmed_graph_node_id]) else None,
+            selected_file_version_ids=scoped_file_version_ids,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1271,6 +1553,7 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
                 "relations_file": str(relations_path) if relations_path else None,
             },
             "next_steps": {
+                "resolve_top_event": "/api/tree/resolve-top-event",
                 "preview_top_events": "/api/batch/preview-top-events",
                 "generate_all": "/api/batch/generate-all",
             },
@@ -1710,6 +1993,9 @@ def api_save(tree_id: str, req: SaveRequest):
         editor=req.editor,
         description=description,
         is_ai=False,
+        requested_top_event=(prev_ver or {}).get("requested_top_event") or meta.get("requested_top_event"),
+        resolved_top_event=(prev_ver or {}).get("resolved_top_event") or meta.get("resolved_top_event") or meta.get("top_event"),
+        normalized_top_event=(prev_ver or {}).get("normalized_top_event") or meta.get("normalized_top_event"),
         source_file_version_ids=(prev_ver or {}).get("source_file_version_ids") or meta.get("source_file_version_ids") or [],
         evidence_chunk_ids=(prev_ver or {}).get("evidence_chunk_ids") or (prev_ver or {}).get("source_chunk_ids") or meta.get("source_chunk_ids") or [],
         subgraph_node_ids=(prev_ver or {}).get("subgraph_node_ids") or [],
