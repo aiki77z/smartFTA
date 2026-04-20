@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from openai import OpenAI
 
 from config import (
+    ENABLE_GRAPH_RETRIEVAL,
     GRAPH_TREE_MAX_DEPTH,
     GRAPH_TREE_MAX_NODES,
     LLM_API_KEY,
@@ -33,10 +34,14 @@ from database import (
     collect_subgraph_chunks,
     expand_scoped_local_fault_subgraph,
     get_graph_node_by_id,
+    get_chunks_by_ids,
     hydrate_documents_by_chunk_ids,
     list_graph_top_event_candidates,
     match_top_event_from_graph,
     resolve_selected_file_version_ids,
+    resolve_top_event_catalog,
+    search_chunks_by_entity_names,
+    search_chunks_by_keywords,
 )
 from validator import validate_full
 
@@ -717,10 +722,15 @@ def generate_fault_tree_with_progress(
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
-        progress_callback(25, "graph_match", "Matching top event from graph")
-        progress_callback(40, "graph_subgraph", "Expanding local graph subgraph")
-        progress_callback(55, "graph_chunks", "Collecting subgraph evidence chunks")
-        progress_callback(70, "graph_llm", "Building fault tree from subgraph and chunks")
+        if ENABLE_GRAPH_RETRIEVAL:
+            progress_callback(25, "graph_match", "Matching top event from graph")
+            progress_callback(40, "graph_subgraph", "Expanding local graph subgraph")
+            progress_callback(55, "graph_chunks", "Collecting subgraph evidence chunks")
+            progress_callback(70, "graph_llm", "Building fault tree from subgraph and chunks")
+        else:
+            progress_callback(25, "chunk_recall", "Resolving top event evidence chunks")
+            progress_callback(45, "chunk_extract", "Extracting fault elements from chunks")
+            progress_callback(70, "chunk_llm", "Building fault tree from recalled chunks")
 
     tree_data = generate_fault_tree(
         top_event,
@@ -732,6 +742,261 @@ def generate_fault_tree_with_progress(
     if progress_callback:
         progress_callback(90, "persistence", "Generation completed, persisting result")
     return tree_data
+
+
+def _chunk_reference(chunk: Dict[str, Any]) -> Any:
+    return chunk.get("chunk_uid") or chunk.get("id", chunk.get("chunk_id"))
+
+
+def _format_chunks_for_prompt(chunks: List[Dict[str, Any]]) -> str:
+    lines = []
+    for chunk in (chunks or [])[:MAX_CHUNKS_FOR_PROMPT]:
+        content = str(chunk.get("content") or "").strip()
+        if len(content) > MAX_CHUNK_CHARS:
+            content = content[:MAX_CHUNK_CHARS] + "..."
+        lines.append(
+            f"[chunk_id={_chunk_reference(chunk)} | {chunk.get('chunk_name', '')} | 章节:{chunk.get('section_path', '')} | 页码:{chunk.get('source', '')}]\n"
+            f"{content}\n"
+            f"{'─' * 50}"
+        )
+    return "\n".join(lines)
+
+
+def _extract_keywords(text: str) -> List[str]:
+    try:
+        import jieba.analyse
+
+        keywords = jieba.analyse.extract_tags(text, topK=8)
+        return keywords if keywords else [text]
+    except Exception:
+        return [text]
+
+
+def _append_unique_chunks(
+    existing: List[Dict[str, Any]],
+    docs: List[Dict[str, Any]],
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    merged = list(existing or [])
+    seen = {str(_chunk_reference(doc)) for doc in merged if _chunk_reference(doc) not in (None, "")}
+    for doc in docs or []:
+        key = _chunk_reference(doc)
+        if key in (None, ""):
+            continue
+        key = str(key)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(doc)
+        if len(merged) >= limit:
+            break
+    return merged[:limit]
+
+
+def _collect_chunk_only_evidence(
+    top_event: str,
+    *,
+    selected_file_version_ids: Optional[List[str]] = None,
+    limit: int = MAX_CHUNKS_FOR_PROMPT,
+) -> Dict[str, Any]:
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    normalized_candidates = build_top_event_normalized_candidates(top_event, [top_event])
+    catalog_entry = resolve_top_event_catalog(
+        normalized_candidates=normalized_candidates,
+        selected_file_version_ids=scoped_file_version_ids,
+    )
+
+    raw_chunks: List[Dict[str, Any]] = []
+    matched_top_event = top_event
+    matched_node_id = None
+
+    if catalog_entry:
+        matched_top_event = catalog_entry.get("name") or top_event
+        matched_node_id = catalog_entry.get("graph_node_id") or ((catalog_entry.get("graph_node_ids") or [None])[0])
+        catalog_chunk_ids = list(catalog_entry.get("source_chunk_ids") or [])
+        if catalog_chunk_ids:
+            raw_chunks = _append_unique_chunks(
+                raw_chunks,
+                get_chunks_by_ids(
+                    catalog_chunk_ids,
+                    limit=max(len(catalog_chunk_ids), 1),
+                    selected_file_version_ids=scoped_file_version_ids,
+                ),
+                limit=limit,
+            )
+
+    entity_names = _dedupe_keep_order(
+        [
+            matched_top_event,
+            top_event,
+            *((catalog_entry or {}).get("aliases") or []),
+            *((catalog_entry or {}).get("normalized_aliases") or []),
+        ]
+    )
+    if entity_names and len(raw_chunks) < limit:
+        raw_chunks = _append_unique_chunks(
+            raw_chunks,
+            search_chunks_by_entity_names(
+                entity_names,
+                limit=limit,
+                selected_file_version_ids=scoped_file_version_ids,
+            ),
+            limit=limit,
+        )
+
+    keyword_candidates = _dedupe_keep_order(entity_names + _extract_keywords(matched_top_event))
+    if keyword_candidates and len(raw_chunks) < limit:
+        raw_chunks = _append_unique_chunks(
+            raw_chunks,
+            search_chunks_by_keywords(
+                keyword_candidates,
+                limit=limit,
+                selected_file_version_ids=scoped_file_version_ids,
+            ),
+            limit=limit,
+        )
+
+    chunk_ids = [_chunk_reference(chunk) for chunk in raw_chunks if _chunk_reference(chunk) not in (None, "")]
+    return {
+        "matched_top_event": matched_top_event,
+        "matched_node_id": matched_node_id,
+        "catalog_entry": catalog_entry,
+        "chunk_ids": chunk_ids,
+        "chunks": raw_chunks,
+        "source_file_version_ids": scoped_file_version_ids,
+    }
+
+
+def extract_fault_elements_from_chunks(top_event: str, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prompt = f"""你是工业设备故障分析专家，精通FTA故障树分析方法。
+
+## 参考知识（来自设备手册）
+{_format_chunks_for_prompt(chunks)}
+
+## 任务
+从上述知识中，提取与以下故障相关的所有故障事件、因果关系和触发条件：
+顶事件：{top_event}
+
+## 提取规则
+1. 顶事件（top_event）只有一个，就是给定的顶事件
+2. 中间事件（intermediate_event）表示还可以继续向下分解的原因
+3. 底事件（basic_event）表示最根本、可检测、不可再分的原因
+4. gate=OR 表示任一子事件发生即可导致父事件
+5. gate=AND 表示所有子事件同时发生才导致父事件
+6. rules 尽量提取量化触发条件；没有就输出空数组
+7. investigateMethod 尽量给出具体排查方法
+
+## 输出格式（严格JSON，无多余文字）
+{{
+  "events": [
+    {{
+      "name": "事件名称",
+      "type": "top_event/intermediate_event/basic_event",
+      "description": "详细描述",
+      "errorLevel": "高/中/低",
+      "investigateMethod": "排查方法",
+      "rules": [
+        {{
+          "measurePointName": "监测点名称",
+          "symbol": ">",
+          "thresholds": ["阈值"],
+          "duration": "持续时长"
+        }}
+      ]
+    }}
+  ],
+  "relations": [
+    {{"parent": "父事件名称", "child": "子事件名称", "gate": "OR"}}
+  ]
+}}
+"""
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=2200,
+    )
+    return _parse_json(response.choices[0].message.content)
+
+
+def build_fault_tree_from_chunk_elements(
+    top_event: str,
+    elements: Dict[str, Any],
+    chunks: List[Dict[str, Any]],
+    requirements: str = "",
+    previous_issues: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    chunks_ref = [
+        {
+            "chunk_id": _chunk_reference(chunk),
+            "chunk_name": chunk.get("chunk_name", ""),
+            "section_path": chunk.get("section_path", ""),
+            "source_page": chunk.get("source", ""),
+            "file_id": chunk.get("file_id", ""),
+            "file_version_id": chunk.get("file_version_id", ""),
+        }
+        for chunk in chunks
+    ]
+    retry_hint = ""
+    if previous_issues:
+        error_msgs = [
+            f"- [{item['level']}] {item['message']} (节点: {item.get('node_name', '')})"
+            for item in previous_issues
+            if item.get("level") in {"ERROR", "WARNING"}
+        ]
+        if error_msgs:
+            retry_hint = "\n## 上次生成存在以下问题，请修正\n" + "\n".join(error_msgs) + "\n"
+
+    prompt = f"""你是工业设备故障树分析专家，精通FTA方法。
+
+## 参考知识（来自设备手册）
+{_format_chunks_for_prompt(chunks)}
+
+## 可用的溯源chunk列表（用于填写documents字段）
+{json.dumps(chunks_ref, ensure_ascii=False, indent=2)}
+
+## 已提取的故障要素
+{json.dumps(elements, ensure_ascii=False, indent=2)}
+{retry_hint}
+## 用户额外要求
+{requirements or '无'}
+
+## 任务
+为顶事件“{top_event}”生成完整、规范的故障树。
+
+## 生成规则
+1. 每个节点id格式：node-{{8位十六进制}}，全部唯一
+2. event.id格式：E001, E002...依次递增
+3. 顶事件的event字段固定为null
+4. 中间事件和底事件必须填完整event对象
+5. errorLevel必须填写：高/中/低
+6. rules尽量从手册提取触发条件；无量化数据则填[]
+7. documents只能从给定chunk列表中选择，每个节点最多2条
+8. investigateMethod尽量控制在40字以内
+9. description尽量控制在60字以内
+10. linkList的sourceId是子节点（原因方），targetId是父节点（结果方）
+11. 故障树深度3-5层
+12. 节点总数尽量控制在8~18个，避免无关扩展
+13. 只输出完整JSON，不要输出markdown
+
+## 输出格式
+{{
+  "nodeList": [...],
+  "linkList": [...]
+}}
+"""
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=LLM_GENERATION_MAX_TOKENS,
+    )
+    return _parse_json(response.choices[0].message.content)
 
 
 def parse_user_prompt(prompt: str) -> dict:
@@ -800,6 +1065,130 @@ def generate_fault_tree(
                     log_callback(message)
                 except Exception:
                     pass
+
+    if not ENABLE_GRAPH_RETRIEVAL:
+        retrieval = _collect_chunk_only_evidence(
+            top_event,
+            selected_file_version_ids=selected_file_version_ids,
+            limit=MAX_CHUNKS_FOR_PROMPT,
+        )
+        raw_chunks = retrieval["chunks"] or []
+        matched_top_event = retrieval.get("matched_top_event") or top_event
+        matched_node_id = root_graph_node_id or retrieval.get("matched_node_id")
+        scoped_file_version_ids = retrieval.get("source_file_version_ids") or resolve_selected_file_version_ids(
+            selected_file_version_ids,
+            fallback_to_active=True,
+            require_active=False,
+        )
+        if not raw_chunks:
+            raise ValueError(f"未找到与'{top_event}'相关的证据 chunks，请检查 top_event_catalog 或 chunks 数据")
+
+        emit(f"[chunk-recall] matched '{top_event}' -> '{matched_top_event}'")
+        emit(f"[chunk-recall] collected {len(raw_chunks)} evidence chunks")
+        emit("[chunk-llm] extracting fault elements from chunks")
+        elements = extract_fault_elements_from_chunks(matched_top_event, raw_chunks)
+        emit(
+            f"[chunk-llm] extracted elements "
+            f"events={len(elements.get('events') or [])} relations={len(elements.get('relations') or [])}"
+        )
+
+        draft_tree = None
+        previous_issues = None
+        for attempt in range(1, MAX_RETRY + 2):
+            emit(f"[chunk-llm] generating draft tree attempt={attempt}")
+            try:
+                draft_tree = build_fault_tree_from_chunk_elements(
+                    top_event=matched_top_event,
+                    elements=elements,
+                    chunks=raw_chunks,
+                    requirements=requirements,
+                    previous_issues=previous_issues,
+                )
+                emit(
+                    f"[chunk-draft] generated draft attempt={attempt} "
+                    f"nodes={len(draft_tree.get('nodeList') or [])} links={len(draft_tree.get('linkList') or [])}"
+                )
+            except ValueError as exc:
+                emit(f"[chunk-draft] draft generation error attempt={attempt} error={exc}")
+                if attempt > MAX_RETRY:
+                    raise
+                previous_issues = [{"level": "ERROR", "message": str(exc)}]
+                emit(f"[chunk-regenerate] retrying draft generation next_attempt={attempt + 1}")
+                continue
+
+            emit(f"[chunk-validate] validating draft attempt={attempt}")
+            validation = validate_full(draft_tree, skip_semantic=True)
+            draft_tree["validation"] = validation
+            if validation["passed"]:
+                emit(
+                    f"[chunk-validate] validation passed attempt={attempt} "
+                    f"errors={validation['error_count']} warnings={validation['warning_count']}"
+                )
+                break
+            previous_issues = validation["issues"]
+            emit(
+                f"[chunk-validate] validation failed attempt={attempt} "
+                f"errors={validation['error_count']} warnings={validation['warning_count']}"
+            )
+            if attempt <= MAX_RETRY:
+                emit(f"[chunk-regenerate] retrying draft generation next_attempt={attempt + 1}")
+            if attempt > MAX_RETRY:
+                break
+
+        if draft_tree is None:
+            raise ValueError(f"Failed to build tree for '{top_event}'")
+
+        final_tree = draft_tree
+        try:
+            from diff_analyzer import format_corrections_for_repair, get_relevant_corrections
+
+            corrections = get_relevant_corrections(draft_tree)
+            if corrections:
+                emit(f"[history-repair] applying {len(corrections)} relevant corrections")
+                repaired = repair_fault_tree(draft_tree, format_corrections_for_repair(corrections), raw_chunks)
+                emit("[chunk-validate] validating repaired draft")
+                repair_validation = validate_full(repaired, skip_semantic=True)
+                if repair_validation["passed"]:
+                    repaired["validation"] = repair_validation
+                    final_tree = repaired
+                    emit(
+                        f"[history-repair] repaired draft accepted "
+                        f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
+                    )
+                else:
+                    emit(
+                        f"[history-repair] repaired draft rejected "
+                        f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
+                    )
+            else:
+                emit("[history-repair] no relevant corrections, skipped")
+        except Exception as exc:
+            emit(f"[history-repair] skipped due to error: {exc}")
+
+        emit("[chunk-validate] validating final tree")
+        final_validation = validate_full(final_tree, skip_semantic=False)
+        final_tree["validation"] = final_validation
+        emit(
+            f"[chunk-validate] final validation "
+            f"{'passed' if final_validation['passed'] else 'failed'} "
+            f"errors={final_validation['error_count']} warnings={final_validation['warning_count']}"
+        )
+        evidence_chunk_ids = [_chunk_reference(chunk) for chunk in raw_chunks if _chunk_reference(chunk) not in (None, "")]
+        final_tree["retrieval"] = {
+            "source": "top_event_catalog_chunks",
+            "matched_top_event": matched_top_event,
+            "matched_node_id": matched_node_id,
+            "matched_node_ids": [matched_node_id] if matched_node_id else [],
+            "alternatives": [],
+            "source_file_version_ids": scoped_file_version_ids,
+            "subgraph_node_count": 0,
+            "subgraph_edge_count": 0,
+            "chunk_ids": retrieval.get("chunk_ids") or evidence_chunk_ids,
+            "evidence_chunk_ids": evidence_chunk_ids,
+            "subgraph_node_ids": [],
+        }
+        final_tree["source_file_version_ids"] = scoped_file_version_ids
+        return final_tree
 
     scoped_file_version_ids = resolve_selected_file_version_ids(
         selected_file_version_ids,
@@ -983,10 +1372,15 @@ def generate_fault_tree_with_progress(
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
-        progress_callback(25, "graph_match", "Matching top event from graph")
-        progress_callback(40, "graph_subgraph", "Expanding local graph subgraph")
-        progress_callback(55, "graph_chunks", "Collecting subgraph evidence chunks")
-        progress_callback(70, "graph_llm", "Building fault tree from subgraph and chunks")
+        if ENABLE_GRAPH_RETRIEVAL:
+            progress_callback(25, "graph_match", "Matching top event from graph")
+            progress_callback(40, "graph_subgraph", "Expanding local graph subgraph")
+            progress_callback(55, "graph_chunks", "Collecting subgraph evidence chunks")
+            progress_callback(70, "graph_llm", "Building fault tree from subgraph and chunks")
+        else:
+            progress_callback(25, "chunk_recall", "Resolving top event evidence chunks")
+            progress_callback(45, "chunk_extract", "Extracting fault elements from chunks")
+            progress_callback(70, "chunk_llm", "Building fault tree from recalled chunks")
 
     tree_data = generate_fault_tree(
         top_event,

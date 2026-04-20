@@ -178,6 +178,24 @@ def _embed_strings_ordered(strings: List[str]) -> List[Optional[List[float]]]:
     return [lookup.get(text or "") for text in strings]
 
 
+def _build_top_event_embedding_fields(semantic_text: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "semantic_text": semantic_text,
+        "embedding": None,
+        "embedding_model": None,
+        "embedding_updated_at": None,
+    }
+    if not semantic_text or not EMBEDDING_MODEL:
+        return payload
+
+    embedding = _embed_strings_ordered([semantic_text])[0]
+    if embedding:
+        payload["embedding"] = embedding
+        payload["embedding_model"] = EMBEDDING_MODEL
+        payload["embedding_updated_at"] = _now()
+    return payload
+
+
 def _cosine_similarity(left: Optional[List[float]], right: Optional[List[float]]) -> float:
     if not left or not right or len(left) != len(right):
         return -1.0
@@ -2116,12 +2134,7 @@ def upsert_top_event_catalog_entry(
         previous_semantic_text = existing.get("semantic_text") or ""
         embedding_payload = {}
         if previous_semantic_text != semantic_text:
-            embedding_payload = {
-                "semantic_text": semantic_text,
-                "embedding": None,
-                "embedding_model": None,
-                "embedding_updated_at": None,
-            }
+            embedding_payload = _build_top_event_embedding_fields(semantic_text)
         top_event_catalog_col.update_one(
             {"_id": doc_id},
             {
@@ -2141,6 +2154,7 @@ def upsert_top_event_catalog_entry(
             },
         )
     else:
+        embedding_payload = _build_top_event_embedding_fields(semantic_text)
         top_event_catalog_col.insert_one(
             {
                 "_id": doc_id,
@@ -2152,10 +2166,7 @@ def upsert_top_event_catalog_entry(
                 "normalized_name": normalized_name,
                 "aliases": aliases,
                 "normalized_aliases": normalized_aliases,
-                "semantic_text": semantic_text,
-                "embedding": None,
-                "embedding_model": None,
-                "embedding_updated_at": None,
+                **embedding_payload,
                 "source_chunk_ids": source_chunk_ids,
                 "graph_node_id": graph_node_id,
                 "created_at": now,
