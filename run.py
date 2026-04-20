@@ -1,4 +1,4 @@
-﻿# run.py
+# run.py
 from __future__ import annotations
 
 """
@@ -126,7 +126,10 @@ def main():
         description="PDF 知识抽取完整流水线：PDF -> MD -> 清理MD -> 分块 -> 实体 -> 关系"
     )
     parser.add_argument("--pdf", "-p", help="输入的 PDF 文件路径；导入模式下仅用于推断 pdf_stem")
-    # parser.add_argument("--pdf-stem", help="导入模式下显式指定产物前缀，例如 test_cleaned")
+    parser.add_argument(
+        "--pdf-stem",
+        help="显式指定产物前缀（pdf_stem）。导入模式下用于定位 *_chunks.json；生成模式下可用于兼容上层服务参数契约。",
+    )
     parser.add_argument("--output-dir", "-o", default="./output", help="输出根目录（默认 ./output）")
     parser.add_argument("--chunk-size", "-s", type=int, default=800, help="分块大小（字符数），默认 800")
     parser.add_argument("--skip-mineru", action="store_true", help="跳过 MinerU 转换步骤（假设已有 MD 文件）")
