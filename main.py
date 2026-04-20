@@ -74,6 +74,11 @@ class PipelineJobRequest(BaseModel):
         None,
         description="展示用原始文件名；缺省时用 pdf_path 的文件名或 {pdf_stem}.pdf",
     )
+    # 与 run.py 版本目录名一致（如 {pdf_stem}_v1）；缺省为同步时 result_dir 的目录名
+    file_version_id: Optional[str] = Field(
+        None,
+        description="显式传给 GNR 的 file_version_id，需与 chunks/relations 产物一致",
+    )
 
 
 class Neo4jImportRequest(BaseModel):
@@ -205,6 +210,13 @@ def _resolve_import_display_file_name(request: PipelineJobRequest, pdf_stem: str
     return f"{pdf_stem}.pdf"
 
 
+def _resolve_sync_file_version_id(request: PipelineJobRequest, artifacts: Dict[str, str]) -> str:
+    explicit = (request.file_version_id or "").strip()
+    if explicit:
+        return explicit
+    return Path(artifacts["result_dir"]).expanduser().resolve().name
+
+
 def _build_generate_fta_contract(
     artifacts: Dict[str, str],
     base_url: str,
@@ -212,8 +224,10 @@ def _build_generate_fta_contract(
     *,
     pdf_stem: str,
     file_name: str,
+    file_version_id: Optional[str] = None,
 ) -> Dict[str, object]:
     endpoint = base_url.rstrip("/") + "/api/integration/import-knowledge-artifacts"
+    resolved_fv = file_version_id or Path(artifacts["result_dir"]).expanduser().resolve().name
     payload = {
         "chunks_file": artifacts["chunks_json"],
         "entities_file": artifacts["entities_merged_json"],
@@ -223,6 +237,7 @@ def _build_generate_fta_contract(
         "source": "knowledge_base_construction",
         "file_id": pdf_stem,
         "file_name": file_name,
+        "file_version_id": resolved_fv,
     }
     return {
         "generate_fta_endpoint": endpoint,
@@ -244,6 +259,7 @@ def _post_generate_fta_import(
 ) -> Dict[str, object]:
     endpoint = request.generate_fta_base_url.rstrip("/") + "/api/integration/import-knowledge-artifacts"
     display_name = _resolve_import_display_file_name(request, pdf_stem)
+    sync_fv = _resolve_sync_file_version_id(request, artifacts)
     payload = {
         "chunks_file": artifacts["chunks_json"],
         "entities_file": None if request.skip_entity else artifacts["entities_merged_json"],
@@ -255,6 +271,7 @@ def _post_generate_fta_import(
         # 与产物内 file_id 对齐，避免 GNR 自建 file_* 导致 Mongo/Neo4j 与 chunks 元数据分裂
         "file_id": pdf_stem,
         "file_name": display_name,
+        "file_version_id": sync_fv,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib_request.Request(
@@ -318,6 +335,7 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
                 request.clear_graph_before_import,
                 pdf_stem=pdf_stem,
                 file_name=display_file_name,
+                file_version_id=_resolve_sync_file_version_id(request, artifacts),
             ),
             "command": cmd,
         },
@@ -439,7 +457,20 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
     if version_dir:
         artifacts = _build_artifacts_for_dir(pdf_stem, version_dir)
         try:
-            _set_job(job_id, {"artifacts": artifacts})
+            _set_job(
+                job_id,
+                {
+                    "artifacts": artifacts,
+                    "integration": _build_generate_fta_contract(
+                        artifacts,
+                        request.generate_fta_base_url,
+                        request.clear_graph_before_import,
+                        pdf_stem=pdf_stem,
+                        file_name=display_file_name,
+                        file_version_id=_resolve_sync_file_version_id(request, artifacts),
+                    ),
+                },
+            )
         except Exception:
             pass
 
@@ -582,6 +613,7 @@ def run_pipeline_job(request: PipelineJobRequest):
                 normalized_request.clear_graph_before_import,
                 pdf_stem=pdf_stem,
                 file_name=display_file_name,
+                file_version_id=_resolve_sync_file_version_id(normalized_request, artifacts),
             ),
         },
     )
