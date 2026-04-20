@@ -91,6 +91,8 @@ def parse_entities(text: str, chunk: Dict) -> List[Dict]:
         if len(name) > 20:
             continue
 
+        fid = str(chunk.get("file_id") or "").strip()
+        fvid = str(chunk.get("file_version_id") or "").strip()
         entity_obj = {
             "name": name,
             "entity_type": entity_type,
@@ -107,7 +109,10 @@ def parse_entities(text: str, chunk: Dict) -> List[Dict]:
                 "source": source
             }],
             "source_chunk_ids": [str(chunk.get("chunk_id") or chunk.get("id", "0"))],
-            "support_count": 1
+            "support_count": 1,
+            "file_id": fid,
+            "file_version_id": fvid,
+            "is_active": bool(chunk.get("is_active", True)),
         }
         valid_entities.append(entity_obj)
         seen_names.add(name)
@@ -368,7 +373,10 @@ def merge_entities(entities_results: List[Dict], output_file: str, max_workers: 
                 "showProbability": entity["showProbability"],
                 "documents": entity["documents"].copy(),
                 "source_chunk_ids": set(entity["source_chunk_ids"]),
-                "support_count": 1
+                "support_count": 1,
+                "file_id": str(entity.get("file_id") or "").strip(),
+                "file_version_id": str(entity.get("file_version_id") or "").strip(),
+                "is_active": bool(entity.get("is_active", True)),
             }
             name_to_instances[name].append(instance)
 
@@ -460,6 +468,8 @@ def merge_entities(entities_results: List[Dict], output_file: str, max_workers: 
                     merged_docs.append(doc)
             merged_chunk_ids.update(inst["source_chunk_ids"])
 
+        _fid = str(first.get("file_id") or "").strip()
+        _fvid = str(first.get("file_version_id") or "").strip()
         merged_entity = {
             "name": res["standard_name"],
             "entity_type": entity_type,
@@ -473,7 +483,10 @@ def merge_entities(entities_results: List[Dict], output_file: str, max_workers: 
             "repairMethod": res["merged_texts"]["repairMethod"],
             "documents": merged_docs,
             "source_chunk_ids": list(merged_chunk_ids),
-            "support_count": len(merged_chunk_ids)
+            "support_count": len(merged_chunk_ids),
+            "file_id": _fid,
+            "file_version_id": _fvid,
+            "is_active": bool(first.get("is_active", True)),
         }
         merged_entities.append(merged_entity)
 

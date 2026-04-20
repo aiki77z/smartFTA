@@ -58,6 +58,7 @@ class PipelineJobRequest(BaseModel):
     output_dir: str = Field("./output", description="输出目录")
     chunk_size: int = Field(800, ge=200, le=4000)
     skip_mineru: bool = False
+    skip_clean: bool = False
     skip_entity: bool = False
     skip_relation: bool = False
     print_raw_text: bool = False
@@ -66,7 +67,8 @@ class PipelineJobRequest(BaseModel):
         DEFAULT_GENERATE_FTA_BASE_URL,
         description="故障树自动生成服务地址，例如 http://127.0.0.1:8000",
     )
-    clear_graph_before_import: bool = True
+    # 下游（FTA-GNR）版本化知识库模式禁止 clear_graph=true
+    clear_graph_before_import: bool = False
 
 
 class Neo4jImportRequest(BaseModel):
@@ -159,6 +161,35 @@ def _build_artifacts(pdf_stem: str, output_dir: str, import_only_dir: Optional[s
     }
 
 
+def _extract_version_dir_from_stdout(stdout_text: str) -> Optional[Path]:
+    """
+    run.py 会打印一行：VERSION_DIR=<abs path>
+    在版本化产物模式下，chunks/entities/relations 会写到该版本目录内。
+    """
+    if not stdout_text:
+        return None
+    version_dir: Optional[Path] = None
+    for line in stdout_text.splitlines():
+        if not line.startswith("VERSION_DIR="):
+            continue
+        raw = line.split("=", 1)[1].strip()
+        if raw:
+            version_dir = Path(raw).expanduser().resolve()
+    return version_dir if (version_dir and version_dir.exists()) else None
+
+
+def _build_artifacts_for_dir(pdf_stem: str, result_dir: Path) -> Dict[str, str]:
+    rd = Path(result_dir).expanduser().resolve()
+    return {
+        "result_dir": str(rd),
+        "chunks_json": str(rd / f"{pdf_stem}_chunks.json"),
+        "entities_jsonl": str(rd / f"{pdf_stem}_entities.jsonl"),
+        "entities_merged_json": str(rd / f"{pdf_stem}_entities_merged.json"),
+        "relations_jsonl": str(rd / f"{pdf_stem}_relations.jsonl"),
+        "relations_csv": str(rd / f"{pdf_stem}_relations.csv"),
+    }
+
+
 
 def _build_generate_fta_contract(artifacts: Dict[str, str], base_url: str, clear_graph: bool) -> Dict[str, object]:
     endpoint = base_url.rstrip("/") + "/api/integration/import-knowledge-artifacts"
@@ -188,6 +219,7 @@ def _post_generate_fta_import(job_id: str, request: PipelineJobRequest, artifact
         "chunks_file": artifacts["chunks_json"],
         "entities_file": None if request.skip_entity else artifacts["entities_merged_json"],
         "relations_file": None if request.skip_relation else artifacts["relations_jsonl"],
+        # 由下游（FTA-GNR）执行版本化约束：若 clear_graph=true 会返回 400
         "clear_graph": request.clear_graph_before_import,
         "import_relations": not request.skip_relation,
         "source": f"knowledge_base_construction:{job_id}",
@@ -228,6 +260,8 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
         cmd.extend(["--output-dir", request.output_dir, "--chunk-size", str(request.chunk_size)])
     if request.skip_mineru:
         cmd.append("--skip-mineru")
+    if request.skip_clean:
+        cmd.append("--skip-clean")
     if request.skip_entity:
         cmd.append("--skip-entity")
     if request.skip_relation:
@@ -314,6 +348,9 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
         for line in proc.stdout:
             text = (line or "").rstrip("\n")
             out_lines.append(text)
+            # 若子脚本明确打印“错误: ...”，立刻把错误同步到 job，避免前端长期停留在 prepare/parse 阶段
+            if text.startswith("错误:"):
+                _update_stage("failed", text[:260])
             # 阶段识别：run.py 固定打印 “=== 步骤X: ... ===”
             if "=== 步骤1: PDF 转 Markdown" in text:
                 _update_stage("parse", "解析文件：PDF 转 Markdown / 清理 Markdown")
@@ -341,8 +378,39 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
     }
 
     if return_code != 0:
-        tail = "\n".join(stdout_text.splitlines()[-20:]).strip()
-        msg = f"流水线失败（return_code={return_code}）。请查看 stdout；末尾摘要：{tail[:600]}"
+        tail_lines = stdout_text.splitlines()[-60:]
+        tail = "\n".join(tail_lines).strip()
+        msg = f"流水线失败（return_code={return_code}）。请查看 stdout；末尾摘要：{tail[:2000]}"
+        _set_job(
+            job_id,
+            {
+                **base_patch,
+                "status": "failed",
+                "stage": "failed",
+                "progress": 100,
+                "sync_status": "skipped",
+                "error": msg,
+                "message": msg,
+            },
+        )
+        return
+
+    # 版本化产物：优先使用 run.py 输出的 VERSION_DIR，避免同步阶段找不到 chunks 文件
+    version_dir = _extract_version_dir_from_stdout(stdout_text)
+    if version_dir:
+        artifacts = _build_artifacts_for_dir(pdf_stem, version_dir)
+        try:
+            _set_job(job_id, {"artifacts": artifacts})
+        except Exception:
+            pass
+
+    # 同步前做一次文件存在性校验，给出更明确的错误
+    try:
+        chunks_path = Path(artifacts["chunks_json"]).expanduser().resolve()
+        if not chunks_path.exists():
+            raise RuntimeError(f"chunks_json 不存在: {chunks_path}")
+    except Exception as exc:
+        msg = str(exc)
         _set_job(
             job_id,
             {
@@ -376,6 +444,13 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
             },
         )
     except Exception as exc:
+        # 将同步异常写入 job.message/error，便于前端“导入图谱”阶段直接显示原因
+        sync_err = str(exc)
+        try:
+            logger.exception("sync to generate-fta failed job=%s err=%s", job_id, sync_err)
+        except Exception:
+            # ignore logging failures
+            pass
         _set_job(
             job_id,
             {
@@ -383,7 +458,9 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
                 "stage": "completed_with_sync_error",
                 "progress": 100,
                 "sync_status": "failed",
-                "sync_error": str(exc),
+                "sync_error": sync_err,
+                "error": sync_err,
+                "message": f"同步到故障树后端失败：{sync_err}",
             },
         )
 
@@ -478,12 +555,14 @@ async def run_pipeline_job_upload(
     output_dir: str = Form("./output"),
     chunk_size: int = Form(800),
     skip_mineru: bool = Form(False),
+    skip_clean: bool = Form(False),
     skip_entity: bool = Form(False),
     skip_relation: bool = Form(False),
     print_raw_text: bool = Form(False),
     sync_to_generate_fta: bool = Form(True),
     generate_fta_base_url: str = Form(DEFAULT_GENERATE_FTA_BASE_URL),
-    clear_graph_before_import: bool = Form(True),
+    # 默认不清空图谱：GNR 版本化知识库模式禁止 clear_graph=true
+    clear_graph_before_import: bool = Form(False),
 ):
     """
     兼容前端上传模式（multipart/form-data）：
@@ -512,11 +591,35 @@ async def run_pipeline_job_upload(
 
     logger.info("upload received name=%s bytes=%s saved=%s", safe_name, len(content or b""), saved_path)
 
+    # 非 PDF 文件：跳过 MinerU，并在 output/{stem}/{stem}.md 写入可供后续分块的 Markdown
+    ext = saved_path.suffix.lower()
+    force_skip_mineru = ext in {".txt", ".csv", ".md"}
+    if force_skip_mineru:
+        try:
+            result_dir = out_root / saved_path.stem
+            result_dir.mkdir(parents=True, exist_ok=True)
+            md_path = result_dir / f"{saved_path.stem}.md"
+            if ext == ".md":
+                # 直接复用用户上传的 markdown
+                md_path.write_bytes(content)
+            else:
+                # txt/csv：写入 markdown 代码块，便于 chunk_md.py 正常处理
+                try:
+                    text = (content or b"").decode("utf-8", errors="replace")
+                except Exception:
+                    text = str(content or b"")
+                fence = "csv" if ext == ".csv" else "text"
+                md_path.write_text(f"```{fence}\n{text}\n```\n", encoding="utf-8", errors="replace")
+            logger.info("non-pdf upload prepared markdown ext=%s md=%s", ext, md_path)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"非 PDF 文件预处理失败（{ext}）: {exc}")
+
     req = PipelineJobRequest(
         pdf_path=str(saved_path),
         output_dir=str(out_root),
         chunk_size=int(chunk_size),
-        skip_mineru=bool(skip_mineru),
+        skip_mineru=bool(skip_mineru) or force_skip_mineru,
+        skip_clean=bool(skip_clean) or force_skip_mineru,
         skip_entity=bool(skip_entity),
         skip_relation=bool(skip_relation),
         print_raw_text=bool(print_raw_text),

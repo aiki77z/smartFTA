@@ -125,6 +125,13 @@ def build_entity_props(entity: Dict) -> Dict:
         props["source_chunk_ids"] = entity["source_chunk_ids"]
     if "support_count" in entity:
         props["support_count"] = entity["support_count"]
+    # 版本化知识库：合并实体 JSON 中应携带 file_id / file_version_id，供 Neo4j 写入与按版本过滤
+    for k in ("file_id", "file_version_id"):
+        v = entity.get(k)
+        if v not in (None, ""):
+            props[k] = v
+    if "is_active" in entity:
+        props["is_active"] = bool(entity["is_active"])
     return props
 
 def save_relations_to_csv_second(relations: List[Dict], output_csv_path: str) -> None:

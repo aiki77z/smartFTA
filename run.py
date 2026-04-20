@@ -27,13 +27,21 @@ def run_command(cmd, description):
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
 
-    result = subprocess.run(cmd, capture_output=True, text=False, env=env)
+    # 以文本模式捕获输出，避免后续把 stdout 当 bytes 处理导致类型错误
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
 
     elapsed = time.time() - start
     print(f"耗时: {elapsed:.2f} 秒")
 
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
 
     if result.returncode != 0:
         print(f"错误: {description} 失败 (返回码 {result.returncode})")
@@ -205,9 +213,10 @@ def main():
 
         # 从输出中解析 VERSION_DIR
         version_dir = None
-        for line in result.stdout.splitlines():
-            if line.startswith("VERSION_DIR="):
-                version_dir = Path(line.split("=", 1)[1].strip())
+        for line in (result.stdout or "").splitlines():
+            s = line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+            if s.startswith("VERSION_DIR="):
+                version_dir = Path(s.split("=", 1)[1].strip())
                 break
         if version_dir is None or not version_dir.exists():
             # 降级：尝试根据 pdf_stem 查找最新版本目录
@@ -244,11 +253,9 @@ def main():
             print(f"错误: 找不到有效的 MD 文件 - {exc}")
             sys.exit(1)
 
-    # 提取 file_version_id（如 test_v1 中的 "v1"）
-    file_version_id = version_dir.name.split("_v")[-1] if "_v" in version_dir.name else "v1"
-    # 确保 file_version_id 格式一致（不带下划线前缀）
-    if not file_version_id.startswith("v"):
-        file_version_id = f"v{file_version_id}"
+    # 版本化知识库：file_version_id 必须是「整份文件版本」的稳定 ID（与 Mongo/Neo4j schema 一致），
+    # 即版本目录名，例如 {pdf_stem}_v1。不能只用 "v1"，否则 chunk_uid、图谱 Entity 无法按版本过滤。
+    file_version_id = version_dir.name
 
     # 后续所有产物都保存在版本目录中
     result_dir = version_dir
