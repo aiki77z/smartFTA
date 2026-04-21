@@ -1699,6 +1699,557 @@ def generate_fault_tree_with_progress(
     return tree_data
 
 
+def _normalize_event_key(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).lower()
+
+
+def _build_chunk_tree_fallback(top_event: str, elements: Dict[str, Any]) -> Dict[str, Any]:
+    events = elements.get("events") or []
+    relations = elements.get("relations") or []
+
+    names: List[str] = []
+    for item in events:
+        name = _normalize_text(item.get("name"))
+        if name and name not in names:
+            names.append(name)
+    if top_event not in names:
+        names.insert(0, top_event)
+    for rel in relations:
+        for key in ("parent", "child"):
+            name = _normalize_text(rel.get(key))
+            if name and name not in names:
+                names.append(name)
+
+    node_ids = {name: _stable_id("node", name) for name in names}
+    node_list = []
+    for name in names:
+        node_type = "top_event" if _normalize_event_key(name) == _normalize_event_key(top_event) else "basic_event"
+        node_list.append(
+            {
+                "id": node_ids[name],
+                "name": name,
+                "type": node_type,
+                "gate": None,
+                "transfer": "",
+                "event": None if node_type == "top_event" else {},
+            }
+        )
+
+    link_list = []
+    seen = set()
+    for rel in relations:
+        parent = _normalize_text(rel.get("parent"))
+        child = _normalize_text(rel.get("child"))
+        if not parent or not child or parent not in node_ids or child not in node_ids:
+            continue
+        key = (node_ids[child], node_ids[parent])
+        if key in seen:
+            continue
+        seen.add(key)
+        link_list.append(
+            {
+                "type": "link",
+                "sourceId": node_ids[child],
+                "targetId": node_ids[parent],
+                "isCondition": False,
+            }
+        )
+
+    return {"nodeList": node_list, "linkList": link_list}
+
+
+def _match_documents_for_event(name: str, chunks: List[Dict[str, Any]], *, limit: int = 3) -> List[Dict[str, Any]]:
+    normalized_name = _normalize_event_key(name)
+    keywords = [
+        token
+        for token in re.split(r"[\s,，。；;、()（）:/]+", str(name or ""))
+        if len(token.strip()) >= 2
+    ]
+    matched = []
+    seen = set()
+
+    def append_doc(chunk: Dict[str, Any]):
+        chunk_key = str(_chunk_reference(chunk))
+        if not chunk_key or chunk_key in seen:
+            return False
+        seen.add(chunk_key)
+        matched.append(
+            {
+                "chunk_id": chunk.get("chunk_id", chunk.get("id")),
+                "chunk_uid": chunk.get("chunk_uid"),
+                "chunk_name": chunk.get("chunk_name", ""),
+                "section_path": chunk.get("section_path", ""),
+                "source_page": chunk.get("source", chunk.get("source_page", "")),
+                "file_id": chunk.get("file_id", ""),
+                "file_version_id": chunk.get("file_version_id", ""),
+                "file": chunk.get("file", ""),
+            }
+        )
+        return len(matched) >= limit
+
+    for chunk in chunks or []:
+        content = str(chunk.get("content") or "")
+        haystack = _normalize_event_key(content)
+        if normalized_name and normalized_name in haystack:
+            if append_doc(chunk):
+                return matched
+            continue
+        if keywords and any(_normalize_event_key(token) in haystack for token in keywords):
+            if append_doc(chunk):
+                return matched
+
+    for chunk in chunks or []:
+        if append_doc(chunk):
+            break
+    return matched
+
+
+def _post_process_chunk_generated_tree(
+    tree: Dict[str, Any],
+    *,
+    top_event: str,
+    elements: Dict[str, Any],
+    chunks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    fallback_tree = _build_chunk_tree_fallback(top_event, elements)
+    raw_nodes = tree.get("nodeList") or fallback_tree["nodeList"]
+    raw_links = tree.get("linkList") or fallback_tree["linkList"]
+    extracted_events = elements.get("events") or []
+    extracted_relations = elements.get("relations") or []
+
+    event_index = {
+        _normalize_event_key(item.get("name")): item
+        for item in extracted_events
+        if _normalize_text(item.get("name"))
+    }
+    nodes_by_name: Dict[str, Dict[str, Any]] = {}
+    nodes_by_id: Dict[str, Dict[str, Any]] = {}
+
+    def ensure_node(name: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        normalized_name = _normalize_text(name) or top_event
+        key = _normalize_event_key(normalized_name)
+        if key in nodes_by_name:
+            existing = nodes_by_name[key]
+            if payload:
+                for field in ("type", "gate", "transfer", "event"):
+                    if payload.get(field) not in (None, "") and existing.get(field) in (None, ""):
+                        existing[field] = payload.get(field)
+            return existing
+        node = {
+            "id": (payload or {}).get("id") or _stable_id("node", normalized_name),
+            "name": normalized_name,
+            "type": (payload or {}).get("type"),
+            "gate": (payload or {}).get("gate"),
+            "transfer": (payload or {}).get("transfer", ""),
+            "event": (payload or {}).get("event"),
+        }
+        nodes_by_name[key] = node
+        nodes_by_id[node["id"]] = node
+        return node
+
+    ensure_node(top_event, {"type": "top_event", "event": None})
+    for item in extracted_events:
+        ensure_node(item.get("name") or "", {"type": item.get("type"), "event": item})
+    for node in raw_nodes:
+        ensure_node(node.get("name") or "", node)
+    for rel in extracted_relations:
+        ensure_node(rel.get("parent") or "")
+        ensure_node(rel.get("child") or "")
+
+    link_pairs = []
+    seen_pairs = set()
+
+    def append_pair(source_id: str, target_id: str):
+        if not source_id or not target_id or source_id == target_id:
+            return
+        pair = (source_id, target_id)
+        if pair in seen_pairs:
+            return
+        seen_pairs.add(pair)
+        link_pairs.append(pair)
+
+    for link in raw_links:
+        source_id = link.get("sourceId")
+        target_id = link.get("targetId")
+        if source_id in nodes_by_id and target_id in nodes_by_id:
+            append_pair(source_id, target_id)
+
+    if not link_pairs:
+        for rel in extracted_relations:
+            parent_name = _normalize_text(rel.get("parent"))
+            child_name = _normalize_text(rel.get("child"))
+            if not parent_name or not child_name:
+                continue
+            parent = ensure_node(parent_name)
+            child = ensure_node(child_name)
+            append_pair(child["id"], parent["id"])
+
+    children_map: Dict[str, List[str]] = {}
+    gate_map: Dict[str, str] = {}
+    for source_id, target_id in link_pairs:
+        children_map.setdefault(target_id, []).append(source_id)
+    for rel in extracted_relations:
+        parent_name = _normalize_text(rel.get("parent"))
+        child_name = _normalize_text(rel.get("child"))
+        if not parent_name or not child_name:
+            continue
+        parent = ensure_node(parent_name)
+        gate = str(rel.get("gate") or "").strip().upper()
+        if gate in {"AND", "OR"}:
+            gate_map[parent["id"]] = gate
+
+    normalized_nodes = []
+    ordered_nodes = sorted(
+        nodes_by_name.values(),
+        key=lambda item: (0 if _normalize_event_key(item["name"]) == _normalize_event_key(top_event) else 1, item["name"]),
+    )
+    for index, node in enumerate(ordered_nodes, start=1):
+        node_id = node["id"]
+        name = node["name"]
+        explicit_type = str(node.get("type") or "").strip()
+        if _normalize_event_key(name) == _normalize_event_key(top_event):
+            node_type = "top_event"
+        elif explicit_type in {"intermediate_event", "basic_event"}:
+            node_type = explicit_type
+        else:
+            node_type = "intermediate_event" if children_map.get(node_id) else "basic_event"
+
+        gate = node.get("gate")
+        if node_type == "basic_event":
+            gate = None
+        elif not gate:
+            gate = gate_map.get(node_id) or ("OR" if children_map.get(node_id) else None)
+
+        if node_type == "top_event":
+            event = None
+        else:
+            extracted = event_index.get(_normalize_event_key(name), {})
+            raw_event = node.get("event") if isinstance(node.get("event"), dict) else {}
+            probability = raw_event.get("probability", extracted.get("probability", 1e-8))
+            event = {
+                "id": str(raw_event.get("id") or extracted.get("id") or f"E{index:03d}"),
+                "name": name,
+                "description": str(
+                    raw_event.get("description")
+                    or extracted.get("description")
+                    or f"{name} related abnormal condition"
+                ),
+                "errorLevel": str(raw_event.get("errorLevel") or extracted.get("errorLevel") or "中"),
+                "priority": raw_event.get("priority", extracted.get("priority", 0)),
+                "probability": probability,
+                "showProbability": raw_event.get("showProbability", extracted.get("showProbability", probability)),
+                "rule": str(raw_event.get("rule") or extracted.get("rule") or ""),
+                "rules": _coerce_rules(
+                    raw_event.get("rules")
+                    or extracted.get("rules")
+                    or raw_event.get("rule")
+                    or extracted.get("rule")
+                ),
+                "investigateMethod": str(
+                    raw_event.get("investigateMethod")
+                    or extracted.get("investigateMethod")
+                    or f"Inspect alarms, state changes, and evidence related to {name}"
+                ),
+                "documents": _match_documents_for_event(name, chunks, limit=3),
+            }
+
+        normalized_nodes.append(
+            {
+                "type": node_type,
+                "gate": gate,
+                "name": name,
+                "id": node_id,
+                "transfer": node.get("transfer", ""),
+                "event": event,
+            }
+        )
+
+    valid_ids = {node["id"] for node in normalized_nodes}
+    normalized_links = [
+        {
+            "type": "link",
+            "sourceId": source_id,
+            "targetId": target_id,
+            "isCondition": False,
+        }
+        for source_id, target_id in link_pairs
+        if source_id in valid_ids and target_id in valid_ids
+    ]
+
+    return {"nodeList": normalized_nodes, "linkList": normalized_links}
+
+
+def build_fault_tree_from_subgraph_and_chunks(
+    top_event: str,
+    subgraph_bundle: Dict[str, Any],
+    evidence_chunks: List[Dict[str, Any]],
+    requirements: str = "",
+    part_details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    skeleton = _compress_subgraph_to_tree_skeleton(subgraph_bundle)
+    evidence = _format_evidence_chunks(evidence_chunks)
+    skeleton_for_prompt = {
+        "root_tree_node_id": skeleton["root_tree_node_id"],
+        "nodes": [
+            {
+                "id": node["id"],
+                "name": node["name"],
+                "type": node["type"],
+                "gate": node["gate"],
+                "graphNodeId": node["graphNodeId"],
+                "kg_key": node["kg_key"],
+                "fileId": node["fileId"],
+                "fileVersionId": node["fileVersionId"],
+                "graph_props": node["graph_props"],
+                "source_chunk_ids": node["source_chunk_ids"],
+                "source_chunk_refs": node["source_chunk_refs"],
+                "documents_seed": node["documents_seed"],
+            }
+            for node in skeleton["nodes"]
+        ],
+        "links": skeleton["links"],
+    }
+
+    pd = part_details if isinstance(part_details, dict) and part_details else None
+    part_details_text = json.dumps(pd, ensure_ascii=False, indent=2) if pd else ""
+    physical_ref_block = ""
+    if pd:
+        physical_ref_block = f"""
+Physical component mapping:
+When appropriate, append `[Ref: Object_X]` to the end of `description` so the tree can be aligned with the physical component view.
+Available components:
+{part_details_text}
+"""
+
+    prompt = f"""You are an industrial fault-tree modeling expert.
+
+This is the graph-retrieval path. A local knowledge-graph subgraph has already been converted into a trusted tree skeleton.
+You must preserve that skeleton and only use evidence chunks to enrich node content, not to invent a different structure.
+
+Top event: {top_event}
+User requirements: {requirements or 'none'}
+
+Skeleton constraints:
+1. Preserve the existing node hierarchy and causal links from the skeleton.
+2. Do not delete skeleton nodes and do not invent a new parallel structure.
+3. If a parent node already has `gate=AND`, keep it as `AND`.
+4. If a parent has multiple children and no explicit AND mark, keep or infer `gate=OR`.
+5. The top event node must stay `type=top_event` and `event=null`.
+6. Every non-top node must have a complete `event` object.
+7. Keep `graphNodeId` and `kg_key` identical to the input skeleton.
+8. `documents` should be filled from the recalled evidence chunks.
+9. Return JSON only.
+
+Graph skeleton:
+{json.dumps(skeleton_for_prompt, ensure_ascii=False, indent=2)}
+
+Evidence chunks:
+{json.dumps(evidence, ensure_ascii=False, indent=2)}
+{physical_ref_block}
+
+Required output:
+{{
+  "nodeList": [...],
+  "linkList": [...]
+}}
+"""
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=LLM_GENERATION_MAX_TOKENS,
+    )
+    tree = _parse_json(response.choices[0].message.content)
+    return _post_process_generated_tree(tree, skeleton, evidence)
+
+
+def extract_fault_elements_from_chunks(top_event: str, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prompt = f"""You are an industrial fault-tree analysis expert.
+
+Your task is to infer fault-tree semantics only from the recalled evidence chunks for top event "{top_event}".
+Do not assume an existing graph skeleton. You must infer event hierarchy and logic gates from the text itself.
+
+Requirements:
+1. There must be exactly one `top_event`, and its name must be "{top_event}".
+2. Extract `intermediate_event` and `basic_event` candidates with clear cause-effect relationships.
+3. For every parent-child relation, decide a gate:
+   - `AND`: children must occur together to cause the parent.
+   - `OR`: any child can independently cause the parent.
+4. If the evidence does not strongly support `AND`, use `OR`.
+5. Keep the structure focused; avoid generic or redundant nodes.
+6. Fill `description`, `errorLevel`, `investigateMethod`, and `rules` when evidence supports them.
+
+Evidence chunks:
+{_format_chunks_for_prompt(chunks)}
+
+Return strict JSON only:
+{{
+  "events": [
+    {{
+      "name": "event name",
+      "type": "top_event/intermediate_event/basic_event",
+      "description": "event description",
+      "errorLevel": "高/中/低",
+      "investigateMethod": "how to investigate",
+      "rules": [
+        {{
+          "measurePointName": "measure point",
+          "symbol": ">",
+          "thresholds": ["value"],
+          "duration": "time window"
+        }}
+      ]
+    }}
+  ],
+  "relations": [
+    {{
+      "parent": "parent event name",
+      "child": "child event name",
+      "gate": "AND/OR"
+    }}
+  ]
+}}
+"""
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=2200,
+    )
+    return _parse_json(response.choices[0].message.content)
+
+
+def build_fault_tree_from_chunk_elements(
+    top_event: str,
+    elements: Dict[str, Any],
+    chunks: List[Dict[str, Any]],
+    requirements: str = "",
+    previous_issues: Optional[List[Dict[str, Any]]] = None,
+    part_details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    chunks_ref = [
+        {
+            "chunk_id": _chunk_reference(chunk),
+            "chunk_name": chunk.get("chunk_name", ""),
+            "section_path": chunk.get("section_path", ""),
+            "source_page": chunk.get("source", ""),
+            "file_id": chunk.get("file_id", ""),
+            "file_version_id": chunk.get("file_version_id", ""),
+        }
+        for chunk in chunks
+    ]
+
+    retry_hint = ""
+    if previous_issues:
+        error_msgs = [
+            f"- [{item['level']}] {item['message']} (node: {item.get('node_name', '')})"
+            for item in previous_issues
+            if item.get("level") in {"ERROR", "WARNING"}
+        ]
+        if error_msgs:
+            retry_hint = "\nPrevious draft had these issues. Fix them in the new output:\n" + "\n".join(error_msgs) + "\n"
+
+    pd = part_details if isinstance(part_details, dict) and part_details else None
+    part_details_text = json.dumps(pd, ensure_ascii=False, indent=2) if pd else ""
+    physical_ref_chunk = ""
+    if pd:
+        physical_ref_chunk = f"""
+Physical component mapping:
+Append a `[Ref: Object_X]` marker at the end of `description` when you can associate an event with a physical component.
+Available components:
+{part_details_text}
+"""
+
+    prompt = f"""You are an industrial fault-tree modeling expert.
+
+This is the chunks-only generation path. There is no trusted graph skeleton available.
+You must build a complete fault tree for top event "{top_event}" only from recalled chunks and extracted elements.
+
+Evidence chunks:
+{_format_chunks_for_prompt(chunks)}
+
+Available documents for `event.documents`:
+{json.dumps(chunks_ref, ensure_ascii=False, indent=2)}
+
+Extracted fault elements:
+{json.dumps(elements, ensure_ascii=False, indent=2)}
+{retry_hint}
+User requirements:
+{requirements or 'none'}
+{physical_ref_chunk}
+
+Output rules:
+1. Output complete `nodeList` and `linkList`.
+2. There must be exactly one `top_event` node named "{top_event}", and its `event` must be `null`.
+3. Every other node must be `intermediate_event` or `basic_event`.
+4. If a node still has children in `linkList`, it must be `intermediate_event`; if it has no children, it must be `basic_event`.
+5. Every `top_event` and `intermediate_event` must explicitly carry `gate`. Use `OR` by default if evidence is insufficient.
+6. Every non-top node must have a full `event` object including:
+   `id`, `name`, `description`, `errorLevel`, `priority`, `probability`, `showProbability`, `rule`, `rules`, `investigateMethod`, `documents`
+7. `documents` must be selected only from the provided chunk list. Each non-top node should reference 1-3 chunks.
+8. `linkList.sourceId` is child and `linkList.targetId` is parent.
+9. Do not output isolated nodes. Do not output an empty tree.
+10. If evidence is limited, still produce the smallest coherent tree with meaningful hierarchy and logic gates.
+11. Return JSON only.
+
+Required JSON shape:
+{{
+  "nodeList": [
+    {{
+      "id": "node-xxxxxxxx",
+      "name": "event name",
+      "type": "top_event/intermediate_event/basic_event",
+      "gate": "AND/OR/null",
+      "transfer": "",
+      "event": null or {{
+        "id": "E001",
+        "name": "event name",
+        "description": "description",
+        "errorLevel": "高/中/低",
+        "priority": 0,
+        "probability": 1e-8,
+        "showProbability": 1e-8,
+        "rule": "",
+        "rules": [],
+        "investigateMethod": "how to investigate",
+        "documents": [
+          {{
+            "chunk_id": "...",
+            "chunk_name": "...",
+            "section_path": "...",
+            "source_page": "...",
+            "file_id": "...",
+            "file_version_id": "..."
+          }}
+        ]
+      }}
+    }}
+  ],
+  "linkList": [
+    {{
+      "type": "link",
+      "sourceId": "node-child",
+      "targetId": "node-parent",
+      "isCondition": false
+    }}
+  ]
+}}
+"""
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=LLM_GENERATION_MAX_TOKENS,
+    )
+    tree = _parse_json(response.choices[0].message.content)
+    return _post_process_chunk_generated_tree(
+        tree,
+        top_event=top_event,
+        elements=elements,
+        chunks=chunks,
+    )
+
+
 def discover_top_events_from_entity_index(entries: List[dict]) -> List[dict]:
     # Kept for backward compatibility; the new batch flow no longer depends on Mongo entity index.
     results = []
