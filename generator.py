@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from openai import OpenAI
@@ -535,7 +536,14 @@ def _post_process_generated_tree(
     return {"nodeList": normalized_nodes, "linkList": link_list}
 
 
-def repair_fault_tree(draft_tree: dict, corrections_hint: str, chunks: list) -> dict:
+def repair_fault_tree(
+    draft_tree: dict,
+    corrections_hint: str,
+    chunks: list,
+    *,
+    include_meta: bool = False,
+) -> dict:
+    started = time.perf_counter()
     prompt = f"""
 你会收到一棵草稿故障树和一组历史修正建议。
 请只做最小必要修改，尽量保持节点 id 和主体结构不变。
@@ -561,7 +569,14 @@ def repair_fault_tree(draft_tree: dict, corrections_hint: str, chunks: list) -> 
         temperature=0.1,
         max_tokens=LLM_REPAIR_MAX_TOKENS,
     )
-    return _parse_json(response.choices[0].message.content)
+    repaired = _parse_json(response.choices[0].message.content)
+    if include_meta:
+        return {
+            "tree": repaired,
+            "duration_seconds": round(time.perf_counter() - started, 3),
+            "token_usage": _normalize_token_usage(getattr(response, "usage", None)),
+        }
+    return repaired
 
 
 def generate_fault_tree(
@@ -1024,12 +1039,129 @@ def build_fault_tree_from_chunk_elements(
     return _parse_json(response.choices[0].message.content)
 
 
-def parse_user_prompt(prompt: str) -> dict:
+def _normalize_token_usage(usage: Any) -> Dict[str, Optional[int]]:
+    if usage is None:
+        return {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+    return {
+        "prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else None,
+        "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
+        "total_tokens": int(total_tokens) if total_tokens is not None else None,
+    }
+
+
+def _add_token_usage(*parts: Optional[Dict[str, Optional[int]]]) -> Dict[str, Optional[int]]:
+    merged = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+    saw_value = False
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = part.get(key)
+            if value is None:
+                continue
+            saw_value = True
+            merged[key] += int(value)
+    if saw_value:
+        return merged
+    return {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
+
+
+def _make_stage_profile(
+    duration_seconds: float,
+    *,
+    token_usage: Optional[Dict[str, Optional[int]]] = None,
+    **extra: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "duration_seconds": round(float(duration_seconds or 0.0), 3),
+        "token_usage": token_usage
+        or {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        },
+    }
+    payload.update(extra)
+    return payload
+
+
+def _estimate_tree_depth(tree_data: Dict[str, Any]) -> int:
+    node_list = tree_data.get("nodeList") or []
+    link_list = tree_data.get("linkList") or []
+    node_ids = {node.get("id") for node in node_list if node.get("id")}
+    if not node_ids:
+        return 0
+
+    children_by_parent: Dict[str, List[str]] = {}
+    incoming: Dict[str, int] = {node_id: 0 for node_id in node_ids}
+    for link in link_list:
+        source_id = link.get("sourceId")
+        target_id = link.get("targetId")
+        if source_id not in node_ids or target_id not in node_ids:
+            continue
+        children_by_parent.setdefault(target_id, []).append(source_id)
+        incoming[source_id] = incoming.get(source_id, 0) + 1
+
+    roots = [node_id for node_id in node_ids if incoming.get(node_id, 0) == 0]
+    if not roots:
+        roots = [node.get("id") for node in node_list if node.get("type") == "top_event" and node.get("id")]
+    if not roots:
+        return 1
+
+    max_depth = 0
+    stack: List[tuple[str, int]] = [(root, 1) for root in roots]
+    seen_depths: Dict[str, int] = {}
+    while stack:
+        node_id, depth = stack.pop()
+        if depth <= seen_depths.get(node_id, 0):
+            continue
+        seen_depths[node_id] = depth
+        max_depth = max(max_depth, depth)
+        for child_id in children_by_parent.get(node_id, []):
+            stack.append((child_id, depth + 1))
+    return max_depth
+
+
+def _summarize_tree_structure(tree_data: Dict[str, Any]) -> Dict[str, Any]:
+    node_list = tree_data.get("nodeList") or []
+    link_list = tree_data.get("linkList") or []
+    gate_counts = {"AND": 0, "OR": 0}
+    for node in node_list:
+        gate = str(node.get("gate") or "").strip().upper()
+        if gate in gate_counts:
+            gate_counts[gate] += 1
+    return {
+        "node_count": len(node_list),
+        "link_count": len(link_list),
+        "gate_count": gate_counts["AND"] + gate_counts["OR"],
+        "and_gate_count": gate_counts["AND"],
+        "or_gate_count": gate_counts["OR"],
+        "max_depth": _estimate_tree_depth(tree_data),
+    }
+
+
+def parse_user_prompt(prompt: str, *, include_meta: bool = False) -> dict:
     raw = str(prompt or "").strip()
     if not raw:
         raise ValueError("prompt 不能为空")
 
     normalized = re.sub(r"\s+", " ", raw).strip()
+    started = time.perf_counter()
     prompt_text = f"""
 你是工业设备故障树系统的提示词解析器。请优先从用户输入中提取：
 1. top_event：用户要分析或生成故障树的顶事件
@@ -1051,7 +1183,14 @@ def parse_user_prompt(prompt: str) -> dict:
         parsed = _parse_json(response.choices[0].message.content)
         top_event = normalize_top_event_name(parsed.get("top_event"))
         if top_event:
-            return {"top_event": top_event, "requirements": str(parsed.get("requirements") or "").strip()}
+            result = {"top_event": top_event, "requirements": str(parsed.get("requirements") or "").strip()}
+            if include_meta:
+                result["_meta"] = {
+                    "parse_method": "llm",
+                    "duration_seconds": round(time.perf_counter() - started, 3),
+                    "token_usage": _normalize_token_usage(getattr(response, "usage", None)),
+                }
+            return result
     except Exception:
         pass
 
@@ -1066,10 +1205,24 @@ def parse_user_prompt(prompt: str) -> dict:
         if match:
             top_event = normalize_top_event_name(match.group(1))
             if top_event:
-                return {"top_event": top_event, "requirements": ""}
+                result = {"top_event": top_event, "requirements": ""}
+                if include_meta:
+                    result["_meta"] = {
+                        "parse_method": "regex",
+                        "duration_seconds": round(time.perf_counter() - started, 3),
+                        "token_usage": _normalize_token_usage(None),
+                    }
+                return result
 
     if len(normalized) <= 40 and "\n" not in normalized:
-        return {"top_event": normalize_top_event_name(normalized), "requirements": ""}
+        result = {"top_event": normalize_top_event_name(normalized), "requirements": ""}
+        if include_meta:
+            result["_meta"] = {
+                "parse_method": "direct_text",
+                "duration_seconds": round(time.perf_counter() - started, 3),
+                "token_usage": _normalize_token_usage(None),
+            }
+        return result
 
     raise ValueError("无法从 prompt 中提取顶事件")
 
@@ -1440,6 +1593,18 @@ def generate_fault_tree(
                 except Exception:
                     pass
 
+    overall_started = time.perf_counter()
+    performance: Dict[str, Any] = {}
+    llm_token_usage = _normalize_token_usage(None)
+    repair_token_usage = _normalize_token_usage(None)
+    llm_validation_token_usage = _normalize_token_usage(None)
+    validation_duration_seconds = 0.0
+    repair_duration_seconds = 0.0
+    validation_runs = 0
+    repair_attempted = False
+    repair_accepted = False
+
+    stage_started = time.perf_counter()
     scoped_file_version_ids = resolve_selected_file_version_ids(
         selected_file_version_ids,
         fallback_to_active=True,
@@ -1484,7 +1649,14 @@ def generate_fault_tree(
             for item in (matched.get("matched_nodes") or [])
             if item.get("graph_node_id")
         ]
+    performance["graph_match"] = _make_stage_profile(
+        time.perf_counter() - stage_started,
+        matched_node_count=len(root_node_ids or ([matched.get("matched_node_id")] if matched.get("matched_node_id") else [])),
+        matched_top_event=matched.get("matched_name"),
+        used_confirmed_graph_node=bool(root_graph_node_id),
+    )
 
+    stage_started = time.perf_counter()
     subgraph_bundle = expand_scoped_local_fault_subgraph(
         root_node_ids or [matched["matched_node_id"]],
         max_depth=GRAPH_TREE_MAX_DEPTH,
@@ -1495,8 +1667,18 @@ def generate_fault_tree(
         f"[graph-subgraph] root={matched['matched_name']} roots={len(subgraph_bundle.get('roots') or [])} "
         f"nodes={len(subgraph_bundle.get('nodes') or [])} edges={len(subgraph_bundle.get('edges') or [])}"
     )
+    performance["graph_subgraph"] = _make_stage_profile(
+        time.perf_counter() - stage_started,
+        root_count=len(subgraph_bundle.get("roots") or []),
+        node_count=len(subgraph_bundle.get("nodes") or []),
+        edge_count=len(subgraph_bundle.get("edges") or []),
+        gate_group_count=len(subgraph_bundle.get("gate_groups") or []),
+        multi_root_runtime_merge=bool(len(subgraph_bundle.get("roots") or []) > 1),
+    )
 
-    chunk_ids = collect_subgraph_chunks(subgraph_bundle, chunk_limit=MAX_CHUNKS_FOR_PROMPT)
+    stage_started = time.perf_counter()
+    initial_chunk_ids = collect_subgraph_chunks(subgraph_bundle, chunk_limit=MAX_CHUNKS_FOR_PROMPT)
+    chunk_ids = list(initial_chunk_ids)
     raw_chunks: List[Dict[str, Any]] = []
     if chunk_ids:
         raw_chunks = get_chunks_by_ids(
@@ -1505,7 +1687,9 @@ def generate_fault_tree(
             selected_file_version_ids=scoped_file_version_ids,
         )
 
+    fallback_used = False
     if not raw_chunks:
+        fallback_used = True
         emit("[graph-chunks] subgraph returned no direct chunks, falling back to top-event chunk recall")
         fallback_retrieval = _collect_chunk_only_evidence(
             matched["matched_name"],
@@ -1524,12 +1708,26 @@ def generate_fault_tree(
         )
 
     emit(f"[graph-chunks] collected {len(raw_chunks)} evidence chunks")
+    performance["chunk_recall"] = _make_stage_profile(
+        time.perf_counter() - stage_started,
+        recalled_chunk_count=len(chunk_ids),
+        retained_chunk_count=len(raw_chunks),
+        source_file_version_count=len({chunk.get("file_version_id") for chunk in raw_chunks if chunk.get("file_version_id")}),
+        fallback_used=fallback_used,
+    )
 
     llm_used_subgraph = ENABLE_GRAPH_RETRIEVAL
     elements: Dict[str, Any] = {}
+    llm_stage_started = time.perf_counter()
     if not llm_used_subgraph:
         emit("[graph-llm] extracting fault elements from graph-recalled chunks without subgraph skeleton")
-        elements = extract_fault_elements_from_chunks(matched["matched_name"], raw_chunks)
+        extract_result = extract_fault_elements_from_chunks(
+            matched["matched_name"],
+            raw_chunks,
+            include_meta=True,
+        )
+        elements = extract_result["elements"]
+        llm_token_usage = _add_token_usage(llm_token_usage, extract_result.get("token_usage"))
         emit(
             f"[graph-llm] extracted elements "
             f"events={len(elements.get('events') or [])} relations={len(elements.get('relations') or [])}"
@@ -1537,26 +1735,31 @@ def generate_fault_tree(
 
     draft_tree = None
     previous_issues = None
+    attempt = 0
     for attempt in range(1, MAX_RETRY + 2):
         emit(f"[graph-llm] generating draft tree attempt={attempt}")
         try:
             if llm_used_subgraph:
-                draft_tree = build_fault_tree_from_subgraph_and_chunks(
+                draft_result = build_fault_tree_from_subgraph_and_chunks(
                     top_event=matched["matched_name"],
                     subgraph_bundle=subgraph_bundle,
                     evidence_chunks=raw_chunks,
                     requirements=requirements,
                     part_details=part_details,
+                    include_meta=True,
                 )
             else:
-                draft_tree = build_fault_tree_from_chunk_elements(
+                draft_result = build_fault_tree_from_chunk_elements(
                     top_event=matched["matched_name"],
                     elements=elements,
                     chunks=raw_chunks,
                     requirements=requirements,
                     previous_issues=previous_issues,
                     part_details=part_details,
+                    include_meta=True,
                 )
+            draft_tree = draft_result["tree"]
+            llm_token_usage = _add_token_usage(llm_token_usage, draft_result.get("token_usage"))
             emit(
                 f"[graph-draft] generated draft attempt={attempt} "
                 f"nodes={len(draft_tree.get('nodeList') or [])} links={len(draft_tree.get('linkList') or [])}"
@@ -1571,12 +1774,11 @@ def generate_fault_tree(
 
         emit(f"[graph-validate] validating draft attempt={attempt}")
         if progress_callback:
-            progress_callback(
-                72,
-                "graph_validate",
-                f"Structural validation (draft attempt {attempt})…",
-            )
-        validation = validate_full(draft_tree, skip_semantic=True)
+            progress_callback(72, "graph_validate", f"Structural validation (draft attempt {attempt})…")
+        validation_runs += 1
+        validation_started = time.perf_counter()
+        validation = validate_full(draft_tree, skip_semantic=True, include_meta=True)
+        validation_duration_seconds += time.perf_counter() - validation_started
         draft_tree["validation"] = validation
         if validation["passed"]:
             emit(
@@ -1603,15 +1805,28 @@ def generate_fault_tree(
 
         corrections = get_relevant_corrections(draft_tree)
         if corrections:
+            repair_attempted = True
             emit(f"[history-repair] applying {len(corrections)} relevant corrections")
-            repaired = repair_fault_tree(draft_tree, format_corrections_for_repair(corrections), raw_chunks)
+            repaired_result = repair_fault_tree(
+                draft_tree,
+                format_corrections_for_repair(corrections),
+                raw_chunks,
+                include_meta=True,
+            )
+            repaired = repaired_result["tree"]
+            repair_duration_seconds += float(repaired_result.get("duration_seconds") or 0.0)
+            repair_token_usage = _add_token_usage(repair_token_usage, repaired_result.get("token_usage"))
             emit("[graph-validate] validating repaired draft")
             if progress_callback:
                 progress_callback(78, "graph_validate", "Validating repaired draft…")
-            repair_validation = validate_full(repaired, skip_semantic=True)
+            validation_runs += 1
+            validation_started = time.perf_counter()
+            repair_validation = validate_full(repaired, skip_semantic=True, include_meta=True)
+            validation_duration_seconds += time.perf_counter() - validation_started
             if repair_validation["passed"]:
                 repaired["validation"] = repair_validation
                 final_tree = repaired
+                repair_accepted = True
                 emit(
                     f"[history-repair] repaired draft accepted "
                     f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
@@ -1629,8 +1844,15 @@ def generate_fault_tree(
     emit("[graph-validate] validating final tree")
     if progress_callback:
         progress_callback(82, "graph_validate", "Running full validation (including semantics)…")
-    final_validation = validate_full(final_tree, skip_semantic=False)
+    validation_runs += 1
+    validation_started = time.perf_counter()
+    final_validation = validate_full(final_tree, skip_semantic=False, include_meta=True)
+    validation_duration_seconds += time.perf_counter() - validation_started
     final_tree["validation"] = final_validation
+    llm_validation_token_usage = _add_token_usage(
+        llm_validation_token_usage,
+        ((final_validation.get("meta") or {}).get("semantic_validation") or {}).get("token_usage"),
+    )
     emit(
         f"[graph-validate] final validation "
         f"{'passed' if final_validation['passed'] else 'failed'} "
@@ -1662,6 +1884,37 @@ def generate_fault_tree(
         "llm_used_subgraph": llm_used_subgraph,
     }
     final_tree["source_file_version_ids"] = scoped_file_version_ids
+
+    tree_summary = _summarize_tree_structure(final_tree)
+    performance["tree_generation"] = _make_stage_profile(
+        max(0.0, time.perf_counter() - llm_stage_started - validation_duration_seconds - repair_duration_seconds),
+        token_usage=llm_token_usage,
+        attempt_count=attempt,
+        llm_used_subgraph=llm_used_subgraph,
+        extracted_event_count=len(elements.get("events") or []),
+        extracted_relation_count=len(elements.get("relations") or []),
+        node_count=tree_summary["node_count"],
+        link_count=tree_summary["link_count"],
+        gate_count=tree_summary["gate_count"],
+        and_gate_count=tree_summary["and_gate_count"],
+        or_gate_count=tree_summary["or_gate_count"],
+        max_depth=tree_summary["max_depth"],
+    )
+    performance["tree_validation"] = _make_stage_profile(
+        validation_duration_seconds + repair_duration_seconds,
+        token_usage=_add_token_usage(llm_validation_token_usage, repair_token_usage),
+        validation_run_count=validation_runs,
+        repair_attempted=repair_attempted,
+        repair_accepted=repair_accepted,
+        repair_duration_seconds=round(repair_duration_seconds, 3),
+        final_passed=bool(final_validation.get("passed")),
+        final_error_count=int(final_validation.get("error_count") or 0),
+        final_warning_count=int(final_validation.get("warning_count") or 0),
+    )
+    performance["overall"] = {
+        "duration_seconds": round(time.perf_counter() - overall_started, 3),
+    }
+    final_tree["performance"] = performance
     return final_tree
 
 
@@ -1985,7 +2238,9 @@ def build_fault_tree_from_subgraph_and_chunks(
     evidence_chunks: List[Dict[str, Any]],
     requirements: str = "",
     part_details: Optional[Dict[str, Any]] = None,
+    include_meta: bool = False,
 ) -> Dict[str, Any]:
+    started = time.perf_counter()
     skeleton = _compress_subgraph_to_tree_skeleton(subgraph_bundle)
     evidence = _format_evidence_chunks(evidence_chunks)
     skeleton_for_prompt = {
@@ -2060,10 +2315,23 @@ Required output:
         max_tokens=LLM_GENERATION_MAX_TOKENS,
     )
     tree = _parse_json(response.choices[0].message.content)
-    return _post_process_generated_tree(tree, skeleton, evidence)
+    normalized_tree = _post_process_generated_tree(tree, skeleton, evidence)
+    if include_meta:
+        return {
+            "tree": normalized_tree,
+            "duration_seconds": round(time.perf_counter() - started, 3),
+            "token_usage": _normalize_token_usage(getattr(response, "usage", None)),
+        }
+    return normalized_tree
 
 
-def extract_fault_elements_from_chunks(top_event: str, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+def extract_fault_elements_from_chunks(
+    top_event: str,
+    chunks: List[Dict[str, Any]],
+    *,
+    include_meta: bool = False,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
     prompt = f"""You are an industrial fault-tree analysis expert.
 
 Your task is to infer fault-tree semantics only from the recalled evidence chunks for top event "{top_event}".
@@ -2116,7 +2384,14 @@ Return strict JSON only:
         temperature=0.2,
         max_tokens=2200,
     )
-    return _parse_json(response.choices[0].message.content)
+    parsed = _parse_json(response.choices[0].message.content)
+    if include_meta:
+        return {
+            "elements": parsed,
+            "duration_seconds": round(time.perf_counter() - started, 3),
+            "token_usage": _normalize_token_usage(getattr(response, "usage", None)),
+        }
+    return parsed
 
 
 def build_fault_tree_from_chunk_elements(
@@ -2126,7 +2401,9 @@ def build_fault_tree_from_chunk_elements(
     requirements: str = "",
     previous_issues: Optional[List[Dict[str, Any]]] = None,
     part_details: Optional[Dict[str, Any]] = None,
+    include_meta: bool = False,
 ) -> Dict[str, Any]:
+    started = time.perf_counter()
     chunks_ref = [
         {
             "chunk_id": _chunk_reference(chunk),
@@ -2242,12 +2519,19 @@ Required JSON shape:
         max_tokens=LLM_GENERATION_MAX_TOKENS,
     )
     tree = _parse_json(response.choices[0].message.content)
-    return _post_process_chunk_generated_tree(
+    normalized_tree = _post_process_chunk_generated_tree(
         tree,
         top_event=top_event,
         elements=elements,
         chunks=chunks,
     )
+    if include_meta:
+        return {
+            "tree": normalized_tree,
+            "duration_seconds": round(time.perf_counter() - started, 3),
+            "token_usage": _normalize_token_usage(getattr(response, "usage", None)),
+        }
+    return normalized_tree
 
 
 def discover_top_events_from_entity_index(entries: List[dict]) -> List[dict]:

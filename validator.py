@@ -21,6 +21,7 @@ import json
 import re
 import importlib.util
 import sys
+import time
 from pathlib import Path
 
 client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
@@ -327,3 +328,163 @@ def validate_full(tree_data: dict, skip_semantic: bool = False) -> dict:
         "info_count":    info_count,
         "issues":        [i.to_dict() for i in all_issues]
     }
+
+
+def _normalize_token_usage(usage) -> dict:
+    if usage is None:
+        return {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+    return {
+        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+    }
+
+
+def validate_semantics(tree_data: dict, *, include_meta: bool = False):
+    node_list = tree_data.get("nodeList", [])
+    link_list = tree_data.get("linkList", [])
+    started = time.perf_counter()
+
+    children_map = {}
+    for link in link_list:
+        tgt = link.get("targetId")
+        src = link.get("sourceId")
+        children_map.setdefault(tgt, []).append(src)
+
+    nodes_by_id = {n["id"]: n for n in node_list}
+
+    lines = []
+    for node in node_list:
+        nid = node["id"]
+        children_ids = children_map.get(nid, [])
+        child_names = [nodes_by_id[c]["name"] for c in children_ids if c in nodes_by_id]
+        if child_names:
+            lines.append(f"[{node['type']}] {node['name']} --({node.get('gate')}闂?--> {child_names}")
+        else:
+            lines.append(f"[{node['type']}] {node['name']} 锛堝簳浜嬩欢锛?")
+
+    tree_summary = "\n".join(lines)
+
+    prompt = f"""浣犳槸鏁呴殰鏍戝垎鏋愶紙FTA锛変笓瀹躲€傝瀹℃煡浠ヤ笅鏁呴殰鏍戠殑閫昏緫鍚堢悊鎬с€?
+
+## 鏁呴殰鏍戠粨鏋?
+{tree_summary}
+
+## 瀹℃煡瑕佺偣
+1. 閫昏緫闂ㄦ槸鍚︾敤瀵癸紙OR/AND锛?
+2. 鍥犳灉鍏崇郴鏄惁鍚堢悊
+3. 搴曚簨浠舵槸鍚﹁冻澶熷叿浣撳彲妫€娴?
+4. 鏄惁瀛樺湪鏄庢樉閬楁紡鐨勯噸瑕佹晠闅滆矾寰?
+
+## 杈撳嚭鏍煎紡
+涓ユ牸杈撳嚭JSON鏁扮粍锛屾病鏈夐棶棰樿緭鍑篬]锛?
+[
+  {{
+    "level": "WARNING",
+    "code": "WRONG_GATE",
+    "message": "鍏蜂綋鎻忚堪闂",
+    "node_name": "鏈夐棶棰樼殑鑺傜偣鍚嶇О"
+  }}
+]
+level鍙兘鏄?WARNING 鎴?INFO銆?
+"""
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=LLM_VALIDATION_MAX_TOKENS,
+        )
+        raw = response.choices[0].message.content
+        clean = re.sub(r"```json|```", "", raw).strip()
+        items = json.loads(clean)
+        issues = [
+            ValidationIssue(
+                level=i.get("level", "WARNING"),
+                code=i.get("code", "SEMANTIC_ISSUE"),
+                message=i.get("message", ""),
+                node_name=i.get("node_name", ""),
+                source="ai",
+            )
+            for i in items
+        ]
+        if include_meta:
+            return {
+                "issues": issues,
+                "duration_seconds": round(time.perf_counter() - started, 3),
+                "token_usage": _normalize_token_usage(getattr(response, "usage", None)),
+                "ran": True,
+            }
+        return issues
+    except Exception as e:
+        issues = [
+            ValidationIssue(
+                "INFO",
+                "SEMANTIC_CHECK_FAILED",
+                f"语义校验未能完成（{str(e)}），建议人工复查",
+                source="ai",
+            )
+        ]
+        if include_meta:
+            return {
+                "issues": issues,
+                "duration_seconds": round(time.perf_counter() - started, 3),
+                "token_usage": _normalize_token_usage(None),
+                "ran": True,
+            }
+        return issues
+
+
+def validate_full(tree_data: dict, skip_semantic: bool = False, *, include_meta: bool = False) -> dict:
+    all_issues = []
+
+    structure_started = time.perf_counter()
+    struct_issues = validate_structure(tree_data)
+    structure_duration = round(time.perf_counter() - structure_started, 3)
+    all_issues.extend(struct_issues)
+
+    has_error = any(i.level == "ERROR" for i in struct_issues)
+    semantic_meta = {
+        "ran": False,
+        "duration_seconds": 0.0,
+        "token_usage": _normalize_token_usage(None),
+    }
+    if not has_error and not skip_semantic:
+        semantic_result = validate_semantics(tree_data, include_meta=include_meta)
+        if include_meta:
+            semantic_issues = semantic_result.get("issues") or []
+            semantic_meta = {
+                "ran": bool(semantic_result.get("ran")),
+                "duration_seconds": float(semantic_result.get("duration_seconds") or 0.0),
+                "token_usage": semantic_result.get("token_usage") or _normalize_token_usage(None),
+            }
+        else:
+            semantic_issues = semantic_result
+        all_issues.extend(semantic_issues)
+
+    error_count = sum(1 for i in all_issues if i.level == "ERROR")
+    warning_count = sum(1 for i in all_issues if i.level == "WARNING")
+    info_count = sum(1 for i in all_issues if i.level == "INFO")
+
+    result = {
+        "passed": error_count == 0,
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "info_count": info_count,
+        "issues": [i.to_dict() for i in all_issues],
+    }
+    if include_meta:
+        result["meta"] = {
+            "structure_validation": {
+                "duration_seconds": structure_duration,
+                "error_count": sum(1 for i in struct_issues if i.level == "ERROR"),
+                "warning_count": sum(1 for i in struct_issues if i.level == "WARNING"),
+                "info_count": sum(1 for i in struct_issues if i.level == "INFO"),
+            },
+            "semantic_validation": semantic_meta,
+        }
+    return result

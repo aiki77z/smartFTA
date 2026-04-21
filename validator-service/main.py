@@ -4,7 +4,9 @@ from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
+import os
 from pathlib import Path
+from urllib.parse import urljoin
 
 from dotenv import load_dotenv
 
@@ -411,12 +413,26 @@ def validate_fault_tree(payload: ValidateRequest) -> Dict[str, Any]:
 # ===== 高保真图片导出（Headless 浏览器截图） =====
 
 class ExportImageRequest(BaseModel):
-  url: str
+  url: str | None = None
+  path: str | None = None
   selector: str | None = None
   width: int | None = 1600
   height: int | None = 900
   scale: float | None = 3.0
   theme: str | None = None  # 'light' or 'dark'
+
+
+def _resolve_export_url(req: ExportImageRequest) -> str:
+  explicit_url = str(req.url or '').strip()
+  if explicit_url:
+    return explicit_url
+
+  path = str(req.path or '').strip()
+  if not path:
+    raise RuntimeError('导出图片缺少 url 或 path 参数')
+
+  base_url = os.getenv('FTA_EXPORT_BASE_URL', '').strip() or 'http://127.0.0.1:5173'
+  return urljoin(base_url.rstrip('/') + '/', path.lstrip('/'))
 
 
 @app.post('/export-fault-tree-image')
@@ -428,6 +444,8 @@ async def export_fault_tree_image(req: ExportImageRequest) -> Response:
   - pip install playwright
   - playwright install chromium
   """
+  target_url = _resolve_export_url(req)
+
   try:
     from playwright.async_api import async_playwright
   except ImportError:
@@ -447,9 +465,9 @@ async def export_fault_tree_image(req: ExportImageRequest) -> Response:
 
     # 先加载页面并记录 HTTP 状态，避免 431 等错误导致页面未渲染。
     # 这里尽量给足时间，React + 资源加载仍可能较慢。
-    goto_resp = await page.goto(req.url, wait_until='networkidle', timeout=30000)
+    goto_resp = await page.goto(target_url, wait_until='networkidle', timeout=30000)
     if goto_resp is not None and goto_resp.status >= 400:
-      raise RuntimeError(f'访问 {req.url} 失败，HTTP {goto_resp.status}')
+      raise RuntimeError(f'访问 {target_url} 失败，HTTP {goto_resp.status}')
 
     # 根据请求主题强制设置前端模式（保持与当前 Web 一致），
     # 直接修改根元素的 class，避免依赖按钮文案或默认状态。
@@ -500,7 +518,7 @@ async def export_fault_tree_image(req: ExportImageRequest) -> Response:
       await context.close()
       await browser.close()
       raise RuntimeError(
-        f'未找到选择器 {target_selector} 对应的元素（url={req.url}）: {exc}'
+        f'未找到选择器 {target_selector} 对应的元素（url={target_url}）: {exc}'
       ) from exc
 
     el = await page.query_selector(target_selector)

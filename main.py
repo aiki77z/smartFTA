@@ -428,16 +428,61 @@ def _build_top_event_resolution_payload(
     return payload
 
 
+def _empty_token_usage() -> Dict[str, Optional[int]]:
+    return {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
+
+
+def _merge_performance_sections(
+    resolution_performance: Optional[Dict[str, Any]],
+    generation_performance: Optional[Dict[str, Any]] = None,
+    persistence_performance: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    if isinstance(resolution_performance, dict):
+        merged.update(resolution_performance)
+    if isinstance(generation_performance, dict):
+        merged.update(generation_performance)
+    if isinstance(persistence_performance, dict):
+        merged["tree_persistence"] = persistence_performance
+
+    total = 0.0
+    for key in (
+        "prompt_parse",
+        "top_event_resolution",
+        "graph_match",
+        "graph_subgraph",
+        "chunk_recall",
+        "tree_generation",
+        "tree_validation",
+        "tree_persistence",
+    ):
+        section = merged.get(key)
+        if not isinstance(section, dict):
+            continue
+        total += float(section.get("duration_seconds") or 0.0)
+    merged["overall"] = {
+        "duration_seconds": round(total, 3),
+    }
+    return merged
+
+
 def _resolve_prompt_top_event(
     *,
     prompt: str,
     selected_file_version_ids: Optional[List[str]] = None,
     candidate_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
-    parsed_prompt = parse_user_prompt(prompt)
+    parse_started = time.perf_counter()
+    parsed_prompt = parse_user_prompt(prompt, include_meta=True)
     requested_top_event = parsed_prompt["top_event"]
     requirements = parsed_prompt.get("requirements", "")
+    parse_meta = parsed_prompt.get("_meta") or {}
     scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
+    resolution_started = time.perf_counter()
     ensured_catalog = ensure_top_event_catalog_for_scope(selected_file_version_ids=scoped_file_version_ids)
     existing_catalog = ensured_catalog.get("catalog") or []
     catalog_generated = bool(ensured_catalog.get("rebuilt_file_version_ids") or [])
@@ -460,6 +505,21 @@ def _resolve_prompt_top_event(
             catalog_generated=catalog_generated,
         )
         payload["parsed_prompt"] = parsed_prompt
+        payload["performance"] = {
+            "prompt_parse": {
+                "duration_seconds": round(float(parse_meta.get("duration_seconds") or (time.perf_counter() - parse_started)), 3),
+                "token_usage": parse_meta.get("token_usage") or _empty_token_usage(),
+                "parse_method": parse_meta.get("parse_method") or "unknown",
+                "prompt_length": len(str(prompt or "")),
+            },
+            "top_event_resolution": {
+                "duration_seconds": round(time.perf_counter() - resolution_started, 3),
+                "token_usage": _empty_token_usage(),
+                "resolution_status": "exact_match",
+                "candidate_count": 0,
+                "selected_scope_count": len(scoped_file_version_ids),
+            },
+        }
         return payload
 
     candidates = search_top_event_catalog_semantic(
@@ -492,6 +552,21 @@ def _resolve_prompt_top_event(
         catalog_generated=catalog_generated,
     )
     payload["parsed_prompt"] = parsed_prompt
+    payload["performance"] = {
+        "prompt_parse": {
+            "duration_seconds": round(float(parse_meta.get("duration_seconds") or (time.perf_counter() - parse_started)), 3),
+            "token_usage": parse_meta.get("token_usage") or _empty_token_usage(),
+            "parse_method": parse_meta.get("parse_method") or "unknown",
+            "prompt_length": len(str(prompt or "")),
+        },
+        "top_event_resolution": {
+            "duration_seconds": round(time.perf_counter() - resolution_started, 3),
+            "token_usage": _empty_token_usage(),
+            "resolution_status": "need_user_confirmation",
+            "candidate_count": len(payload.get("candidates") or []),
+            "selected_scope_count": len(scoped_file_version_ids),
+        },
+    }
     return payload
 
 
@@ -831,6 +906,7 @@ def _build_single_generate_result(
     graph_node_id: Optional[str] = None,
     job_id: Optional[str] = None,
     item_id: Optional[str] = None,
+    performance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload = {
         "mode": mode,
@@ -851,6 +927,8 @@ def _build_single_generate_result(
         payload["job_id"] = job_id
     if item_id:
         payload["item_id"] = item_id
+    if performance:
+        payload["performance"] = performance
     return payload
 
 
@@ -896,6 +974,7 @@ def _wait_for_single_item_result(
                 graph_node_id=graph_node_id,
                 job_id=job_id or item.get("job_id"),
                 item_id=item_id,
+                performance=item.get("performance_profile"),
             )
 
         if status == "failed":
@@ -1123,6 +1202,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
                 stage="persistence",
                 progress=90,
             )
+        persistence_started = time.perf_counter()
         version = save_version(
             tree_id=tree_id,
             tree_data=tree_data,
@@ -1135,6 +1215,17 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             source_file_version_ids=resolved_source_file_version_ids,
             evidence_chunk_ids=evidence_chunk_ids,
             subgraph_node_ids=subgraph_node_ids,
+        )
+        persistence_performance = {
+            "duration_seconds": round(time.perf_counter() - persistence_started, 3),
+            "token_usage": _empty_token_usage(),
+            "version": version,
+            "source_file_version_count": len(resolved_source_file_version_ids or []),
+            "evidence_chunk_count": len(evidence_chunk_ids or []),
+        }
+        performance_profile = _merge_performance_sections(
+            tree_data.get("performance"),
+            persistence_performance=persistence_performance,
         )
         _append_event(
             item_id,
@@ -1161,6 +1252,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             tree_id=tree_id,
             version=version,
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
+            performance_profile=performance_profile,
         )
         _console_log(
             f"[scheduler] success item={item_id} job={job_id} top_event={top_event} "
@@ -1177,6 +1269,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             version=version,
             error=None,
             worker_duration_seconds=round(time.perf_counter() - wall_started, 3),
+            performance_profile=performance_profile,
         )
         for mid in mirror_item_ids or []:
             _append_event(mid, agent="生成智能体", text="生成完成。", stage="completed", progress=100)
@@ -1295,6 +1388,7 @@ def _queue_single_generation(
             normalized_top_event=normalized_top_event,
             requirements=requirements,
             graph_node_id=graph_node_id,
+            performance=(reused.get("tree_data") or {}).get("performance"),
         )
 
     active_item = find_active_job_item_by_top_event_and_scope(normalized_top_event, scoped_file_version_ids)
@@ -1764,10 +1858,14 @@ def api_generate(req: GenerateRequest):
                 async_mode=True,
                 part_details=req.part_details,
             )
+            result["performance"] = _merge_performance_sections(
+                resolution.get("performance"),
+                result.get("performance"),
+            )
             return result
 
         # sync (default): block until finished and return tree_data
-        return _queue_single_generation(
+        result = _queue_single_generation(
             req.prompt,
             requested_top_event,
             requirements,
@@ -1776,6 +1874,11 @@ def api_generate(req: GenerateRequest):
             selected_file_version_ids=scoped_file_version_ids,
             part_details=req.part_details,
         )
+        result["performance"] = _merge_performance_sections(
+            resolution.get("performance"),
+            result.get("performance"),
+        )
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
