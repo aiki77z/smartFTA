@@ -1,0 +1,15 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.venv
+output
+*.pdf
+*.txt
+!requirements.txt
+*.json
+*.jsonl
+*.csv
+*.env

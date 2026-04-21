@@ -4,7 +4,7 @@ import time
 import threading
 from openai import OpenAI
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-86383e600ac4443ea8910c49120afdf4")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "qwen3.5-plus")
 LLM_TYPE = os.getenv("LLM_TYPE", "openai")
@@ -36,7 +36,7 @@ def get_token_usage():
 def call_openai(prompt, context):
     """调用 OpenAI 标准库，访问阿里云百炼大模型或其他 OpenAI 兼容接口"""
     if not OPENAI_API_KEY or not OPENAI_BASE_URL or not OPENAI_MODEL_NAME:
-        raise ValueError("请在代码中设置 OPENAI_API_KEY、OPENAI_BASE_URL 和 OPENAI_MODEL_NAME")
+        raise ValueError("请设置环境变量 OPENAI_API_KEY、OPENAI_BASE_URL 和 OPENAI_MODEL_NAME")
 
     client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
     messages = [
