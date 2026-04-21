@@ -42,7 +42,6 @@ function autoCleanGates(graphData) {
     const gateNodes = nodes.filter((n) => n.type === 'gate')
     for (const gate of gateNodes) {
       const children = getChildren(edges, gate.id)
-      const parentId = getParent(edges, gate.id)
       // 当 gate 不再有任何子节点时再清理掉该 gate；
       // 若仍有 1 个子节点，则保留 gate，避免用户删除一个子事件后逻辑门被自动移除。
       if (children.length === 0) {
@@ -677,7 +676,7 @@ export function graphToRawJson(graphData, attr, options = {}) {
         : n.meta?.gateCode || '2'
     }
 
-    return {
+    const entry = {
       type: typeField,
       gate: gateField,
       name: n.label.replace(/^\[(AND|OR)\]\s*/, ''),
@@ -687,6 +686,11 @@ export function graphToRawJson(graphData, attr, options = {}) {
       id: n.id,
       transfer: n.meta?.transfer || '',
     }
+    if (n.meta?._diffStatus) {
+      entry._ftaDiffStatus = n.meta._diffStatus
+      if (n.meta._diffGhost) entry._ftaDiffGhost = true
+    }
+    return entry
   })
 
   const linkList = []
@@ -786,7 +790,7 @@ export function graphToTreeDataJson(graphData, original) {
         .filter((cn) => cn && cn.type !== 'gate')
         .map((cn) => cn.id)
     }
-    newNodes[n.id] = {
+    const nodeEntry = {
       ...prev,
       id: n.id,
       name: n.label,
@@ -795,6 +799,14 @@ export function graphToTreeDataJson(graphData, original) {
       description: n.meta?.event?.description ?? prev.description,
       children,
     }
+    if (n.meta?._diffStatus) {
+      nodeEntry._ftaDiffStatus = n.meta._diffStatus
+      if (n.meta._diffGhost) nodeEntry._ftaDiffGhost = true
+    } else {
+      delete nodeEntry._ftaDiffStatus
+      delete nodeEntry._ftaDiffGhost
+    }
+    newNodes[n.id] = nodeEntry
   })
 
   return {

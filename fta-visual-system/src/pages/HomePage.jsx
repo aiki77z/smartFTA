@@ -1,14 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
   generateAllTrees,
-  generateTree,
+  getTree,
+  getTreeVersion,
+  listAllChunks,
   pollBatchJob,
-  pollGenerationJobItem,
 } from '../api/ftaBackend.js'
-import GenerationTaskPanel from '../components/GenerationTaskPanel.jsx'
+import { downloadKbJobUploadedFile, pollKbJob, startKbJobUpload } from '../api/kbBackend.js'
+import KnowledgeBasePanel from '../components/KnowledgeBasePanel.jsx'
+import KnowledgeGraphModal from '../components/KnowledgeGraphModal.jsx'
+import Exploded3dUploadModal from '../components/Exploded3dUploadModal.jsx'
 import {
-  clearProjectReviewed,
+  chunkBelongsToKbFile,
+  getChunkBodyText,
+  matchChunkToKbFile,
+} from '../components/knowledgeBaseConstants.js'
+import {
   DEFAULT_WORKSPACE_MESSAGES,
   ensureProject,
   getProjectById,
@@ -17,12 +25,165 @@ import {
   renameProjectFromFirstFile,
   saveWorkspace,
 } from '../utils/projectStore.js'
+import {
+  inferCanvasDisplayTitle,
+  listCanvasDrafts,
+  removeCanvasDraft,
+  upsertCanvasDraft,
+} from '../utils/canvasDraftStore.js'
+import {
+  deleteExploded3dBundle,
+  loadExploded3dBundle,
+  saveExploded3dBundle,
+} from '../utils/exploded3dProjectStore.js'
+import { buildFaultTreeThumbnailScene } from '../utils/faultTreeThumbnailLayout.js'
+import { normalizeBackendTreeDocumentToGraph } from '../utils/ftaParser.js'
 import { IconChevronLeft } from '../components/icons.jsx'
 import ThemeToggle from '../components/ThemeToggle.jsx'
-import TaskProgressHistoryModal from '../components/TaskProgressHistoryModal.jsx'
 import '../styles/home.css'
 
-const DEFAULT_TOP_EVENT = '示例设备总故障'
+const DEFAULT_FTA_BASE_URL = 'http://localhost:8000'
+
+/**
+ * 知识库构建全流程成功后的本地持久标记（随 workspace.files 写入 localStorage）。
+ * KB 后端重启后仍可显示「解析成功」，且恢复轮询时不会因接口失败被误判为解析失败。
+ */
+function migrateKbFileFromWorkspace(file) {
+  if (!file || typeof file !== 'object') return file
+  if (file.kbImportComplete) return file
+  if (file.status === 'done') {
+    return { ...file, kbImportComplete: true }
+  }
+  return file
+}
+
+function withKbImportCompleteIfDone(file, job) {
+  if (!file || typeof file !== 'object') return file
+  if (file.kbImportComplete) return file
+  const st = String(job?.status || '').toLowerCase()
+  if (st === 'failed' || st === 'error') return file
+  const done =
+    st === 'success' ||
+    st === 'completed' ||
+    st === 'finished' ||
+    st === 'done' ||
+    st === 'succeeded' ||
+    st === 'successful' ||
+    st === 'completed_with_sync_error'
+  if (!done) return file
+  return { ...file, kbImportComplete: true }
+}
+
+function lastChatTimestampFromMessages(messages) {
+  if (!Array.isArray(messages)) return null
+  let max = 0
+  for (const m of messages) {
+    const t = Number(m?.at)
+    if (Number.isFinite(t) && t > max) max = t
+  }
+  return max > 0 ? max : null
+}
+
+function formatBatchProgressInline(job, running) {
+  if (!job || typeof job !== 'object') return running ? '正在提交…' : ''
+  const total = Number(job.total)
+  const success = Number(job.success)
+  const failed = Number(job.failed)
+  const st = String(job.status || '').toLowerCase()
+  const t = Number.isFinite(total) ? total : null
+  const s = Number.isFinite(success) ? success : 0
+  const f = Number.isFinite(failed) ? failed : 0
+  const done = s + f
+  if (t != null && t > 0) {
+    return `${done}/${t} 棵 · ${s} 成功 · ${f} 失败`
+  }
+  if (running || st === 'pending' || st === 'running') {
+    return String(job.message || '').trim() || '批量任务进行中…'
+  }
+  return String(job.message || '').trim() || '—'
+}
+
+function formatFaultTreeChatTime(ts) {
+  if (!ts || !Number.isFinite(Number(ts))) return '暂无对话'
+  const d = new Date(Number(ts))
+  if (Number.isNaN(d.getTime())) return '暂无对话'
+  return d.toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'short' })
+}
+
+function MiniFaultTreeThumbnail({ graphData }) {
+  const scene = useMemo(() => buildFaultTreeThumbnailScene(graphData), [graphData])
+  if (!scene?.shapes?.length) {
+    return <div className="home-ft-thumb-placeholder">空白</div>
+  }
+  return (
+    <svg className="home-ft-thumb-svg" viewBox={scene.viewBox} aria-hidden>
+      {scene.lines.map((ln, i) => (
+        <line
+          key={`ln-${i}`}
+          x1={ln.x1}
+          y1={ln.y1}
+          x2={ln.x2}
+          y2={ln.y2}
+          stroke="currentColor"
+          strokeWidth="1.35"
+          opacity={0.38}
+        />
+      ))}
+      {scene.shapes.map((s) => {
+        if (s.kind === 'ellipse') {
+          const stroke = s.nodeType === 'basic' ? '#8dc08a' : '#64748b'
+          const fill = s.nodeType === 'basic' ? '#DEFACD' : '#e2e8f0'
+          return (
+            <ellipse
+              key={s.id}
+              cx={s.cx}
+              cy={s.cy}
+              rx={s.rx}
+              ry={s.ry}
+              fill={fill}
+              stroke={stroke}
+              strokeWidth="1.25"
+            />
+          )
+        }
+        if (s.kind === 'gate') {
+          const stroke = s.isAnd ? '#f59e0b' : '#a855f7'
+          const fill = s.isAnd ? '#fffbeb' : '#faf5ff'
+          return (
+            <rect
+              key={s.id}
+              x={s.x}
+              y={s.y}
+              width={s.w}
+              height={s.h}
+              rx={Math.min(3, s.w * 0.12)}
+              fill={fill}
+              stroke={stroke}
+              strokeWidth="1.25"
+            />
+          )
+        }
+        const stroke =
+          s.nodeType === 'top' ? '#4a62c4' : s.nodeType === 'intermediate' ? '#d4708f' : '#64748b'
+        const fill =
+          s.nodeType === 'top' ? '#CEEBFF' : s.nodeType === 'intermediate' ? '#FFF0FF' : '#f1f5f9'
+        return (
+          <rect
+            key={s.id}
+            x={s.x}
+            y={s.y}
+            width={s.w}
+            height={s.h}
+            rx={s.rx}
+            fill={fill}
+            stroke={stroke}
+            strokeWidth="1.25"
+          />
+        )
+      })}
+    </svg>
+  )
+}
 
 function getPreviewKind(fileName, mimeType = '') {
   const lower = (fileName || '').toLowerCase()
@@ -36,13 +197,17 @@ function FileContentPreview({ fileMeta, fileObject, hasAnyFiles, variant = 'inli
   const [textError, setTextError] = useState('')
   const [textLoading, setTextLoading] = useState(false)
   const [pdfObjectUrl, setPdfObjectUrl] = useState('')
+  const [remoteFileObject, setRemoteFileObject] = useState(null)
   const isModal = variant === 'modal'
 
+  const effectiveFileObject = fileObject || remoteFileObject
+
   const kind = useMemo(
-    () => getPreviewKind(fileMeta?.name, fileObject?.type),
-    [fileMeta?.name, fileObject?.type],
+    () => getPreviewKind(fileMeta?.name, effectiveFileObject?.type),
+    [fileMeta?.name, effectiveFileObject?.type],
   )
 
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     setTextContent('')
     setTextError('')
@@ -52,7 +217,26 @@ function FileContentPreview({ fileMeta, fileObject, hasAnyFiles, variant = 'inli
       return ''
     })
 
-    if (!fileMeta || !fileObject) return undefined
+    if (!fileMeta) return undefined
+
+    // 若本地 File 丢失（例如离开页面回来），尝试从 KB 后端按 kbJobId 拉取原文件 blob 以供预览
+    if (!fileObject && fileMeta?.kbJobId && !remoteFileObject) {
+      const ac = new AbortController()
+      downloadKbJobUploadedFile({ jobId: fileMeta.kbJobId, signal: ac.signal })
+        .then((blob) => {
+          const b = blob instanceof Blob ? blob : null
+          if (!b) return
+          const name = fileMeta?.name || 'upload.bin'
+          const f = new File([b], name, { type: b.type || '' })
+          setRemoteFileObject(f)
+        })
+        .catch(() => {
+          // ignore
+        })
+      return () => ac.abort()
+    }
+
+    if (!effectiveFileObject) return undefined
 
     if (kind === 'txt') {
       setTextLoading(true)
@@ -65,12 +249,12 @@ function FileContentPreview({ fileMeta, fileObject, hasAnyFiles, variant = 'inli
         setTextError('无法读取该文本文件')
         setTextLoading(false)
       }
-      reader.readAsText(fileObject, 'UTF-8')
+      reader.readAsText(effectiveFileObject, 'UTF-8')
       return undefined
     }
 
     if (kind === 'pdf') {
-      const url = URL.createObjectURL(fileObject)
+      const url = URL.createObjectURL(effectiveFileObject)
       setPdfObjectUrl(url)
       return () => {
         URL.revokeObjectURL(url)
@@ -78,7 +262,8 @@ function FileContentPreview({ fileMeta, fileObject, hasAnyFiles, variant = 'inli
     }
 
     return undefined
-  }, [fileMeta?.id, fileObject, kind])
+  }, [fileMeta?.id, fileMeta?.kbJobId, fileObject, remoteFileObject, kind])
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const phCls = `home-file-preview-placeholder${isModal ? ' home-file-preview-placeholder--modal' : ''}`
   const errCls = `home-file-preview-error${isModal ? ' home-file-preview-error--modal' : ''}`
@@ -93,10 +278,10 @@ function FileContentPreview({ fileMeta, fileObject, hasAnyFiles, variant = 'inli
     )
   }
 
-  if (!fileObject) {
+  if (!effectiveFileObject) {
     return (
       <div className={phCls}>
-        该文件仅有记录（例如刷新页面后从本地恢复），无法预览原文。请重新上传该文件后再试。
+        该文件仅有记录（例如刷新页面后从本地恢复），正在尝试从 KB 后端恢复原文用于预览…
       </div>
     )
   }
@@ -141,158 +326,158 @@ function FileContentPreview({ fileMeta, fileObject, hasAnyFiles, variant = 'inli
   return null
 }
 
-function extractTopEvent(input) {
-  const text = input.trim()
-  if (!text) return DEFAULT_TOP_EVENT
-  const match = text.match(/顶事件为\s*["“]?([^"”。，,;\n]+)["”]?/)
-  if (match?.[1]) return match[1].trim()
-  return DEFAULT_TOP_EVENT
-}
-
-/**
- * 与本地存储兼容：旧数据无 status；
- * 任务恢复策略：queued/running 不再直接判定为失败，而是在页面加载后自动恢复轮询。
- */
-function normalizeStoredResultItems(items) {
-  if (!Array.isArray(items)) return []
-  return items
-    .filter(Boolean)
-    .map((it) => {
-      if (!it.status) {
-        return {
-          ...it,
-          status: 'completed',
-          progress: 100,
-          promptPreview: it.promptPreview || it.title || '',
-        }
-      }
-      if (it.status === 'queued' || it.status === 'running') {
-        return {
-          ...it,
-          // 保持原状态，提示用户正在恢复（具体进度会由恢复轮询覆盖）
-          message: it.message || '正在恢复任务进度…',
-          stage: it.stage || 'resume',
-          error: null,
-        }
-      }
-      return it
-    })
-}
-
 function HomePage() {
   const navigate = useNavigate()
+  const location = useLocation()
   const { projectId = '' } = useParams()
   const [files, setFiles] = useState([])
   const [selectedFileId, setSelectedFileId] = useState(null)
-  const [chatInput, setChatInput] = useState('')
+  /** 与右侧「故障树」卡片联动：高亮画布内已选知识库文件 */
+  const [linkedKbFileIds, setLinkedKbFileIds] = useState([])
+  const [activeFaultTreeKey, setActiveFaultTreeKey] = useState(null)
+  const [faultTreeRefreshKey, setFaultTreeRefreshKey] = useState(0)
   const [projectName, setProjectName] = useState('')
   const [editingProjectName, setEditingProjectName] = useState(false)
-  const [messages, setMessages] = useState([...DEFAULT_WORKSPACE_MESSAGES])
-  const [resultItems, setResultItems] = useState([])
   const [workspaceReady, setWorkspaceReady] = useState(false)
   const [previewModalOpen, setPreviewModalOpen] = useState(false)
-  const [batchGenerating, setBatchGenerating] = useState(false)
-  const [progressModal, setProgressModal] = useState({ open: false, taskId: '' })
+  const [previewFileObject, setPreviewFileObject] = useState(null)
+  /** 知识库构建：对接 FTA-KB job（GET /api/kb/jobs/{job_id}） */
+  const [kbJob, setKbJob] = useState(null)
+  const [kbPrimaryFileId, setKbPrimaryFileId] = useState('')
+  const kbPrimaryFileIdRef = useRef('')
+  const [kbHydrating, setKbHydrating] = useState(false)
+  /** 记录每个文件对应的 KB job_id（用于多文件并行轮询与显示解析进度） */
+  const kbJobIdByFileIdRef = useRef(new Map())
+  const kbPollersByFileIdRef = useRef(new Map())
+  /** 勾选参与分块预览的文件（默认勾选新上传文件）；与「本轮知识库来源」一致 */
+  const [kbChunkIncludeById, setKbChunkIncludeById] = useState({})
+  /** 项目页知识库来源/文件集合变化代数，供画布判断下一条是否须走 FTA generate */
+  const [kbDatasetEpoch, setKbDatasetEpoch] = useState(0)
+  const [kbChunks, setKbChunks] = useState([])
+  const [kbChunksLoading, setKbChunksLoading] = useState(false)
+  const [kbChunksError, setKbChunksError] = useState('')
+  const [kbChunksPanelOpen, setKbChunksPanelOpen] = useState(true)
+  /** 批量生成故障树（FTA-GNR /api/batch/generate-all） */
+  const [batchJob, setBatchJob] = useState(null)
+  const [batchJobError, setBatchJobError] = useState('')
+  const [batchJobRunning, setBatchJobRunning] = useState(false)
+  const batchPollerRef = useRef(null)
+  /** 批量生成：已成功写入本地画布草稿的 job_item，避免轮询重复导入 */
+  const batchImportedItemIdsRef = useRef(new Set())
+  /** 批量生成开始时快照的「知识库来源文件 id」，写入画布草稿供概览高亮 */
+  const batchKbSourceFileIdsRef = useRef([])
   const skipTitleBlurRef = useRef(false)
-  const executionQueueRef = useRef([])
-  const drainingRef = useRef(false)
-  const resumePollersRef = useRef(new Map())
-  /** 仅内存：每个任务最后已消费的 event.seq，用于去重 */
-  const taskEventCursorRef = useRef(new Map())
-  /** 仅内存：每个任务的历史事件（用于弹窗展示） */
-  const taskEventHistoryRef = useRef(new Map())
+  const kbPollerRef = useRef(null)
+  const [graphModalOpen, setGraphModalOpen] = useState(false)
+  const [threeDModalOpen, setThreeDModalOpen] = useState(false)
+  /** 当前项目是否在 IndexedDB 中存有 GLB+部件 JSON（与生成故障树提示词联动） */
+  const [exploded3dConfigured, setExploded3dConfigured] = useState(false)
   /** 仅内存：上传的 File 对象，用于本地预览；不写入 localStorage */
   const fileObjectStoreRef = useRef(new Map())
 
-  const patchResultTask = useCallback((taskId, patch) => {
-    setResultItems((prev) => prev.map((t) => (t.id === taskId ? { ...t, ...patch } : t)))
+  const openGraphModal = useCallback(() => {
+    setGraphModalOpen(true)
   }, [])
 
-  const formatAgentDisplay = useCallback((agent) => {
-    const a = String(agent || '').trim()
-    if (!a) return { name: 'Agent', avatar: 'A' }
-    if (a === 'LLM#1') return { name: '知识抽取智能体', avatar: '1' }
-    if (a === 'LLM#2') return { name: '草稿生成智能体', avatar: '2' }
-    if (a === 'LLM#3') return { name: '定向修复智能体', avatar: '3' }
-    if (a.includes('召回')) return { name: '召回智能体', avatar: 'R' }
-    if (a.includes('修复')) return { name: '修复智能体', avatar: 'F' }
-    if (a.includes('校验')) return { name: '校验智能体', avatar: 'V' }
-    if (a.includes('调度')) return { name: '调度器', avatar: 'S' }
-    if (a.includes('流程')) return { name: '流程控制', avatar: 'P' }
-    return { name: a, avatar: a.slice(0, 1).toUpperCase() }
+  const closeGraphModal = useCallback(() => {
+    setGraphModalOpen(false)
   }, [])
 
-  const appendTaskEventsToChat = useCallback(
-    ({ taskId, userPrompt, events }) => {
-      if (!taskId || !Array.isArray(events) || events.length === 0) return
-      const lastSeq = Number(taskEventCursorRef.current.get(taskId) || 0)
-      const incoming = events
-        .filter((e) => e && Number(e.seq) > lastSeq)
-        .sort((a, b) => Number(a.seq) - Number(b.seq))
+  const openThreeDModal = useCallback(() => {
+    setThreeDModalOpen(true)
+  }, [])
 
-      if (incoming.length === 0) return
+  const closeThreeDModal = useCallback(() => {
+    setThreeDModalOpen(false)
+  }, [])
 
-      const nextLast = Math.max(...incoming.map((e) => Number(e.seq) || 0))
-      taskEventCursorRef.current.set(taskId, nextLast)
+  const kbProgressFromJob = useCallback((job) => {
+    const jp = Number(job?.progress)
+    if (Number.isFinite(jp) && jp >= 0) return Math.max(0, Math.min(100, jp))
+    const st = String(job?.status || '').toLowerCase()
+    if (st === 'queued') return 1
+    if (st === 'running') return 35
+    if (st === 'syncing') return 85
+    if (st === 'success' || st === 'completed' || st === 'finished') return 100
+    if (st === 'completed_with_sync_error') return 100
+    if (st === 'failed') return 100
+    return 10
+  }, [])
 
-      const quote = userPrompt
-        ? userPrompt.length > 80
-          ? `${userPrompt.slice(0, 80)}…`
-          : userPrompt
-        : ''
+  const kbStatusFromJob = useCallback((job) => {
+    const st = String(job?.status || '').toLowerCase()
+    if (
+      st === 'success' ||
+      st === 'completed' ||
+      st === 'finished' ||
+      st === 'done' ||
+      st === 'succeeded' ||
+      st === 'successful'
+    ) {
+      return 'done'
+    }
+    if (st === 'completed_with_sync_error') return 'done'
+    if (st === 'failed' || st === 'error') return 'failed'
+    return 'processing'
+  }, [])
 
-      const normalizedIncoming = incoming.map((evt) => {
-        const { name, avatar } = formatAgentDisplay(evt.agent)
-        return {
-          seq: Number(evt.seq) || 0,
-          ts: evt.ts || evt.created_at || '',
-          agent: name,
-          avatar,
-          level: String(evt.level || 'INFO').toUpperCase(),
-          text: String(evt.text || ''),
-          stage: evt.stage || '',
-          progress: evt.progress,
-        }
-      })
+  useEffect(() => {
+    kbPrimaryFileIdRef.current = kbPrimaryFileId || ''
+  }, [kbPrimaryFileId])
 
-      // update per-task history (in-memory)
-      const prevHistory = taskEventHistoryRef.current.get(taskId) || []
-      const merged = [...prevHistory, ...normalizedIncoming]
-      // hard cap to avoid unlimited memory growth
-      taskEventHistoryRef.current.set(taskId, merged.slice(-400))
+  const startKbPollingForFile = useCallback(
+    (fileId, jobId) => {
+      if (!fileId || !jobId) return
+      const prev = kbPollersByFileIdRef.current.get(fileId)
+      if (prev) prev.abort?.()
+      const controller = new AbortController()
+      kbPollersByFileIdRef.current.set(fileId, controller)
 
-      // chat: keep only ONE message per task, showing latest event
-      const latest = normalizedIncoming[normalizedIncoming.length - 1]
-      const prefix =
-        latest.level === 'ERROR' ? '错误' : latest.level === 'WARNING' ? '警告' : '进度'
-      const msg = {
-        id: `progress-${taskId}`,
-        role: 'assistant',
-        kind: 'progress',
-        taskId,
-        agent: latest.agent,
-        avatar: latest.avatar,
-        quote,
-        content: `${prefix}：${latest.text || ''}`.trim(),
-        at: Date.now(),
-      }
-
-      setMessages((prev) => {
-        const next = []
-        let replaced = false
-        for (const m of prev) {
-          if (m?.kind === 'progress' && m?.taskId === taskId) {
-            if (!replaced) next.push(msg)
-            replaced = true
-          } else {
-            next.push(m)
+      void pollKbJob({
+        jobId,
+        signal: controller.signal,
+        onUpdate: (job) => {
+          // 左栏上方只展示“主文件”的 job，避免多个轮询互相覆盖造成错误闪烁
+          const primary = kbPrimaryFileIdRef.current
+          if (!primary || primary === fileId) {
+            setKbJob(job)
+            if (kbHydrating) setKbHydrating(false)
           }
-        }
-        if (!replaced) next.push(msg)
-        return next.slice(-320)
+          const pct = kbProgressFromJob(job)
+          const importedFile = job?.sync_response?.file
+          const importedFileVersionId = importedFile?.file_version_id || ''
+          const importedFileId = importedFile?.file_id || ''
+          const importedFileName = importedFile?.file_name || ''
+          setFiles((prevFiles) =>
+            prevFiles.map((f) => {
+              if (f.id !== fileId) return f
+              const next = {
+                ...f,
+                kbJobId: jobId,
+                fileVersionId: importedFileVersionId || f.fileVersionId || '',
+                fileId: importedFileId || f.fileId || '',
+                importedFileName: importedFileName || f.importedFileName || '',
+                parseProgress: Math.max(f.parseProgress || 0, pct),
+                status: kbStatusFromJob(job),
+              }
+              return withKbImportCompleteIfDone(next, job)
+            }),
+          )
+        },
+        intervalMs: 2000,
+      }).catch((e) => {
+        if (e?.name === 'AbortError') return
+        // KB 不可达时：已本地标记「构建完成」的文件保持成功，不覆盖为失败
+        setFiles((prevFiles) =>
+          prevFiles.map((f) => {
+            if (f.id !== fileId) return f
+            if (f.kbImportComplete || f.status === 'done') return f
+            return { ...f, status: 'failed' }
+          }),
+        )
       })
     },
-    [formatAgentDisplay],
+    [kbProgressFromJob, kbStatusFromJob, kbHydrating],
   )
 
   useEffect(() => {
@@ -300,24 +485,174 @@ function HomePage() {
     setWorkspaceReady(false)
     fileObjectStoreRef.current = new Map()
     setSelectedFileId(null)
+    setKbJob(null)
+    setKbPrimaryFileId('')
+    setKbHydrating(false)
+    kbJobIdByFileIdRef.current = new Map()
+    if (kbPollerRef.current) {
+      kbPollerRef.current.abort()
+      kbPollerRef.current = null
+    }
+    // stop per-file pollers
+    try {
+      for (const c of kbPollersByFileIdRef.current.values()) c.abort?.()
+    } catch {
+      // ignore
+    }
+    kbPollersByFileIdRef.current = new Map()
     ensureProject(projectId)
     const proj = getProjectById(projectId)
     if (proj) setProjectName(proj.name)
 
     const ws = getWorkspace(projectId)
     if (ws) {
-      setFiles(ws.files || [])
-      setMessages(
-        ws.messages?.length ? ws.messages : [...DEFAULT_WORKSPACE_MESSAGES],
-      )
-      setResultItems(normalizeStoredResultItems(ws.resultItems || []))
+      setFiles((ws.files || []).map(migrateKbFileFromWorkspace))
+      setKbDatasetEpoch(typeof ws.kbDatasetEpoch === 'number' ? ws.kbDatasetEpoch : 0)
+      if (Array.isArray(ws.kbSourceFileIds)) {
+        const inc = {}
+        for (const f of ws.files || []) {
+          inc[f.id] = ws.kbSourceFileIds.includes(f.id)
+        }
+        setKbChunkIncludeById(inc)
+      } else {
+        setKbChunkIncludeById({})
+      }
     } else {
       setFiles([])
-      setMessages([...DEFAULT_WORKSPACE_MESSAGES])
-      setResultItems([])
+      setKbDatasetEpoch(0)
+      setKbChunkIncludeById({})
     }
+
     setWorkspaceReady(true)
   }, [projectId])
+
+  // 重新进入页面：恢复每个文件的 KB 轮询（基于持久化的 kbJobId）
+  const kbResumeOnceRef = useRef(false)
+  useEffect(() => {
+    if (!workspaceReady) return
+    if (kbResumeOnceRef.current) return
+    kbResumeOnceRef.current = true
+    const list = Array.isArray(files) ? files : []
+    // 仅对仍需向 KB 查询状态的文件恢复轮询；已成功持久化的文件不再请求（避免 KB 停机时误判失败）
+    const needsKbPoll = (f) =>
+      f?.kbJobId &&
+      !f.kbImportComplete &&
+      (f.status === 'processing' || f.status === 'failed')
+    // 选择一个“主流程”文件：优先仍在构建中的，其次曾失败需重试的
+    const processing = list.find((f) => f?.kbJobId && f.status === 'processing')
+    const primary = processing || list.find(needsKbPoll) || null
+    if (primary?.id && primary?.kbJobId && needsKbPoll(primary)) {
+      setKbPrimaryFileId(primary.id)
+      setKbHydrating(true)
+      setKbJob({
+        job_id: String(primary.kbJobId || ''),
+        status: 'running',
+        stage: 'resume',
+        progress: Number(primary.parseProgress) || 0,
+        message: `正在恢复任务进度…（${primary.name || '文件'}）`,
+      })
+    } else if (list.some((f) => f?.kbImportComplete && f.status === 'done')) {
+      const firstDone = list.find((f) => f.status === 'done')
+      if (firstDone?.id) setKbPrimaryFileId(firstDone.id)
+      setKbHydrating(false)
+    }
+    for (const f of list) {
+      const jobId = f?.kbJobId
+      if (jobId && needsKbPoll(f)) {
+        startKbPollingForFile(f.id, jobId)
+      }
+    }
+  }, [workspaceReady, files, startKbPollingForFile])
+
+  useEffect(() => {
+    setLinkedKbFileIds([])
+    setActiveFaultTreeKey(null)
+  }, [projectId])
+
+  useEffect(() => {
+    setKbChunks([])
+    setKbChunksError('')
+    setBatchJob(null)
+    setBatchJobError('')
+    setBatchJobRunning(false)
+    batchImportedItemIdsRef.current = new Set()
+    if (batchPollerRef.current) {
+      batchPollerRef.current.abort()
+      batchPollerRef.current = null
+    }
+  }, [projectId])
+
+  useEffect(() => {
+    setKbChunkIncludeById((prev) => {
+      const next = { ...prev }
+      for (const f of files) {
+        if (!(f.id in next)) next[f.id] = true
+      }
+      return next
+    })
+  }, [files])
+
+  const kbIncludedNamesKey = useMemo(
+    () =>
+      files
+        .filter((f) => kbChunkIncludeById[f.id] !== false)
+        .map(
+          (f) =>
+            `${f.id}:${f.name}:${String(f.fileVersionId || '').trim()}:${String(f.fileId || '').trim()}`,
+        )
+        .sort()
+        .join('|'),
+    [files, kbChunkIncludeById],
+  )
+
+  useEffect(() => {
+    const ac = new AbortController()
+    setKbChunksLoading(true)
+    setKbChunksError('')
+    // 临时：预览时直接拉取数据库全库 chunks（后端按 safe_limit 截断）
+    listAllChunks({ limit: 800, signal: ac.signal })
+      .then((r) => {
+        setKbChunks(Array.isArray(r?.chunks) ? r.chunks : [])
+      })
+      .catch((e) => {
+        if (e?.name === 'AbortError') return
+        setKbChunksError(e?.message || '加载分块失败')
+        setKbChunks([])
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setKbChunksLoading(false)
+      })
+    return () => ac.abort()
+  }, [kbIncludedNamesKey])
+
+  // 将 KB job 的实时进度映射回“当前触发的那个文件”的解析进度条（与 kbStatusFromJob 终态一致）
+  useEffect(() => {
+    if (!kbPrimaryFileId) return
+    if (!kbJob) return
+    const pct = Number.isFinite(Number(kbJob.progress)) ? Math.max(0, Math.min(100, Number(kbJob.progress))) : 0
+    const st = String(kbJob.status || '').toLowerCase()
+    const failed = st === 'failed' || st === 'error'
+    const done =
+      !failed &&
+      (st === 'success' ||
+        st === 'completed' ||
+        st === 'finished' ||
+        st === 'done' ||
+        st === 'succeeded' ||
+        st === 'successful' ||
+        st === 'completed_with_sync_error')
+    setFiles((prev) =>
+      prev.map((f) => {
+        if (f.id !== kbPrimaryFileId) return f
+        const next = {
+          ...f,
+          parseProgress: failed || done ? 100 : Math.max(f.parseProgress || 0, Math.round(pct)),
+          status: failed ? 'failed' : done ? 'done' : 'processing',
+        }
+        return done ? { ...next, kbImportComplete: true } : next
+      }),
+    )
+  }, [kbJob, kbPrimaryFileId])
 
   useEffect(() => {
     if (!selectedFileId) return
@@ -326,143 +661,118 @@ function HomePage() {
     }
   }, [files, selectedFileId])
 
+  // 若当前未选中任何文件：当有文件进入 done 状态时，自动选中第一个已完成文件（便于预览）
+  useEffect(() => {
+    if (selectedFileId) return
+    const firstDone = files.find((f) => f.status === 'done')
+    if (firstDone) setSelectedFileId(firstDone.id)
+  }, [files, selectedFileId])
+
+  const kbSourceFileIdsForSave = useMemo(
+    () => files.filter((f) => kbChunkIncludeById[f.id] !== false).map((f) => f.id),
+    [files, kbChunkIncludeById],
+  )
+
+  const ingestBatchItemToLocalCanvas = useCallback(
+    async ({ itemId, treeId, topEventLabel }, signal) => {
+      if (!projectId || !treeId || !itemId) return
+      let ver = await getTree({ treeId: String(treeId), signal })
+      const hasTd = Boolean(ver?.tree_data || ver?.treeData)
+      if (!hasTd) {
+        const cv = Number(ver?.current_version)
+        const v = Number.isFinite(cv) && cv >= 1 ? cv : 1
+        ver = await getTreeVersion({ treeId: String(treeId), version: v, signal })
+      }
+      const rawJsonText = JSON.stringify(ver, null, 2)
+      const graphData = normalizeBackendTreeDocumentToGraph(ver)
+      const canvasId = `tree-${String(treeId)}`
+      const srcIds = Array.isArray(batchKbSourceFileIdsRef.current)
+        ? batchKbSourceFileIdsRef.current.map(String).filter(Boolean)
+        : []
+      upsertCanvasDraft(projectId, canvasId, {
+        title: inferCanvasDisplayTitle(rawJsonText, graphData),
+        rawJsonText,
+        graphData,
+        selectedSourceFiles: srcIds,
+        backendTreeId: String(treeId),
+        assistantMessages: [
+          {
+            role: 'assistant',
+            at: Date.now(),
+            content: `批量生成：${topEventLabel || '故障树'}（tree_id=${String(treeId)}）`,
+          },
+        ],
+      })
+      setFaultTreeRefreshKey((k) => k + 1)
+    },
+    [projectId],
+  )
+
   useEffect(() => {
     if (!projectId || !workspaceReady) return
-    saveWorkspace(projectId, { files, messages, resultItems })
-  }, [projectId, workspaceReady, files, messages, resultItems])
-
-  // 任务轮询恢复：切换项目/离开页面时终止；在任务列表变化时按需启动新的轮询
-  useEffect(() => {
-    if (!projectId || !workspaceReady) return undefined
+    let cancelled = false
+    loadExploded3dBundle(projectId)
+      .then((b) => {
+        if (!cancelled) setExploded3dConfigured(!!b)
+      })
+      .catch(() => {
+        if (!cancelled) setExploded3dConfigured(false)
+      })
     return () => {
-      resumePollersRef.current.forEach((controller) => controller.abort())
-      resumePollersRef.current = new Map()
+      cancelled = true
     }
   }, [projectId, workspaceReady])
 
+  const handleExploded3dSaved = useCallback(
+    async (bundle) => {
+      if (!projectId) return
+      await saveExploded3dBundle(projectId, bundle)
+      setExploded3dConfigured(true)
+      saveWorkspace(projectId, {
+        files,
+        messages: DEFAULT_WORKSPACE_MESSAGES,
+        resultItems: [],
+        kbSourceFileIds: kbSourceFileIdsForSave,
+        kbDatasetEpoch,
+        exploded3dConfigured: true,
+      })
+    },
+    [projectId, files, kbSourceFileIdsForSave, kbDatasetEpoch],
+  )
+
+  const handleExploded3dClear = useCallback(async () => {
+    if (!projectId) return
+    await deleteExploded3dBundle(projectId)
+    setExploded3dConfigured(false)
+    saveWorkspace(projectId, {
+      files,
+      messages: DEFAULT_WORKSPACE_MESSAGES,
+      resultItems: [],
+      kbSourceFileIds: kbSourceFileIdsForSave,
+      kbDatasetEpoch,
+      exploded3dConfigured: false,
+    })
+  }, [projectId, files, kbSourceFileIdsForSave, kbDatasetEpoch])
+
   useEffect(() => {
     if (!projectId || !workspaceReady) return
-
-    const startResume = (task) => {
-      if (!task?.id) return
-      if (resumePollersRef.current.has(task.id)) return
-      if (task.status !== 'queued' && task.status !== 'running') return
-      const hasItem = Boolean(task.itemId)
-      const hasJob = Boolean(task.jobId)
-      if (!hasItem && !hasJob) return
-
-      const controller = new AbortController()
-      resumePollersRef.current.set(task.id, controller)
-
-      patchResultTask(task.id, {
-        status: 'running',
-        error: null,
-        message: task.message || '正在恢复任务进度…',
-        stage: task.stage || 'resume',
-      })
-
-      ;(async () => {
-        try {
-          if (hasItem) {
-            const finalItem = await pollGenerationJobItem({
-              itemId: task.itemId,
-              signal: controller.signal,
-              onUpdate: (item) => {
-                patchResultTask(task.id, {
-                  progress: item.progress ?? 0,
-                  stage: item.stage || item.status || '',
-                  message: item.message || '',
-                  title: item.top_event || task.title || '',
-                })
-                appendTaskEventsToChat({
-                  taskId: task.id,
-                  userPrompt: task.userPrompt || '',
-                  events: item.events || [],
-                })
-              },
-            })
-            if (finalItem.status === 'success') {
-              patchResultTask(task.id, {
-                status: 'completed',
-                progress: 100,
-                faultTreeId: finalItem.tree_id || task.faultTreeId || null,
-                stage: 'completed',
-                message: finalItem.message || '生成完成',
-                error: null,
-              })
-            } else if (finalItem.status === 'failed') {
-              patchResultTask(task.id, {
-                status: 'failed',
-                progress: finalItem.progress ?? 100,
-                faultTreeId: finalItem.tree_id || task.faultTreeId || null,
-                stage: finalItem.stage || 'failed',
-                message: finalItem.message || '生成失败',
-                error: finalItem.error || '生成失败',
-              })
-            }
-          } else if (hasJob) {
-            const finalJob = await pollBatchJob({
-              jobId: task.jobId,
-              signal: controller.signal,
-              onUpdate: (job) => {
-                const total = Number(job?.total)
-                const success = Number(job?.success)
-                const failed = Number(job?.failed)
-                const done =
-                  (Number.isFinite(success) ? success : 0) + (Number.isFinite(failed) ? failed : 0)
-                const progress =
-                  Number.isFinite(total) && total > 0 ? Math.round((done / total) * 100) : 0
-                patchResultTask(task.id, {
-                  progress,
-                  stage: job?.stage || job?.status || '',
-                  message:
-                    job?.message ||
-                    (Number.isFinite(total)
-                      ? `批量生成中：${done}/${total}（成功 ${success || 0}，失败 ${failed || 0}）`
-                      : task.message || ''),
-                })
-              },
-            })
-            const st = String(finalJob?.status || '').toLowerCase()
-            if (st === 'failed') {
-              patchResultTask(task.id, {
-                status: 'failed',
-                stage: finalJob?.stage || 'failed',
-                message: finalJob?.message || '批量任务失败',
-                error: finalJob?.error || '批量任务失败',
-              })
-            } else {
-              patchResultTask(task.id, {
-                status: 'completed',
-                progress: 100,
-                stage: finalJob?.stage || 'completed',
-                message: finalJob?.message || '批量生成任务已完成',
-                error: null,
-              })
-            }
-          }
-        } catch (e) {
-          if (e?.name === 'AbortError') return
-          patchResultTask(task.id, {
-            status: 'failed',
-            stage: 'failed',
-            message: '任务进度恢复失败',
-            error: e?.message || '任务进度恢复失败',
-          })
-        } finally {
-          // 任务结束后允许重新启动（例如用户刷新后再次恢复）
-          resumePollersRef.current.delete(task.id)
-        }
-      })()
-    }
-
-    resultItems.forEach(startResume)
-  }, [projectId, workspaceReady, resultItems, patchResultTask])
+    saveWorkspace(projectId, {
+      files,
+      messages: DEFAULT_WORKSPACE_MESSAGES,
+      resultItems: [],
+      kbSourceFileIds: kbSourceFileIdsForSave,
+      kbDatasetEpoch,
+      exploded3dConfigured,
+    })
+  }, [projectId, workspaceReady, files, kbSourceFileIdsForSave, kbDatasetEpoch, exploded3dConfigured])
 
   useEffect(() => {
     if (!previewModalOpen) return undefined
     const onKey = (e) => {
-      if (e.key === 'Escape') setPreviewModalOpen(false)
+      if (e.key === 'Escape') {
+        setPreviewModalOpen(false)
+        setPreviewFileObject(null)
+      }
     }
     document.addEventListener('keydown', onKey)
     const prevOverflow = document.body.style.overflow
@@ -473,37 +783,120 @@ function HomePage() {
     }
   }, [previewModalOpen])
 
-  useEffect(() => {
-    if (!files.length) return
-    const timer = setInterval(() => {
-      setFiles((prev) =>
-        prev.map((item) => {
-          if (item.status === 'done') return item
-
-          const upload = Math.min(item.uploadProgress + 12, 100)
-          let parse = item.parseProgress
-          if (upload >= 100) {
-            parse = Math.min(parse + 10, 100)
-          }
-          const done = upload === 100 && parse === 100
-
-          return {
-            ...item,
-            uploadProgress: upload,
-            parseProgress: parse,
-            status: done ? 'done' : 'processing',
-          }
-        }),
-      )
-    }, 450)
-
-    return () => clearInterval(timer)
-  }, [files.length])
-
   const finishedCount = useMemo(
     () => files.filter((f) => f.status === 'done').length,
     [files],
   )
+
+  useEffect(() => {
+    return () => {
+      if (kbPollerRef.current) {
+        kbPollerRef.current.abort()
+        kbPollerRef.current = null
+      }
+      if (batchPollerRef.current) {
+        batchPollerRef.current.abort()
+        batchPollerRef.current = null
+      }
+      try {
+        for (const c of kbPollersByFileIdRef.current.values()) c.abort?.()
+      } catch {
+        // ignore
+      }
+      kbPollersByFileIdRef.current = new Map()
+    }
+  }, [])
+
+  const bumpKbDatasetEpoch = useCallback(() => {
+    setKbDatasetEpoch((e) => (Number.isFinite(e) ? e + 1 : 1))
+  }, [])
+
+  const batchScopeFileVersionIds = useMemo(() => {
+    // 仅使用“已完成”且具备 fileVersionId 的文件作为选源范围
+    const ids = files
+      .filter((f) => f.status === 'done')
+      .map((f) => String(f.fileVersionId || '').trim())
+      .filter(Boolean)
+    // 去重保持顺序
+    const seen = new Set()
+    const uniq = []
+    for (const id of ids) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      uniq.push(id)
+    }
+    return uniq
+  }, [files])
+
+  const startBatchGenerate = useCallback(() => {
+    if (!batchScopeFileVersionIds.length) {
+      setBatchJobError('暂无可用选源：请先等待至少一个文件完成知识库导入（done）')
+      return
+    }
+    if (batchPollerRef.current) {
+      batchPollerRef.current.abort()
+      batchPollerRef.current = null
+    }
+    batchImportedItemIdsRef.current = new Set()
+    batchKbSourceFileIdsRef.current = [...kbSourceFileIdsForSave]
+    const ac = new AbortController()
+    batchPollerRef.current = ac
+    setBatchJobError('')
+    setBatchJobRunning(true)
+    setBatchJob({
+      status: 'pending',
+      message: '正在提交批量生成任务…',
+      selected_file_version_ids: batchScopeFileVersionIds,
+    })
+
+    const processItemsForCanvases = (jobPayload) => {
+      const items = Array.isArray(jobPayload?.items) ? jobPayload.items : []
+      if (!items.length || !projectId) return
+      for (const it of items) {
+        const itemId = String(it?.item_id || it?.itemId || it?._id || '').trim()
+        const treeId = it?.tree_id || it?.treeId
+        const st = String(it?.status || '').toLowerCase()
+        if (!itemId || st !== 'success' || !treeId) continue
+        if (batchImportedItemIdsRef.current.has(itemId)) continue
+        batchImportedItemIdsRef.current.add(itemId)
+        const topEventLabel = String(it?.top_event || it?.topEvent || '').trim()
+        void ingestBatchItemToLocalCanvas(
+          { itemId, treeId: String(treeId), topEventLabel },
+          ac.signal,
+        ).catch((e) => {
+          if (e?.name === 'AbortError') return
+          batchImportedItemIdsRef.current.delete(itemId)
+        })
+      }
+    }
+
+    generateAllTrees({ signal: ac.signal, selectedFileVersionIds: batchScopeFileVersionIds })
+      .then((resp) => {
+        setBatchJob(resp || null)
+        const jobId = resp?.job_id || resp?.jobId
+        if (!jobId) return resp
+        return pollBatchJob({
+          jobId,
+          signal: ac.signal,
+          onUpdate: (job) => {
+            setBatchJob(job)
+            processItemsForCanvases(job)
+          },
+          intervalMs: 2000,
+        })
+      })
+      .then((finalJob) => {
+        setBatchJob(finalJob || null)
+        processItemsForCanvases(finalJob)
+      })
+      .catch((e) => {
+        if (e?.name === 'AbortError') return
+        setBatchJobError(e?.message || '批量生成失败')
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setBatchJobRunning(false)
+      })
+  }, [batchScopeFileVersionIds, projectId, kbSourceFileIdsForSave, ingestBatchItemToLocalCanvas])
 
   const handleFileChange = (event) => {
     const selected = Array.from(event.target.files || [])
@@ -517,17 +910,91 @@ function HomePage() {
         id,
         name: file.name,
         size: file.size,
-        uploadProgress: 0,
+        uploadProgress: 100,
         parseProgress: 0,
         status: 'processing',
       }
     })
-    setFiles((prev) => [...incoming, ...prev])
-    setSelectedFileId(incoming[0].id)
+    let base = [...files]
+    const removedIds = []
+    for (const inc of incoming) {
+      const di = base.findIndex((f) => f.name === inc.name)
+      if (di >= 0) {
+        removedIds.push(base[di].id)
+        fileObjectStoreRef.current.delete(base[di].id)
+        base.splice(di, 1)
+      }
+    }
+    setFiles([...incoming, ...base])
+    setKbChunkIncludeById((prev) => {
+      const next = { ...prev }
+      for (const rid of removedIds) delete next[rid]
+      for (const inc of incoming) next[inc.id] = true
+      return next
+    })
+    bumpKbDatasetEpoch()
+    // 刚上传的文件还在构建知识库（processing），按需求不允许在左栏选择/预览
+    setSelectedFileId(null)
     if (wasEmpty && incoming.length && projectId) {
       const updated = renameProjectFromFirstFile(projectId, incoming[0].name)
       if (updated) setProjectName(updated.name)
     }
+
+    // 立刻触发 FTA-KB 知识构建：对本次选择的每个文件各建一个 job 并轮询
+    const generateFtaBaseUrl = import.meta?.env?.VITE_FTA_BACKEND_URL || DEFAULT_FTA_BASE_URL
+    for (const meta of incoming) {
+      const fo = fileObjectStoreRef.current.get(meta.id)
+      if (!fo) continue
+      // 预先把“提交中”状态写入（左侧进度条会立即变化）
+      setFiles((prevFiles) =>
+        prevFiles.map((f) =>
+          f.id === meta.id ? { ...f, status: 'processing', parseProgress: Math.max(f.parseProgress || 0, 1) } : f,
+        ),
+      )
+      setKbPrimaryFileId(meta.id)
+      setKbJob({
+        job_id: '',
+        status: 'queued',
+        stage: 'queued',
+        progress: 0,
+        message: `正在提交到 KB 后端…（${fo.name}）`,
+        uploaded_file: { name: fo.name },
+      })
+      startKbJobUpload({
+        file: fo,
+        outputDir: './output',
+        chunkSize: 800,
+        syncToGenerateFta: true,
+        generateFtaBaseUrl,
+        // 版本化知识库模式下禁止 clear_graph（会导致 GNR 导入阶段 400）
+        clearGraphBeforeImport: false,
+      })
+        .then((resp) => {
+          const jobId = resp?.job_id || resp?.jobId || ''
+          if (jobId) kbJobIdByFileIdRef.current.set(meta.id, jobId)
+          // 将 jobId 写回文件记录，便于离开页面后恢复轮询/预览
+          setFiles((prevFiles) =>
+            prevFiles.map((f) => (f.id === meta.id ? { ...f, kbJobId: jobId } : f)),
+          )
+          // 保留“提交中”的提示文案；并确保后端返回的 stage/progress/message 能立即展示
+          setKbJob((prev) => (prev && typeof prev === 'object' ? { ...prev, ...resp } : resp))
+          startKbPollingForFile(meta.id, jobId)
+        })
+        .catch((e) => {
+          setKbJob({
+            job_id: '',
+            status: 'failed',
+            stage: 'failed',
+            progress: 0,
+            message: '提交 KB 任务失败',
+            error: e?.message || '提交 KB 任务失败',
+          })
+          setFiles((prevFiles) =>
+            prevFiles.map((f) => (f.id === meta.id ? { ...f, status: 'failed' } : f)),
+          )
+        })
+    }
+
     event.target.value = ''
   }
 
@@ -536,9 +1003,13 @@ function HomePage() {
     [files, selectedFileId],
   )
 
-  const selectedFileObject = selectedFileMeta
-    ? fileObjectStoreRef.current.get(selectedFileMeta.id) || null
-    : null
+  /** 下方列表：按当前选中文件过滤；未选中时展示全部已加载分块 */
+  const visibleKbChunks = useMemo(() => {
+    if (!selectedFileId || !selectedFileMeta) return kbChunks
+    return kbChunks.filter((c) => chunkBelongsToKbFile(c, selectedFileMeta))
+  }, [kbChunks, selectedFileId, selectedFileMeta])
+
+  const selectedFileObject = previewFileObject
 
   const handleProjectNameSave = () => {
     const updated = renameProject(projectId, projectName)
@@ -556,203 +1027,6 @@ function HomePage() {
     setEditingProjectName(false)
   }
 
-  const runGenerationTask = useCallback(
-    async ({ taskId, userPrompt }) => {
-      patchResultTask(taskId, {
-        status: 'running',
-        message: '正在连接后端…',
-        progress: 0,
-        stage: 'prepare',
-      })
-
-      let resp
-      try {
-        resp = await generateTree({ prompt: userPrompt })
-      } catch (e) {
-        if (e?.name === 'AbortError') return
-        const topEvent = extractTopEvent(userPrompt)
-        const faultTreeId = `ft-${Date.now()}`
-        patchResultTask(taskId, {
-          status: 'completed',
-          progress: 100,
-          faultTreeId,
-          title: topEvent,
-          stage: 'demo',
-          message: '演示数据（后端不可用）',
-          error: null,
-        })
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `a-${Date.now()}`,
-            role: 'assistant',
-            content: `后端生成失败，已为您创建演示用结果（顶事件：${topEvent}）。`,
-          },
-        ])
-        return
-      }
-
-      const topEvent = resp?.parsed_prompt?.top_event || extractTopEvent(userPrompt)
-
-      if (resp.mode === 'reuse') {
-        const treeId = resp.tree_id
-        patchResultTask(taskId, {
-          status: 'completed',
-          progress: 100,
-          faultTreeId: treeId,
-          title: topEvent,
-          stage: 'reuse',
-          message: '已复用已有故障树',
-          error: null,
-        })
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `a-${Date.now()}`,
-            role: 'assistant',
-            content: `已为您生成顶事件为${topEvent}的故障树（ID：${treeId}）`,
-          },
-        ])
-        return
-      }
-
-      if (resp.mode === 'queued') {
-        const itemId = resp.item_id
-        if (!itemId) {
-          patchResultTask(taskId, {
-            status: 'failed',
-            progress: 0,
-            stage: 'failed',
-            message: '无法跟踪进度',
-            error: '后端未返回 item_id',
-          })
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `a-${Date.now()}`,
-              role: 'assistant',
-              content: '生成任务已提交，但后端未返回任务标识，无法展示进度。',
-            },
-          ])
-          return
-        }
-        patchResultTask(taskId, {
-          jobId: resp.job_id,
-          itemId,
-          title: topEvent,
-          progress: resp.progress ?? 0,
-          stage: 'queued',
-          message: '任务已提交，等待执行…',
-        })
-        let finalItem
-        try {
-          finalItem = await pollGenerationJobItem({
-            itemId,
-            onUpdate: (item) => {
-              patchResultTask(taskId, {
-                progress: item.progress ?? 0,
-                stage: item.stage || '',
-                message: item.message || '',
-                title: item.top_event || topEvent,
-              })
-              appendTaskEventsToChat({ taskId, userPrompt, events: item.events || [] })
-            },
-          })
-        } catch (pollErr) {
-          if (pollErr?.name === 'AbortError') return
-          patchResultTask(taskId, {
-            status: 'failed',
-            progress: 0,
-            stage: 'failed',
-            message: '无法获取任务进度',
-            error: pollErr?.message || '轮询任务失败',
-          })
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `a-${Date.now()}`,
-              role: 'assistant',
-              content: `任务进度查询失败：${pollErr?.message || '未知错误'}`,
-            },
-          ])
-          return
-        }
-
-        if (finalItem.status === 'success') {
-          const tid = finalItem.tree_id
-          patchResultTask(taskId, {
-            status: 'completed',
-            progress: 100,
-            faultTreeId: tid,
-            title: finalItem.top_event || topEvent,
-            stage: 'completed',
-            message: finalItem.message || '生成完成',
-            error: null,
-          })
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `a-${Date.now()}`,
-              role: 'assistant',
-              content: `已为您生成顶事件为${finalItem.top_event || topEvent}的故障树（ID：${tid}）`,
-            },
-          ])
-        } else {
-          patchResultTask(taskId, {
-            status: 'failed',
-            progress: finalItem.progress ?? 100,
-            faultTreeId: finalItem.tree_id || null,
-            stage: finalItem.stage || 'failed',
-            message: finalItem.message || '生成失败',
-            error: finalItem.error || '生成失败',
-          })
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `a-${Date.now()}`,
-              role: 'assistant',
-              content: `生成失败：${finalItem.error || '未知错误'}`,
-            },
-          ])
-        }
-        return
-      }
-
-      patchResultTask(taskId, {
-        status: 'failed',
-        progress: 0,
-        stage: 'failed',
-        message: '无法解析后端响应',
-        error: resp?.mode ? `未知的生成响应：${resp.mode}` : '未知的生成响应',
-      })
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `a-${Date.now()}`,
-          role: 'assistant',
-          content: '后端返回了无法识别的生成结果，请检查接口版本。',
-        },
-      ])
-    },
-    [patchResultTask, appendTaskEventsToChat],
-  )
-
-  const drainGenerationQueue = useCallback(async () => {
-    if (drainingRef.current) return
-    drainingRef.current = true
-    try {
-      while (executionQueueRef.current.length > 0) {
-        const job = executionQueueRef.current.shift()
-        await runGenerationTask(job)
-      }
-    } finally {
-      drainingRef.current = false
-      if (executionQueueRef.current.length > 0) {
-        void drainGenerationQueue()
-      }
-    }
-  }, [runGenerationTask])
-
   const handleTitleBlur = () => {
     if (skipTitleBlurRef.current) {
       skipTitleBlurRef.current = false
@@ -766,128 +1040,85 @@ function HomePage() {
     handleProjectNameSave()
   }
 
-  const handleSend = () => {
-    const text = chatInput.trim()
-    if (!text) return
-
-    const now = Date.now()
-    const taskId = `task-${now}-${Math.random().toString(36).slice(2, 9)}`
-    const promptPreview = text.length > 80 ? `${text.slice(0, 80)}…` : text
-
-    clearProjectReviewed(projectId)
-
-    setMessages((prev) => [...prev, { id: `u-${now}`, role: 'user', content: text, at: now }])
-    setResultItems((prev) => [
-      {
-        id: taskId,
-        createdAt: now,
-        userPrompt: text,
-        promptPreview,
-        title: extractTopEvent(text),
-        faultTreeId: null,
-        status: 'queued',
-        progress: 0,
-        stage: 'queued',
-        message: '排队中',
-        error: null,
-        jobId: null,
-        itemId: null,
-      },
-      ...prev,
-    ])
-    setChatInput('')
-
-    executionQueueRef.current.push({ taskId, userPrompt: text })
-    void drainGenerationQueue()
-  }
-
-  const runGenerateAll = useCallback(async () => {
-    if (!projectId) return
-    if (batchGenerating) return
-    setBatchGenerating(true)
-    const now = Date.now()
-    const taskId = `batch-${now}-${Math.random().toString(36).slice(2, 9)}`
-    setResultItems((prev) => [
-      {
-        id: taskId,
-        createdAt: now,
-        userPrompt: '',
-        promptPreview: '批量生成当前知识库中可识别的全部顶事件故障树',
-        title: '批量生成全部故障树',
-        faultTreeId: null,
-        status: 'running',
-        progress: 0,
-        stage: 'queued',
-        message: '正在提交批量任务…',
-        error: null,
-        jobId: null,
-        itemId: null,
-      },
-      ...prev,
-    ])
-
-    try {
-      const resp = await generateAllTrees()
-      const jobId = resp?.job_id || resp?.jobId || ''
-      if (!jobId) throw new Error('后端未返回 job_id')
-
-      patchResultTask(taskId, {
-        jobId,
-        progress: 0,
-        stage: resp?.status || 'queued',
-        message: `已发现 ${resp?.discovered_total ?? '—'} 个顶事件，入队 ${resp?.queued_count ?? '—'} 个`,
-      })
-
-      await pollBatchJob({
-        jobId,
-        onUpdate: (job) => {
-          const total = Number(job?.total)
-          const success = Number(job?.success)
-          const failed = Number(job?.failed)
-          const done = (Number.isFinite(success) ? success : 0) + (Number.isFinite(failed) ? failed : 0)
-          const pct = Number.isFinite(total) && total > 0 ? Math.round((done / total) * 100) : 0
-          patchResultTask(taskId, {
-            progress: pct,
-            stage: job?.stage || job?.status || '',
-            message:
-              job?.message ||
-              (Number.isFinite(total)
-                ? `批量生成中：${done}/${total}（成功 ${success || 0}，失败 ${failed || 0}）`
-                : `批量任务进行中（job_id: ${jobId}）`),
-          })
-        },
-      })
-
-      patchResultTask(taskId, {
-        status: 'completed',
-        progress: 100,
-        stage: 'completed',
-        message: '批量生成任务已完成（可在右侧任务条目中查看单树任务进度）',
-        error: null,
-      })
-    } catch (e) {
-      if (e?.name === 'AbortError') return
-      patchResultTask(taskId, {
-        status: 'failed',
-        progress: 0,
-        stage: 'failed',
-        message: '批量任务提交失败',
-        error: e?.message || '批量生成失败',
-      })
-      setMessages((prev) => [
-        ...prev,
-        { id: `a-${Date.now()}`, role: 'assistant', content: `批量生成失败：${e?.message || '未知错误'}` },
-      ])
-    } finally {
-      setBatchGenerating(false)
-    }
-  }, [projectId, batchGenerating, patchResultTask])
-
-  const openFaultTree = (faultTreeId) => {
+  const openCanvasDraft = (canvasId) => {
     navigate(
-      `/fta-viewer?projectId=${encodeURIComponent(projectId)}&faultTreeId=${encodeURIComponent(faultTreeId)}`,
+      `/fta-viewer?projectId=${encodeURIComponent(projectId)}&canvasId=${encodeURIComponent(canvasId)}`,
     )
   }
+
+  const faultTreeCatalog = useMemo(() => {
+    if (!projectId) return []
+    const drafts = listCanvasDrafts(projectId)
+    return drafts
+      .map((d) => {
+        const topLabel =
+          d.title || inferCanvasDisplayTitle(d.rawJsonText || '', d.graphData || null)
+        const msgTs = lastChatTimestampFromMessages(d.assistantMessages)
+        const lastAt = msgTs || d.updatedAt || null
+        const ids = Array.isArray(d.selectedSourceFiles)
+          ? d.selectedSourceFiles.map(String).filter(Boolean)
+          : []
+        return {
+          key: `canvas:${d.canvasId}`,
+          canvasId: d.canvasId,
+          topLabel,
+          lastAt,
+          linkedFileIds: ids,
+          graphData: d.graphData || null,
+        }
+      })
+      .sort((a, b) => Number(b.lastAt || 0) - Number(a.lastAt || 0))
+  }, [projectId, location.key, faultTreeRefreshKey])
+
+  const deleteFaultTreeDraft = useCallback(
+    (canvasId) => {
+      if (!projectId || !canvasId) return
+      const ok = window.confirm('确定删除该故障树草稿？此操作仅影响本地草稿，无法恢复。')
+      if (!ok) return
+      removeCanvasDraft(projectId, canvasId)
+      setFaultTreeRefreshKey((k) => k + 1)
+      setActiveFaultTreeKey((prev) => (prev === `canvas:${canvasId}` ? null : prev))
+      setLinkedKbFileIds((prev) => (Array.isArray(prev) ? [] : prev))
+    },
+    [projectId],
+  )
+
+  const deleteUploadedFile = useCallback(
+    (fileId) => {
+      if (!projectId || !fileId) return
+      const f = files.find((x) => x.id === fileId)
+      const name = f?.name || fileId
+      const ok = window.confirm(`确定删除文件「${name}」？此操作仅删除本地记录与预览文件对象，不会删除后端已导入的数据。`)
+      if (!ok) return
+
+      try {
+        const controller = kbPollersByFileIdRef.current.get(fileId)
+        controller?.abort?.()
+        kbPollersByFileIdRef.current.delete(fileId)
+      } catch {
+        // ignore
+      }
+
+      try {
+        fileObjectStoreRef.current.delete(fileId)
+      } catch {
+        // ignore
+      }
+
+      setFiles((prev) => prev.filter((x) => x.id !== fileId))
+      setKbChunkIncludeById((prev) => {
+        const next = { ...(prev || {}) }
+        delete next[fileId]
+        return next
+      })
+      bumpKbDatasetEpoch()
+
+      setSelectedFileId((prev) => (prev === fileId ? null : prev))
+      setPreviewModalOpen(false)
+      setLinkedKbFileIds((prev) => (Array.isArray(prev) ? prev.filter((id) => id !== fileId) : prev))
+    },
+    [projectId, files, bumpKbDatasetEpoch],
+  )
 
   return (
     <div className="home-layout">
@@ -932,7 +1163,7 @@ function HomePage() {
                 {projectName || '未命名项目'}
               </button>
             )}
-            <p className="home-subtitle">知识库构建 · AI 对话生成 · 故障树编辑</p>
+            <p className="home-subtitle">知识库构建 · 故障树画布 · AI 辅助编辑</p>
           </div>
           <ThemeToggle />
         </header>
@@ -940,183 +1171,340 @@ function HomePage() {
 
       <main className="home-main">
         <section className="home-panel home-panel--left">
-          <h2 className="home-panel-title">知识库数据上传</h2>
+          <h2 className="home-panel-title">知识库构建</h2>
           <p className="home-panel-desc">
-            上传设备手册、维修记录等文件。当前为前端演示，进度为模拟展示。
+            上传设备手册、维修记录等资料，完成解析与知识抽取后可作为故障树生成的依据。分块预览来自 FTA
+            后端（localhost:8000）数据库中与勾选文件匹配的 chunks。
           </p>
 
-          <label className="home-upload-btn">
-            选择多个文件
-            <input type="file" multiple onChange={handleFileChange} />
-          </label>
-
-          <p className="home-upload-summary">
-            共 {files.length} 个文件，已完成 {finishedCount} 个
-          </p>
-
-          <div className="home-file-list">
-            {files.length === 0 && (
-              <div className="home-empty">暂无文件。请先上传设备资料。</div>
-            )}
-            {files.map((file) => (
-              <button
-                key={file.id}
-                type="button"
-                className={`home-file-card${
-                  file.id === selectedFileId ? ' home-file-card--selected' : ''
-                }`}
-                onClick={() => setSelectedFileId(file.id)}
-              >
-                <div className="home-file-head">
-                  <span className="home-file-name">{file.name}</span>
-                  <span className="home-file-size">
-                    {(file.size / 1024).toFixed(1)} KB
-                  </span>
-                </div>
-                <div className="home-progress-row">
-                  <span>上传进度</span>
-                  <span>{file.uploadProgress}%</span>
-                </div>
-                <div className="home-progress-track">
-                  <div
-                    className="home-progress-fill"
-                    style={{ width: `${file.uploadProgress}%` }}
-                  />
-                </div>
-                <div className="home-progress-row">
-                  <span>解析进度</span>
-                  <span>{file.parseProgress}%</span>
-                </div>
-                <div className="home-progress-track home-progress-track--parse">
-                  <div
-                    className="home-progress-fill home-progress-fill--parse"
-                    style={{ width: `${file.parseProgress}%` }}
-                  />
-                </div>
+          <div className="home-panel-scroll">
+            <div className="home-upload-row">
+              <label className="home-upload-btn">
+                上传文件
+                <input type="file" multiple onChange={handleFileChange} />
+              </label>
+              <button type="button" className="home-3d-btn" onClick={openThreeDModal} title="上传 GLB 与部件列表">
+                三维
               </button>
-            ))}
-          </div>
+              {exploded3dConfigured ? (
+                <span className="home-3d-hint">已配置三维爆炸图与部件列表</span>
+              ) : (
+                <span className="home-3d-hint">未配置三维（可选）</span>
+              )}
+            </div>
 
-          <div
-            className="home-file-preview-section home-file-preview-section--expandable"
-            role="button"
-            tabIndex={0}
-            aria-label="文件内容预览，点击放大查看"
-            onClick={() => setPreviewModalOpen(true)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault()
-                setPreviewModalOpen(true)
-              }
-            }}
-          >
-            <h3 className="home-file-preview-title">文件内容预览</h3>
-            <p className="home-file-preview-hint">
-              支持 .txt 与 .pdf；下方可滚动查看全文。点击本区域可放大查看。
+            <p className="home-upload-summary">
+              共 {files.length} 个文件，已完成本地处理 {finishedCount} 个
             </p>
-            <div className="home-file-preview-body">
-              <FileContentPreview
-                fileMeta={selectedFileMeta}
-                fileObject={selectedFileObject}
-                hasAnyFiles={files.length > 0}
-              />
+
+            <KnowledgeBasePanel job={kbJob} onOpenGraph={openGraphModal} hydrating={kbHydrating} />
+
+            <h3 className="home-files-section-title">已上传文件</h3>
+
+            <div className="home-file-list home-file-list--kb">
+              {files.length === 0 && (
+                <div className="home-empty">暂无文件。请先上传设备资料。</div>
+              )}
+              {files.map((file) => (
+                <div
+                  key={file.id}
+                  className={`home-file-row${
+                    file.id === selectedFileId ? ' home-file-row--selected' : ''
+                  }${linkedKbFileIds.includes(file.id) ? ' home-file-row--linked' : ''}${
+                    file.status !== 'done' ? ' home-file-row--processing' : ''
+                  }`}
+                >
+                  <button
+                    type="button"
+                    className="home-file-row-main"
+                    onClick={() => {
+                      setSelectedFileId(file.id)
+                      setPreviewFileObject(fileObjectStoreRef.current.get(file.id) || null)
+                    }}
+                    title="点击选中该文件，在下方「分块预览」中查看与该文件匹配的分块；知识库处理中时分块可能尚未就绪"
+                  >
+                    <div className="home-file-card-head">
+                      <div className="home-file-card-name" title={file.name}>
+                        {file.name}
+                      </div>
+                      <div className="home-file-card-meta">
+                        <span className={`home-file-pill home-file-pill--${file.status || 'processing'}`}>
+                          {file.status === 'done' ? '已完成' : file.status === 'failed' ? '失败' : '处理中'}
+                        </span>
+                        <span className="home-file-size">{(file.size / 1024).toFixed(1)} KB</span>
+                      </div>
+                    </div>
+
+                    <div className="home-file-bars">
+                      <div className="home-file-bar">
+                        <span className="home-file-bar-label">上传</span>
+                        <div className="home-file-bar-track" aria-hidden>
+                          <div
+                            className="home-file-bar-fill"
+                            style={{ width: `${Math.max(0, Math.min(100, Number(file.uploadProgress) || 0))}%` }}
+                          />
+                        </div>
+                        <span className="home-file-bar-num">{Math.max(0, Math.min(100, Number(file.uploadProgress) || 0))}%</span>
+                      </div>
+                      <div className="home-file-bar">
+                        <span className="home-file-bar-label">解析</span>
+                        <div className="home-file-bar-track home-file-bar-track--parse" aria-hidden>
+                          <div
+                            className="home-file-bar-fill home-file-bar-fill--parse"
+                            style={{ width: `${Math.max(0, Math.min(100, Number(file.parseProgress) || 0))}%` }}
+                          />
+                        </div>
+                        <span className="home-file-bar-num">{Math.max(0, Math.min(100, Number(file.parseProgress) || 0))}%</span>
+                      </div>
+                    </div>
+                  </button>
+                  {file.status === 'done' ? (
+                    <button
+                      type="button"
+                      className="home-file-doc-btn"
+                      title="预览原文（PDF / TXT）"
+                      aria-label="预览原文"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setSelectedFileId(file.id)
+                        setPreviewFileObject(fileObjectStoreRef.current.get(file.id) || null)
+                        setPreviewModalOpen(true)
+                      }}
+                    >
+                      原文
+                    </button>
+                  ) : null}
+                  <label className="home-file-row-check" title="在下方分块预览中包含此文件对应的知识分块">
+                    <input
+                      type="checkbox"
+                      checked={kbChunkIncludeById[file.id] !== false}
+                      onChange={(e) => {
+                        setKbChunkIncludeById((prev) => ({
+                          ...prev,
+                          [file.id]: e.target.checked,
+                        }))
+                        bumpKbDatasetEpoch()
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="home-icon-btn home-icon-btn--danger"
+                    title="删除文件（仅本地）"
+                    aria-label="删除文件"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      deleteUploadedFile(file.id)
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="home-kbchunks-panel">
+              <button
+                type="button"
+                className="home-collapse-head"
+                onClick={() => setKbChunksPanelOpen((o) => !o)}
+              >
+                <span className="home-collapse-head-title">分块（CHUNKS）预览</span>
+                <span className="home-collapse-head-ico" aria-hidden>
+                  {kbChunksPanelOpen ? '▼' : '▶'}
+                </span>
+              </button>
+              {kbChunksPanelOpen ? (
+                <div className="home-kbchunks-body">
+                  {selectedFileMeta ? (
+                    <div className="home-kbchunks-focus">
+                      当前预览文件：<strong title={selectedFileMeta.name}>{selectedFileMeta.name}</strong>
+                      <span className="home-kbchunks-focus-count">
+                        （{visibleKbChunks.length}/{kbChunks.length} 条分块）
+                      </span>
+                    </div>
+                  ) : null}
+                  {kbChunksLoading ? (
+                    <div className="home-empty home-kbchunks-status">正在从后端加载…</div>
+                  ) : null}
+                  {kbChunksError ? <div className="home-kbchunks-err">{kbChunksError}</div> : null}
+                  {!kbChunksLoading && !kbChunksError && kbChunks.length === 0 ? (
+                    <div className="home-empty home-kbchunks-status">
+                      勾选上方文件后，将展示数据库中与之文本匹配的 chunks（需后端已导入分块数据）。点击某个文件即可选中并在下方过滤显示其分块。
+                    </div>
+                  ) : null}
+                  {!kbChunksLoading &&
+                  !kbChunksError &&
+                  kbChunks.length > 0 &&
+                  visibleKbChunks.length === 0 &&
+                  selectedFileMeta ? (
+                    <div className="home-empty home-kbchunks-status">
+                      暂无与「{selectedFileMeta.name}」匹配的分块（可能仍在同步，或后端 file_version_id
+                      与本地不一致）。可稍后再试或检查 FTA-GNR 中该文件的 chunks。
+                    </div>
+                  ) : null}
+                  {visibleKbChunks.length > 0 ? (
+                    <ul className="home-kb-chunk-list">
+                      {visibleKbChunks.map((c, idx) => {
+                        const cid = c.id ?? c.chunk_id ?? `idx-${idx}`
+                        const includedFiles = files.filter((f) => kbChunkIncludeById[f.id] !== false)
+                        const fromFile = matchChunkToKbFile(c, includedFiles)
+                        return (
+                          <li key={`${String(cid)}-${idx}`} className="home-kb-chunk-card">
+                            <div className="home-kb-chunk-meta">
+                              <span className="home-kb-chunk-id">#{String(cid)}</span>
+                              <span className="home-kb-chunk-file" title={fromFile}>
+                                {fromFile}
+                              </span>
+                            </div>
+                            <p className="home-kb-chunk-text">{getChunkBodyText(c)}</p>
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           </div>
         </section>
 
-        <section className="home-panel home-panel--center">
-          <h2 className="home-panel-title">AI 对话生成</h2>
+        <section className="home-panel home-panel--fault-trees">
+          <h2 className="home-panel-title">故障树</h2>
           <p className="home-panel-desc">
-            建议输入：为我创建一棵顶事件为“某设备故障现象”的故障树。
+            本项目故障树均在「新建空白画布」中创建与编辑。此处列出各画布草稿；点击卡片可在左侧高亮该画布内已选知识库文件；缩略图为结构示意。
           </p>
 
-          <div className="home-chat-list">
-            {messages.map((msg) => (
+          <div className="home-ft-toolbar">
+            <button
+              type="button"
+              className="home-send-btn"
+              onClick={() =>
+                navigate(`/fta-viewer?projectId=${encodeURIComponent(projectId)}&blank=1`)
+              }
+              title="新建空白画布"
+            >
+              新建空白画布
+            </button>
+            <button
+              type="button"
+              className="home-send-btn"
+              onClick={startBatchGenerate}
+              disabled={batchJobRunning || batchScopeFileVersionIds.length === 0}
+              title={
+                batchScopeFileVersionIds.length === 0
+                  ? '请先等待至少一个文件完成知识库导入（done）'
+                  : batchJobRunning
+                    ? '批量生成进行中…'
+                    : '批量生成当前选源范围内的全部顶事件故障树'
+              }
+            >
+              {batchJobRunning ? '批量生成中…' : '批量生成'}
+            </button>
+            {batchJobRunning || batchJob ? (
+              <span className="home-ft-batch-inline" role="status" aria-live="polite">
+                {formatBatchProgressInline(batchJob, batchJobRunning)}
+              </span>
+            ) : null}
+          </div>
+
+          {batchJobError ? (
+            <div className="home-ft-batch-status home-ft-batch-status--compact" role="alert">
+              <div className="home-ft-batch-err">错误：{batchJobError}</div>
+            </div>
+          ) : null}
+          {batchJob && (batchJob.job_id || batchJob.jobId) && !batchJobRunning ? (
+            <div className="home-ft-batch-meta" role="status">
+              任务 ID：{String(batchJob.job_id || batchJob.jobId)}
+            </div>
+          ) : null}
+
+          <div className="home-ft-grid">
+            {faultTreeCatalog.length === 0 && (
+              <div className="home-empty home-ft-grid-empty">
+                暂无故障树画布。请点击「新建空白画布」，在画布页通过 AI 助手生成或编辑故障树。
+              </div>
+            )}
+            {faultTreeCatalog.map((entry) => (
               <div
-                key={msg.id}
-                className={`home-chat-item ${
-                  msg.role === 'user' ? 'home-chat-item--user' : 'home-chat-item--assistant'
+                key={entry.key}
+                role="button"
+                tabIndex={0}
+                className={`home-ft-card${
+                  activeFaultTreeKey === entry.key ? ' home-ft-card--active' : ''
                 }`}
+                onClick={() => {
+                  setActiveFaultTreeKey(entry.key)
+                  setLinkedKbFileIds(entry.linkedFileIds || [])
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    setActiveFaultTreeKey(entry.key)
+                    setLinkedKbFileIds(entry.linkedFileIds || [])
+                  }
+                }}
               >
-                {msg.kind === 'progress' ? (
-                  <div className="home-chat-progress">
-                    <div className="home-chat-progress-head">
-                      <span className="home-chat-progress-avatar" aria-hidden>
-                        {msg.avatar || 'A'}
-                      </span>
-                      <span className="home-chat-progress-agent">{msg.agent || 'Agent'}</span>
-                      {msg.taskId ? (
-                        <span className="home-chat-progress-task" title={msg.taskId}>
-                          #{String(msg.taskId).slice(-6)}
-                        </span>
-                      ) : null}
-                    </div>
-                    {msg.quote ? <div className="home-chat-progress-quote">引用：{msg.quote}</div> : null}
-                    <button
-                      type="button"
-                      className="home-chat-progress-body home-chat-progress-body--btn"
-                      onClick={() => setProgressModal({ open: true, taskId: msg.taskId || '' })}
-                      title="点击查看该任务的历史进度记录"
-                    >
-                      {msg.content}
-                      <span className="home-chat-progress-more">查看历史</span>
-                    </button>
+                <button
+                  type="button"
+                  className="home-ft-del-btn"
+                  title="删除草稿（仅本地）"
+                  aria-label="删除草稿"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (entry.canvasId) deleteFaultTreeDraft(entry.canvasId)
+                  }}
+                >
+                  ×
+                </button>
+                <div className="home-ft-thumb" aria-hidden>
+                  <MiniFaultTreeThumbnail graphData={entry.graphData} />
+                </div>
+                <div className="home-ft-card-body">
+                  <div className="home-ft-card-title" title={entry.topLabel}>
+                    {entry.topLabel}
                   </div>
-                ) : (
-                  msg.content
-                )}
+                  <div className="home-ft-card-meta">
+                    <span className="home-ft-card-badge">画布草稿</span>
+                    <span className="home-ft-card-time">
+                      最近对话：{formatFaultTreeChatTime(entry.lastAt)}
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="home-ft-enter-btn"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (entry.canvasId) openCanvasDraft(entry.canvasId)
+                  }}
+                >
+                  进入画布
+                </button>
               </div>
             ))}
           </div>
-
-          <div className="home-chat-input-wrap">
-            <input
-              className="home-chat-input"
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-              placeholder="请输入你的需求..."
-            />
-            <button
-              type="button"
-              className="home-send-btn"
-              onClick={handleSend}
-              disabled={!chatInput.trim()}
-            >
-              发送
-            </button>
-          </div>
-        </section>
-
-        <section className="home-panel home-panel--right">
-          <h2 className="home-panel-title">生成任务与结果</h2>
-          <p className="home-panel-desc">
-            任务按队列依次执行；生成中也可继续发起新任务。完成后点击条目进入编辑画布。
-          </p>
-
-          <div style={{ display: 'flex', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              className="home-send-btn"
-              onClick={runGenerateAll}
-              disabled={batchGenerating}
-              title="调用 /api/batch/generate-all 批量生成"
-            >
-              批量生成全部故障树
-            </button>
-          </div>
-
-          <div className="home-result-list">
-            <GenerationTaskPanel tasks={resultItems} onOpenTree={openFaultTree} />
-          </div>
         </section>
       </main>
+
+      <KnowledgeGraphModal open={graphModalOpen} onClose={closeGraphModal} />
+
+      <Exploded3dUploadModal
+        open={threeDModalOpen}
+        onClose={closeThreeDModal}
+        projectId={projectId}
+        onSaved={handleExploded3dSaved}
+        onClear={handleExploded3dClear}
+      />
 
       {previewModalOpen && (
         <div
           className="home-preview-modal-overlay"
           role="presentation"
-          onClick={() => setPreviewModalOpen(false)}
+          onClick={() => {
+            setPreviewModalOpen(false)
+            setPreviewFileObject(null)
+          }}
         >
           <div
             className="home-preview-modal"
@@ -1136,7 +1524,10 @@ function HomePage() {
                 type="button"
                 className="home-preview-modal-close"
                 aria-label="关闭预览"
-                onClick={() => setPreviewModalOpen(false)}
+                onClick={() => {
+                  setPreviewModalOpen(false)
+                  setPreviewFileObject(null)
+                }}
               >
                 ×
               </button>
@@ -1155,14 +1546,6 @@ function HomePage() {
         </div>
       )}
 
-      <TaskProgressHistoryModal
-        open={!!progressModal.open}
-        onClose={() => setProgressModal({ open: false, taskId: '' })}
-        taskId={progressModal.taskId}
-        title={resultItems.find((t) => t.id === progressModal.taskId)?.title || ''}
-        quote={resultItems.find((t) => t.id === progressModal.taskId)?.userPrompt || ''}
-        events={taskEventHistoryRef.current.get(progressModal.taskId) || []}
-      />
     </div>
   )
 }

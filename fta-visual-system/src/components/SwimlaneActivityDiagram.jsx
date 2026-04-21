@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import './swimlane-activity-diagram.css'
 
 function textOf(e) { return String(e?.text || '') }
@@ -40,7 +40,21 @@ function bounds(kind, cx, cy, c) {
 }
 
 export default function SwimlaneActivityDiagram({ events = [], compact = false, title = '多智能体生成流程' }) {
-  const c = compact ? CC : C
+  const baseC = compact ? CC : C
+  const wrapRef = useRef(null)
+  const [wrapWidth, setWrapWidth] = useState(0)
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    const el = wrapRef.current
+    if (!el) return undefined
+    const ro = new ResizeObserver((entries) => {
+      const w = Math.round(entries?.[0]?.contentRect?.width || 0)
+      if (Number.isFinite(w) && w > 0) setWrapWidth(w)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
 
   const normEv = useMemo(() =>
     (Array.isArray(events) ? events : [])
@@ -51,7 +65,6 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
   const lanes = useMemo(() => [
     { id: 'scheduler', name: '调度器' },
     { id: 'recall', name: '召回' },
-    { id: 'llm1', name: '知识抽取' },
     { id: 'llm2', name: '草稿生成' },
     { id: 'validate', name: '结构校验' },
     { id: 'repair', name: '修复' },
@@ -60,37 +73,65 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
 
   const laneIdx = useMemo(() => { const m = new Map(); lanes.forEach((l, i) => m.set(l.id, i)); return m }, [lanes])
 
+  // 让仅剩的 6 列尽量铺满容器宽度（最小不小于默认 colW）
+  const c = useMemo(() => {
+    const minColW = baseC.colW
+    const usable = Math.max(0, Number(wrapWidth) || 0)
+    const dynamicColW = lanes.length > 0 ? Math.floor(usable / lanes.length) : minColW
+    return {
+      ...baseC,
+      colW: Math.max(minColW, dynamicColW),
+    }
+  }, [baseC, wrapWidth, lanes.length])
+
   const graph = useMemo(() => {
     const nodes = [
       { id: 'start', lane: 'scheduler', row: 0, kind: 'terminator', label: '开始',
         match: e => textOf(e).includes('任务开始执行') },
-      { id: 'recall', lane: 'recall', row: 1, kind: 'action', label: '召回知识',
-        match: e => textOf(e).startsWith('[召回]') || e.stage === 'knowledge_search' },
-      { id: 'extract', lane: 'llm1', row: 2, kind: 'action', label: '提取故障要素',
-        match: e => textOf(e).includes('LLM#1') || textOf(e).includes('提取故障要素') },
-      { id: 'draft', lane: 'llm2', row: 3, kind: 'action', label: '生成草稿',
-        match: e => textOf(e).includes('LLM#2：生成草稿') },
-      { id: 'chk_valid', lane: 'validate', row: 4, kind: 'decision', label: '校验通过？',
-        match: e => textOf(e).includes('草稿结构校验通过') || textOf(e).includes('草稿校验失败') },
-      { id: 'retry', lane: 'llm2', row: 5, kind: 'action', label: '重新生成',
-        match: e => textOf(e).includes('LLM#2：生成草稿（第 2 次）') },
-      { id: 'valid_ok', lane: 'validate', row: 6, kind: 'action', label: '校验通过',
-        match: e => textOf(e).includes('草稿结构校验通过') },
-      { id: 'repair', lane: 'repair', row: 7, kind: 'action', label: '历史修正',
-        match: e => textOf(e).includes('[修复]') },
-      { id: 'persist', lane: 'persist', row: 8, kind: 'action', label: '保存版本',
+      { id: 'graph_match', lane: 'recall', row: 1, kind: 'action', label: '图谱匹配顶事件',
+        match: e => e.stage === 'graph_match' || textOf(e).includes('[graph-match]') || /matching top event/i.test(textOf(e)) },
+      { id: 'graph_subgraph', lane: 'recall', row: 2, kind: 'action', label: '扩展局部子图',
+        match: e => e.stage === 'graph_subgraph' || textOf(e).includes('[graph-subgraph]') || /expanding local graph/i.test(textOf(e)) },
+      { id: 'graph_chunks', lane: 'recall', row: 3, kind: 'action', label: '召回证据 Chunk',
+        match: e => e.stage === 'graph_chunks' || /collecting subgraph evidence/i.test(textOf(e)) },
+      { id: 'draft', lane: 'llm2', row: 4, kind: 'action', label: '生成草稿',
+        match: e =>
+          e.stage === 'draft' ||
+          e.stage === 'generate_draft' ||
+          textOf(e).includes('生成草稿') ||
+          textOf(e).includes('LLM#2') ||
+          textOf(e).includes('[graph-llm]') ||
+          textOf(e).includes('[graph-draft]') },
+      { id: 'chk_valid', lane: 'validate', row: 5, kind: 'decision', label: '校验通过？',
+        match: e =>
+          textOf(e).includes('草稿结构校验通过') ||
+          textOf(e).includes('草稿校验失败') ||
+          textOf(e).includes('[graph-validate]') },
+      { id: 'retry', lane: 'llm2', row: 6, kind: 'action', label: '重新生成',
+        match: e => textOf(e).includes('LLM#2：生成草稿（第 2 次）') || textOf(e).includes('[graph-regenerate]') },
+      { id: 'valid_ok', lane: 'validate', row: 7, kind: 'action', label: '校验通过',
+        match: e => textOf(e).includes('草稿结构校验通过') || /validation passed/i.test(textOf(e)) },
+      { id: 'repair', lane: 'repair', row: 8, kind: 'action', label: '历史修正',
+        match: e =>
+          e.stage === 'repair' ||
+          e.stage === 'fix' ||
+          String(e.agent || '').includes('修复') ||
+          textOf(e).includes('[修复]') ||
+          textOf(e).includes('[history-repair]') },
+      { id: 'persist', lane: 'persist', row: 9, kind: 'action', label: '保存版本',
         match: e => e.stage === 'persistence' || textOf(e).includes('persisting') },
-      { id: 'chk_save', lane: 'persist', row: 9, kind: 'decision', label: '成功？',
+      { id: 'chk_save', lane: 'persist', row: 10, kind: 'decision', label: '成功？',
         match: e => e.stage === 'completed' || e.stage === 'failed' || textOf(e).includes('生成完成') || textOf(e).includes('生成失败') },
-      { id: 'done', lane: 'persist', row: 10, kind: 'terminator', label: '完成',
+      { id: 'done', lane: 'persist', row: 11, kind: 'terminator', label: '完成',
         match: e => textOf(e).includes('生成完成') || e.stage === 'completed' },
-      { id: 'failed', lane: 'repair', row: 10, kind: 'terminator', label: '失败',
+      { id: 'failed', lane: 'repair', row: 11, kind: 'terminator', label: '失败',
         match: e => e.stage === 'failed' || (String(e.level || '').toUpperCase() === 'ERROR' && textOf(e).includes('生成失败')) },
     ]
     const edges = [
-      { from: 'start', to: 'recall' },
-      { from: 'recall', to: 'extract' },
-      { from: 'extract', to: 'draft' },
+      { from: 'start', to: 'graph_match' },
+      { from: 'graph_match', to: 'graph_subgraph' },
+      { from: 'graph_subgraph', to: 'graph_chunks' },
+      { from: 'graph_chunks', to: 'draft' },
       { from: 'draft', to: 'chk_valid' },
       { from: 'chk_valid', to: 'valid_ok', label: '是' },
       { from: 'chk_valid', to: 'retry', label: '否' },
@@ -104,7 +145,7 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
     return { nodes, edges }
   }, [])
 
-  const maxRow = 10
+  const maxRow = 11
 
   const pos = useMemo(() => {
     const m = new Map()
@@ -127,8 +168,37 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
     }
     const failedSeq = findFirstSeq(normEv, e => e.stage === 'failed' || e.level === 'ERROR')
     const doneSeq = findFirstSeq(normEv, e => e.stage === 'completed' || textOf(e).includes('生成完成'))
-    let curId = null, curSeq = -1
-    for (const n of graph.nodes) { const i = ni.get(n.id); if (i?.seen && (i.lastSeq ?? -1) > curSeq) { curSeq = i.lastSeq; curId = n.id } }
+    /**
+     * 当前高亮步骤：按流水线从后往前取「最后一个已匹配到事件」的节点。
+     * 若用 max(lastSeq) 跨节点比较，draft 曾匹配 stage=graph_llm 的进度事件，seq 可能被抬得比校验/持久化还高，导致一直卡在「生成草稿」。
+     */
+    const PIPELINE_ORDER = [
+      'start',
+      'graph_match',
+      'graph_subgraph',
+      'graph_chunks',
+      'draft',
+      'chk_valid',
+      'retry',
+      'valid_ok',
+      'repair',
+      'persist',
+      'chk_save',
+      'done',
+      'failed',
+    ]
+    let curId = null
+    if (failedSeq != null && ni.get('failed')?.seen) {
+      curId = 'failed'
+    } else {
+      for (let i = PIPELINE_ORDER.length - 1; i >= 0; i -= 1) {
+        const id = PIPELINE_ORDER[i]
+        if (ni.get(id)?.seen) {
+          curId = id
+          break
+        }
+      }
+    }
     return { ni, failedSeq, doneSeq, curId }
   }, [graph.nodes, normEv])
 
@@ -195,7 +265,7 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
   }
 
   return (
-    <div className={`slad${compact ? ' slad--compact' : ''}`}>
+    <div ref={wrapRef} className={`slad${compact ? ' slad--compact' : ''}`}>
       <div className="slad-top">
         <div className="slad-title">{title}</div>
         <div className="slad-sub">蓝色 = 已完成 · 灰色 = 未执行 · 高亮 = 当前步骤</div>

@@ -1,0 +1,157 @@
+.e3d-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.e3d-modal {
+  width: min(520px, 100%);
+  max-height: min(90vh, 640px);
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  border: 1px solid var(--home-border, #e2e8f0);
+  background: var(--home-surface, #fff);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.2);
+  color: var(--home-text-main, #334155);
+}
+
+.e3d-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 1rem 1.1rem;
+  border-bottom: 1px solid var(--home-border, #e2e8f0);
+}
+
+.e3d-modal-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+}
+
+.e3d-modal-close {
+  border: none;
+  background: transparent;
+  font-size: 1.5rem;
+  line-height: 1;
+  cursor: pointer;
+  color: #64748b;
+  padding: 0 0.25rem;
+}
+
+.e3d-modal-close:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.e3d-modal-body {
+  padding: 1rem 1.1rem 0.5rem;
+  overflow: auto;
+}
+
+.e3d-modal-desc {
+  margin: 0 0 1rem;
+  font-size: 0.88rem;
+  line-height: 1.55;
+  color: #64748b;
+}
+
+.e3d-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.85rem;
+}
+
+.e3d-label {
+  flex: 1 1 100%;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #475569;
+}
+
+.e3d-file-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid #c7d2fe;
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.e3d-file-btn input {
+  display: none;
+}
+
+.e3d-file-name {
+  font-size: 0.8rem;
+  color: #0f172a;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.e3d-file-placeholder {
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.e3d-error {
+  margin: 0.25rem 0 0;
+  font-size: 0.82rem;
+  color: #b91c1c;
+}
+
+.e3d-modal-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.85rem 1.1rem 1rem;
+  border-top: 1px solid var(--home-border, #e2e8f0);
+}
+
+.e3d-modal-foot-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.e3d-btn {
+  border-radius: 999px;
+  padding: 0.45rem 1rem;
+  font-size: 0.88rem;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.e3d-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.e3d-btn--ghost {
+  background: #f1f5f9;
+  border-color: #e2e8f0;
+  color: #334155;
+}
+
+.e3d-btn--primary {
+  background: linear-gradient(135deg, #6366f1, #818cf8);
+  color: #fff;
+}

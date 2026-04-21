@@ -71,15 +71,37 @@ export function getWorkspace(projectId) {
     files: Array.isArray(ws.files) ? ws.files : [],
     messages: Array.isArray(ws.messages) ? ws.messages : [...DEFAULT_WORKSPACE_MESSAGES],
     resultItems: Array.isArray(ws.resultItems) ? ws.resultItems : [],
+    /** 项目页勾选为「本轮知识库来源」的文件 id（多选） */
+    kbSourceFileIds: Array.isArray(ws.kbSourceFileIds) ? ws.kbSourceFileIds : null,
+    /** 知识库来源或文件集合变化时递增，画布侧用于判断下一条是否须走 generate */
+    kbDatasetEpoch:
+      typeof ws.kbDatasetEpoch === 'number' && Number.isFinite(ws.kbDatasetEpoch) ? ws.kbDatasetEpoch : 0,
+    /** 项目页是否保存过三维 GLB+部件 JSON（与 IndexedDB 可选同步，画布以 IDB 为准） */
+    exploded3dConfigured: typeof ws.exploded3dConfigured === 'boolean' ? ws.exploded3dConfigured : false,
   }
 }
 
 export function saveWorkspace(projectId, workspace) {
   const all = readWorkspaces()
+  const prev = all[projectId] || {}
   all[projectId] = {
     files: workspace.files || [],
     messages: workspace.messages || [],
     resultItems: workspace.resultItems || [],
+    kbSourceFileIds:
+      workspace.kbSourceFileIds !== undefined ? workspace.kbSourceFileIds : prev.kbSourceFileIds ?? null,
+    kbDatasetEpoch:
+      workspace.kbDatasetEpoch !== undefined
+        ? workspace.kbDatasetEpoch
+        : typeof prev.kbDatasetEpoch === 'number'
+          ? prev.kbDatasetEpoch
+          : 0,
+    exploded3dConfigured:
+      workspace.exploded3dConfigured !== undefined
+        ? workspace.exploded3dConfigured
+        : typeof prev.exploded3dConfigured === 'boolean'
+          ? prev.exploded3dConfigured
+          : false,
   }
   saveWorkspaces(all)
   syncProjectFromWorkspace(projectId, all[projectId])
@@ -206,4 +228,39 @@ export function markProjectReviewed(projectId) {
 export function clearProjectReviewed(projectId) {
   if (!projectId) return
   patchProject(projectId, { reviewed: false })
+}
+
+/**
+ * 从本地删除项目（仅 localStorage）：
+ * - 删除项目元信息
+ * - 删除该项目 workspace
+ * - 删除该项目的画布草稿（fta-canvas-drafts:{projectId}）
+ */
+export function deleteProject(projectId) {
+  if (typeof window === 'undefined') return false
+  const id = String(projectId || '').trim()
+  if (!id) return false
+
+  const projects = readProjects()
+  const nextProjects = projects.filter((p) => p?.id !== id)
+  if (nextProjects.length === projects.length) return false
+  saveProjects(nextProjects)
+
+  const all = readWorkspaces()
+  if (all && typeof all === 'object' && id in all) {
+    try {
+      delete all[id]
+    } catch {
+      // ignore
+    }
+    saveWorkspaces(all)
+  }
+
+  try {
+    localStorage.removeItem(`fta-canvas-drafts:${id}`)
+  } catch {
+    // ignore
+  }
+
+  return true
 }

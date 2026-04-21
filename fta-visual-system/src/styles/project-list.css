@@ -143,6 +143,67 @@
   gap: 0.65rem;
 }
 
+.project-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.project-icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #64748b;
+  font-size: 1.05rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.project-icon-btn:hover {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+}
+
+.project-icon-btn--danger {
+  color: #b91c1c;
+}
+
+.project-icon-btn--danger:hover {
+  border-color: rgba(185, 28, 28, 0.35);
+  background: rgba(239, 68, 68, 0.08);
+  color: #b91c1c;
+}
+
+[data-theme='dark'] .project-icon-btn {
+  border-color: #334155;
+  background: rgba(15, 23, 42, 0.6);
+  color: #94a3b8;
+}
+
+[data-theme='dark'] .project-icon-btn:hover {
+  border-color: #475569;
+  background: rgba(148, 163, 184, 0.08);
+  color: #cbd5e1;
+}
+
+[data-theme='dark'] .project-icon-btn--danger {
+  color: #fca5a5;
+}
+
+[data-theme='dark'] .project-icon-btn--danger:hover {
+  border-color: rgba(252, 165, 165, 0.4);
+  background: rgba(248, 113, 113, 0.12);
+  color: #fecaca;
+}
+
 .project-card-name {
   font-size: 1.02rem;
   font-weight: 700;

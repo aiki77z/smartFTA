@@ -7,7 +7,9 @@ import {
   useState,
 } from 'react'
 
-export const THEME_STORAGE_KEY = 'fta-theme'
+/* eslint-disable react-refresh/only-export-components */
+
+const THEME_STORAGE_KEY = 'fta-theme'
 
 const ThemeContext = createContext(null)
 

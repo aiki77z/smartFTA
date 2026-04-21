@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import ThemeToggle from '../components/ThemeToggle.jsx'
-import { createProject, listProjectsSortedForListPage } from '../utils/projectStore.js'
+import { createProject, deleteProject, listProjectsSortedForListPage } from '../utils/projectStore.js'
 import '../styles/project-list.css'
 
 function formatTime(ts) {
@@ -66,21 +66,45 @@ function ProjectListPage() {
           </div>
         )}
         {projects.map((project) => (
-          <button
+          <div
             key={project.id}
-            type="button"
             className="project-card"
+            role="button"
+            tabIndex={0}
             onClick={() => navigate(`/project/${project.id}`)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                navigate(`/project/${project.id}`)
+              }
+            }}
           >
             <div className="project-card-head">
               <span className="project-card-name">{project.name}</span>
-              <span
-                className={`project-status ${
-                  STATUS_CLASS[project.workflowStatus] || 'project-status--upload'
-                }`}
-              >
-                {project.workflowStatus || '待上传'}
-              </span>
+              <div className="project-card-actions">
+                <span
+                  className={`project-status ${
+                    STATUS_CLASS[project.workflowStatus] || 'project-status--upload'
+                  }`}
+                >
+                  {project.workflowStatus || '待上传'}
+                </span>
+                <button
+                  type="button"
+                  className="project-icon-btn project-icon-btn--danger"
+                  title="删除项目（仅本地）"
+                  aria-label="删除项目"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    const ok = window.confirm(`确定删除项目「${project.name || project.id}」？此操作仅影响本地数据，无法恢复。`)
+                    if (!ok) return
+                    deleteProject(project.id)
+                    setRefreshKey((k) => k + 1)
+                  }}
+                >
+                  ×
+                </button>
+              </div>
             </div>
             <dl className="project-card-body">
               <div className="project-card-row">
@@ -92,7 +116,7 @@ function ProjectListPage() {
                 <dd>{formatTime(project.lastChatAt)}</dd>
               </div>
             </dl>
-          </button>
+          </div>
         ))}
       </div>
     </div>

@@ -34,3 +34,19 @@ exploded/
 
 # validator-service
 __pycache__/*
+
+# 忽略所有 worktree 目录
+../FTA-*/
+
+# 忽略压缩包和环境文件
+../multi.zip
+../.env
+
+# 忽略本地测试的 raw 数据
+raw-FTA/*.json
+
+public/demo/*
+
+fta-ai-service/.venv/
+fta-ai-service/.env
+fta-ai-service/app/__pycache__/

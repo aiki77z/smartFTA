@@ -33,7 +33,7 @@ export default function GenerationTaskPanel({ tasks, onOpenTree }) {
   return (
     <div className="gen-task-list">
       {tasks.length === 0 && (
-        <div className="home-empty">暂无任务。请在中间栏发起生成任务。</div>
+        <div className="home-empty">暂无任务。请在下方旧版对话中发起生成任务。</div>
       )}
       {tasks.map((task) => {
         const pct = Math.max(0, Math.min(100, Number(task.progress) || 0))

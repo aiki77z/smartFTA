@@ -67,7 +67,9 @@ function formatBasicLabel(text) {
 }
 
 function EventNode({ data }) {
-  const cls = `fta-node fta-node--${data.type || 'event'}`
+  const diffStatus = data.diffStatus || ''
+  const diffCls = diffStatus ? ` fta-node--diff-${diffStatus}` : ''
+  const cls = `fta-node fta-node--${data.type || 'event'}${diffCls}`
   const isBasic = data.type === 'basic'
   const typeTag = TYPE_LABELS[data.type] || ''
 
@@ -106,6 +108,8 @@ function EventNode({ data }) {
 }
 
 function GateNode({ data }) {
+  const diffStatus = data.diffStatus || ''
+  const diffCls = diffStatus ? ` fta-gate--diff-${diffStatus}` : ''
   const isAnd = data.label === 'AND'
   const isDark = data.theme === 'dark'
 
@@ -135,7 +139,7 @@ function GateNode({ data }) {
         fontFamily: 'jyhphy, system-ui, -apple-system, sans-serif',
       }
   return (
-    <div className={`fta-gate ${isAnd ? 'fta-gate--and' : 'fta-gate--or'}`}>
+    <div className={`fta-gate ${isAnd ? 'fta-gate--and' : 'fta-gate--or'}${diffCls}`}>
       <Handle type="target" position={Position.Top} className="fta-handle" />
       <svg viewBox="0 0 60 52" width="60" height="52">
         {isAnd ? (
@@ -322,6 +326,7 @@ function buildLayout(nodes, edges) {
         label: n.label,
         type: n.type,
         meta: n.meta,
+        diffStatus: n?.meta?._diffStatus || '',
       },
       position: { x: c.cx - halfW, y: c.cy },
       type: isGate ? 'gateNode' : 'eventNode',
@@ -556,6 +561,7 @@ function CanvasInner({
   const { getNodes, fitView } = useReactFlow()
 
   useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect */
     setNodes(init.rfNodes)
     setEdges(init.rfEdges)
     if (!userAdjustedView) {
@@ -564,6 +570,7 @@ function CanvasInner({
         80,
       )
     }
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, [init, fitView, userAdjustedView])
 
   const exportImage = useCallback(async () => {
@@ -593,9 +600,10 @@ function CanvasInner({
     })
   }, [getNodes, theme])
 
-  if (canvasActionsRef) {
+  useEffect(() => {
+    if (!canvasActionsRef) return
     canvasActionsRef.current = { exportImage }
-  }
+  }, [canvasActionsRef, exportImage])
 
   const handleNodeCtx = useCallback(
     (event, node) => {
