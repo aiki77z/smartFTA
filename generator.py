@@ -1395,6 +1395,268 @@ def generate_fault_tree_with_progress(
     return tree_data
 
 
+def generate_fault_tree(
+    top_event: str,
+    requirements: str = "",
+    selected_file_version_ids: Optional[List[str]] = None,
+    root_graph_node_id: Optional[str] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    # Keep this later definition as the runtime-active implementation.
+    def emit(message: str):
+        try:
+            print(message)
+        finally:
+            if log_callback:
+                try:
+                    log_callback(message)
+                except Exception:
+                    pass
+
+    scoped_file_version_ids = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    if root_graph_node_id:
+        emit(f"[graph-match] using confirmed graph node '{root_graph_node_id}' for top event '{top_event}'")
+        matched_node = get_graph_node_by_id(
+            root_graph_node_id,
+            selected_file_version_ids=scoped_file_version_ids,
+        )
+        if not matched_node:
+            raise ValueError(f"Confirmed graph node not found in current scope: {root_graph_node_id}")
+        matched = {
+            "matched_node_id": matched_node.get("graph_node_id"),
+            "matched_name": matched_node.get("name") or top_event,
+            "matched_node": matched_node,
+            "matched_nodes": [
+                {
+                    "graph_node_id": matched_node.get("graph_node_id"),
+                    "name": matched_node.get("name"),
+                    "normalized_name": matched_node.get("normalized_name"),
+                    "file_id": matched_node.get("file_id"),
+                    "file_version_id": matched_node.get("file_version_id"),
+                }
+            ],
+            "alternatives": [],
+        }
+        root_node_ids = [matched_node.get("graph_node_id")]
+        emit(f"[graph-match] confirmed '{top_event}' -> '{matched['matched_name']}'")
+    else:
+        normalized_candidates = build_top_event_normalized_candidates(top_event, [top_event])
+        emit(f"[graph-match] matching top event '{top_event}'")
+        matched = match_top_event_from_graph(
+            top_event,
+            normalized_candidates=normalized_candidates,
+            selected_file_version_ids=scoped_file_version_ids,
+        )
+        emit(f"[graph-match] matched '{top_event}' -> '{matched['matched_name']}'")
+        root_node_ids = [
+            item.get("graph_node_id")
+            for item in (matched.get("matched_nodes") or [])
+            if item.get("graph_node_id")
+        ]
+
+    subgraph_bundle = expand_scoped_local_fault_subgraph(
+        root_node_ids or [matched["matched_node_id"]],
+        max_depth=GRAPH_TREE_MAX_DEPTH,
+        max_nodes=GRAPH_TREE_MAX_NODES,
+        selected_file_version_ids=scoped_file_version_ids,
+    )
+    emit(
+        f"[graph-subgraph] root={matched['matched_name']} roots={len(subgraph_bundle.get('roots') or [])} "
+        f"nodes={len(subgraph_bundle.get('nodes') or [])} edges={len(subgraph_bundle.get('edges') or [])}"
+    )
+
+    chunk_ids = collect_subgraph_chunks(subgraph_bundle, chunk_limit=MAX_CHUNKS_FOR_PROMPT)
+    raw_chunks: List[Dict[str, Any]] = []
+    if chunk_ids:
+        raw_chunks = get_chunks_by_ids(
+            chunk_ids,
+            limit=max(len(chunk_ids), 1),
+            selected_file_version_ids=scoped_file_version_ids,
+        )
+
+    if not raw_chunks:
+        emit("[graph-chunks] subgraph returned no direct chunks, falling back to top-event chunk recall")
+        fallback_retrieval = _collect_chunk_only_evidence(
+            matched["matched_name"],
+            selected_file_version_ids=scoped_file_version_ids,
+            limit=MAX_CHUNKS_FOR_PROMPT,
+        )
+        _append_unique_chunks(raw_chunks, fallback_retrieval.get("chunks") or [])
+        for chunk_id in fallback_retrieval.get("chunk_ids") or []:
+            if chunk_id not in chunk_ids:
+                chunk_ids.append(chunk_id)
+
+    if not raw_chunks:
+        raise ValueError(
+            f"No evidence chunks found for '{matched['matched_name']}'. Please check graph links, "
+            "top_event_catalog, or chunks data."
+        )
+
+    emit(f"[graph-chunks] collected {len(raw_chunks)} evidence chunks")
+
+    llm_used_subgraph = ENABLE_GRAPH_RETRIEVAL
+    elements: Dict[str, Any] = {}
+    if not llm_used_subgraph:
+        emit("[graph-llm] extracting fault elements from graph-recalled chunks without subgraph skeleton")
+        elements = extract_fault_elements_from_chunks(matched["matched_name"], raw_chunks)
+        emit(
+            f"[graph-llm] extracted elements "
+            f"events={len(elements.get('events') or [])} relations={len(elements.get('relations') or [])}"
+        )
+
+    draft_tree = None
+    previous_issues = None
+    for attempt in range(1, MAX_RETRY + 2):
+        emit(f"[graph-llm] generating draft tree attempt={attempt}")
+        try:
+            if llm_used_subgraph:
+                draft_tree = build_fault_tree_from_subgraph_and_chunks(
+                    top_event=matched["matched_name"],
+                    subgraph_bundle=subgraph_bundle,
+                    evidence_chunks=raw_chunks,
+                    requirements=requirements,
+                )
+            else:
+                draft_tree = build_fault_tree_from_chunk_elements(
+                    top_event=matched["matched_name"],
+                    elements=elements,
+                    chunks=raw_chunks,
+                    requirements=requirements,
+                    previous_issues=previous_issues,
+                )
+            emit(
+                f"[graph-draft] generated draft attempt={attempt} "
+                f"nodes={len(draft_tree.get('nodeList') or [])} links={len(draft_tree.get('linkList') or [])}"
+            )
+        except ValueError as exc:
+            emit(f"[graph-draft] draft generation error attempt={attempt} error={exc}")
+            if attempt > MAX_RETRY:
+                raise
+            previous_issues = [{"level": "ERROR", "message": str(exc)}]
+            emit(f"[graph-regenerate] retrying draft generation next_attempt={attempt + 1}")
+            continue
+
+        emit(f"[graph-validate] validating draft attempt={attempt}")
+        validation = validate_full(draft_tree, skip_semantic=True)
+        draft_tree["validation"] = validation
+        if validation["passed"]:
+            emit(
+                f"[graph-validate] validation passed attempt={attempt} "
+                f"errors={validation['error_count']} warnings={validation['warning_count']}"
+            )
+            break
+        previous_issues = validation["issues"]
+        emit(
+            f"[graph-validate] validation failed attempt={attempt} "
+            f"errors={validation['error_count']} warnings={validation['warning_count']}"
+        )
+        if attempt <= MAX_RETRY:
+            emit(f"[graph-regenerate] retrying draft generation next_attempt={attempt + 1}")
+        if attempt > MAX_RETRY:
+            break
+
+    if draft_tree is None:
+        raise ValueError(f"Failed to build tree for '{top_event}'")
+
+    final_tree = draft_tree
+    try:
+        from diff_analyzer import format_corrections_for_repair, get_relevant_corrections
+
+        corrections = get_relevant_corrections(draft_tree)
+        if corrections:
+            emit(f"[history-repair] applying {len(corrections)} relevant corrections")
+            repaired = repair_fault_tree(draft_tree, format_corrections_for_repair(corrections), raw_chunks)
+            emit("[graph-validate] validating repaired draft")
+            repair_validation = validate_full(repaired, skip_semantic=True)
+            if repair_validation["passed"]:
+                repaired["validation"] = repair_validation
+                final_tree = repaired
+                emit(
+                    f"[history-repair] repaired draft accepted "
+                    f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
+                )
+            else:
+                emit(
+                    f"[history-repair] repaired draft rejected "
+                    f"errors={repair_validation['error_count']} warnings={repair_validation['warning_count']}"
+                )
+        else:
+            emit("[history-repair] no relevant corrections, skipped")
+    except Exception as exc:
+        emit(f"[history-repair] skipped due to error: {exc}")
+
+    emit("[graph-validate] validating final tree")
+    final_validation = validate_full(final_tree, skip_semantic=False)
+    final_tree["validation"] = final_validation
+    emit(
+        f"[graph-validate] final validation "
+        f"{'passed' if final_validation['passed'] else 'failed'} "
+        f"errors={final_validation['error_count']} warnings={final_validation['warning_count']}"
+    )
+
+    evidence_chunk_ids = [
+        chunk.get("chunk_uid") or chunk.get("chunk_id")
+        for chunk in raw_chunks
+        if chunk.get("chunk_uid") or chunk.get("chunk_id")
+    ]
+    subgraph_node_ids = [
+        node.get("graph_node_id")
+        for node in (subgraph_bundle.get("nodes") or [])
+        if node.get("graph_node_id")
+    ]
+    final_tree["retrieval"] = {
+        "source": "graph_local_subgraph",
+        "matched_top_event": matched["matched_name"],
+        "matched_node_id": matched["matched_node_id"],
+        "matched_node_ids": root_node_ids or [matched["matched_node_id"]],
+        "alternatives": matched.get("alternatives") or [],
+        "source_file_version_ids": scoped_file_version_ids,
+        "subgraph_node_count": len(subgraph_bundle.get("nodes") or []),
+        "subgraph_edge_count": len(subgraph_bundle.get("edges") or []),
+        "chunk_ids": chunk_ids or evidence_chunk_ids,
+        "evidence_chunk_ids": evidence_chunk_ids,
+        "subgraph_node_ids": subgraph_node_ids,
+        "llm_used_subgraph": llm_used_subgraph,
+    }
+    final_tree["source_file_version_ids"] = scoped_file_version_ids
+    return final_tree
+
+
+def generate_fault_tree_with_progress(
+    top_event: str,
+    requirements: str = "",
+    selected_file_version_ids: Optional[List[str]] = None,
+    root_graph_node_id: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    if progress_callback:
+        progress_callback(10, "prepare", "Preparing generation request")
+        progress_callback(25, "graph_match", "Matching top event from graph")
+        progress_callback(40, "graph_subgraph", "Expanding local graph subgraph")
+        progress_callback(55, "graph_chunks", "Collecting subgraph evidence chunks")
+        if ENABLE_GRAPH_RETRIEVAL:
+            progress_callback(70, "graph_llm", "Building fault tree from subgraph and chunks")
+        else:
+            progress_callback(70, "graph_llm", "Building fault tree from graph-recalled chunks")
+
+    tree_data = generate_fault_tree(
+        top_event,
+        requirements,
+        selected_file_version_ids=selected_file_version_ids,
+        root_graph_node_id=root_graph_node_id,
+        log_callback=log_callback,
+    )
+
+    if progress_callback:
+        progress_callback(90, "persistence", "Generation completed, persisting result")
+    return tree_data
+
+
 def discover_top_events_from_entity_index(entries: List[dict]) -> List[dict]:
     # Kept for backward compatibility; the new batch flow no longer depends on Mongo entity index.
     results = []
