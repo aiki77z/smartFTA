@@ -15,6 +15,7 @@ import {
   getTreeHistory,
   getTreeVersion,
   generateTree,
+  getFtaBackendBaseUrl,
   getBatchJobItem,
   pollGenerationJobItem,
   saveTree,
@@ -2381,15 +2382,15 @@ function FaultTreePage() {
 
   const handleDownloadHiResImage = useCallback(async () => {
     try {
-      const origin = window.location.origin
       // 高保真导出使用“修剪后的 snapshot”，避免把 description/message 等无关字段塞进 URL 导致 431
       const snapParam = encodeURIComponent(hiResSnapshotText)
-      const url = `${origin}/fta-viewer?snapshot=${snapParam}`
-      const resp = await fetch('http://localhost:8000/export-fault-tree-image', {
+      const viewerPath = `/fta-viewer?snapshot=${snapParam}`
+      const backendBaseUrl = getFtaBackendBaseUrl()
+      const resp = await fetch(`${backendBaseUrl}/export-fault-tree-image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          url,
+          path: viewerPath,
           selector: '.fta-canvas-wrapper',
           width: 1600,
           height: 900,

@@ -5,6 +5,10 @@ function getBaseUrl() {
   return (envUrl || DEFAULT_BASE_URL).replace(/\/+$/, '')
 }
 
+export function getFtaBackendBaseUrl() {
+  return getBaseUrl()
+}
+
 async function requestJson(path, { method = 'GET', body, signal } = {}) {
   const baseUrl = getBaseUrl()
   const url = `${baseUrl}${path.startsWith('/') ? path : `/${path}`}`
