@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
 from database import (
     activate_file_version,
+    fail_orphan_running_generation_items_after_restart,
     archive_file,
     append_generation_job_item_event,
     assert_chunk_artifacts_align_with_file_version,
@@ -225,6 +226,16 @@ app.add_middleware(
 
 def _console_log(message: str):
     print(message, flush=True)
+
+
+@app.on_event("startup")
+def _startup_recover_orphan_running_jobs():
+    try:
+        n = fail_orphan_running_generation_items_after_restart()
+        if n:
+            _console_log(f"[scheduler] startup: marked {n} orphan running job item(s) as failed (server restart)")
+    except Exception as exc:
+        _console_log(f"[scheduler] startup recovery failed: {exc}")
 
 
 def _load_py_module(module_name: str, file_path: Path):
@@ -932,6 +943,13 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
     aliases = _dedupe_keep_order(item.get("aliases") or [])
     requirements = item.get("requirements") or ""
     selected_file_version_ids = _resolve_selected_scope(item.get("source_file_version_ids") or [])
+    part_details = None
+    try:
+        meta = item.get("metadata") or {}
+        if isinstance(meta, dict) and meta.get("part_details"):
+            part_details = meta.get("part_details")
+    except Exception:
+        part_details = None
     tree_id = None
 
     try:
@@ -1076,6 +1094,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             root_graph_node_id=graph_node_id,
             progress_callback=progress_callback,
             log_callback=log_callback,
+            part_details=part_details,
         )
 
         retrieval = tree_data.get("retrieval") or {}
@@ -1249,6 +1268,7 @@ def _queue_single_generation(
     graph_node_id_override: Optional[str] = None,
     selected_file_version_ids: Optional[List[str]] = None,
     async_mode: bool = False,
+    part_details: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
     resolved_top_event = catalog["name"]
@@ -1279,8 +1299,27 @@ def _queue_single_generation(
 
     active_item = find_active_job_item_by_top_event_and_scope(normalized_top_event, scoped_file_version_ids)
     if active_item:
+        aid = active_item["item_id"]
+        st = active_item.get("status") or ""
+        # 异步 API（sync=false）不应阻塞 HTTP：复用已有任务项并立即返回 item_id 供前端轮询。
+        if async_mode:
+            if st == "pending":
+                _start_dedicated_generation_thread(aid)
+            return {
+                "mode": "queued",
+                "job_id": active_item.get("job_id"),
+                "item_id": aid,
+                "status": st or "queued",
+                "selected_file_version_ids": scoped_file_version_ids,
+                "parsed_prompt": {
+                    "requested_top_event": requested_top_event,
+                    "resolved_top_event": resolved_top_event,
+                    "normalized_top_event": normalized_top_event,
+                    "requirements": requirements,
+                },
+            }
         return _wait_for_single_item_result(
-            item_id=active_item["item_id"],
+            item_id=aid,
             selected_file_version_ids=scoped_file_version_ids,
             requested_top_event=requested_top_event,
             resolved_top_event=resolved_top_event,
@@ -1288,7 +1327,7 @@ def _queue_single_generation(
             requirements=requirements,
             graph_node_id=graph_node_id,
             job_id=active_item.get("job_id"),
-            execute_if_pending=(active_item.get("status") == "pending"),
+            execute_if_pending=(st == "pending"),
         )
 
     job = create_generation_job(
@@ -1306,6 +1345,17 @@ def _queue_single_generation(
             "selected_file_version_ids": scoped_file_version_ids,
         },
     )
+    item_metadata: Dict[str, Any] = {
+        "requested_prompt": prompt,
+        "query_top_event": requested_top_event,
+        "resolved_top_event": resolved_top_event,
+        "normalized_top_event": normalized_top_event,
+        "graph_node_id": graph_node_id,
+        "selected_file_version_ids": scoped_file_version_ids,
+    }
+    if part_details:
+        item_metadata["part_details"] = part_details
+
     item = create_generation_job_item(
         job_id=job["job_id"],
         top_event=resolved_top_event,
@@ -1317,14 +1367,7 @@ def _queue_single_generation(
         source_chunk_ids=catalog.get("source_chunk_ids") or [],
         source_file_version_ids=scoped_file_version_ids,
         requirements=requirements,
-        metadata={
-            "requested_prompt": prompt,
-            "query_top_event": requested_top_event,
-            "resolved_top_event": resolved_top_event,
-            "normalized_top_event": normalized_top_event,
-            "graph_node_id": graph_node_id,
-            "selected_file_version_ids": scoped_file_version_ids,
-        },
+        metadata=item_metadata,
     )
 
     if async_mode:
@@ -1406,6 +1449,8 @@ class GenerateRequest(BaseModel):
     confirmed_top_event: Optional[str] = None
     confirmed_normalized_top_event: Optional[str] = None
     confirmed_graph_node_id: Optional[str] = None
+    # 前端三维爆炸图：Object_X -> 部件元数据，用于 LLM 在 description 末尾标注 [Ref: Object_X]
+    part_details: Optional[Dict[str, Any]] = None
     # 若为 True：同步等待生成完成并返回 tree_data（默认兼容旧行为）
     # 若为 False：异步排队，立即返回 mode=queued + job_id/item_id，供前端轮询 events 实时展示进度
     sync: bool = True
@@ -1717,6 +1762,7 @@ def api_generate(req: GenerateRequest):
                 graph_node_id_override=graph_node_id_override,
                 selected_file_version_ids=scoped_file_version_ids,
                 async_mode=True,
+                part_details=req.part_details,
             )
             return result
 
@@ -1728,6 +1774,7 @@ def api_generate(req: GenerateRequest):
             catalog,
             graph_node_id_override=graph_node_id_override,
             selected_file_version_ids=scoped_file_version_ids,
+            part_details=req.part_details,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

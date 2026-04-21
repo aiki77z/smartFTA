@@ -2974,6 +2974,38 @@ def get_generation_job_item(item_id: str) -> Optional[Dict[str, Any]]:
     return _decorate_runtime_fields(generation_job_items_col.find_one({"_id": item_id}))
 
 
+def fail_orphan_running_generation_items_after_restart(
+    *,
+    message: str = "服务已重启，上次生成被中断；请重新提交。",
+) -> int:
+    """
+    进程重启后，内存中的生成线程已消失，但 Mongo 中可能仍为 running，会导致后续请求在
+    _wait_for_single_item_result 中无限等待。启动时将这些项标为 failed。
+    """
+    cursor = generation_job_items_col.find({"status": "running"}, {"job_id": 1})
+    job_ids = list({doc.get("job_id") for doc in cursor if doc.get("job_id")})
+    now = _now()
+    result = generation_job_items_col.update_many(
+        {"status": "running"},
+        {
+            "$set": {
+                "status": "failed",
+                "error": message,
+                "stage": "failed",
+                "progress": 100,
+                "finished_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    for jid in job_ids:
+        try:
+            refresh_generation_job(jid)
+        except Exception:
+            pass
+    return int(result.modified_count or 0)
+
+
 def list_generation_job_items(job_id: str) -> List[Dict[str, Any]]:
     cursor = generation_job_items_col.find({"job_id": job_id}, {"_id": 0}).sort("created_at", ASCENDING)
     return [_decorate_runtime_fields(doc) for doc in cursor]

@@ -300,6 +300,7 @@ def build_fault_tree_from_subgraph_and_chunks(
     subgraph_bundle: Dict[str, Any],
     evidence_chunks: List[Dict[str, Any]],
     requirements: str = "",
+    part_details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     skeleton = _compress_subgraph_to_tree_skeleton(subgraph_bundle)
     evidence = _format_evidence_chunks(evidence_chunks)
@@ -325,6 +326,18 @@ def build_fault_tree_from_subgraph_and_chunks(
         "links": skeleton["links"],
     }
 
+    pd = part_details if isinstance(part_details, dict) and part_details else None
+    part_details_text = json.dumps(pd, ensure_ascii=False, indent=2) if pd else ""
+    physical_ref_block = ""
+    if pd:
+        physical_ref_block = f"""
+11. 在构建故障树的每一个事件节点时，请在 description 字段的末尾，按照 [Ref: Object_X] 的格式标注其物理关联组件。
+其中，Object_X 是该事件对应的物理组件 ID，如：Object_2、Object_3、Object_4 等。
+这是为了模拟工业标准中「逻辑位点与物理备件」的对标。
+以下是该设备的物理组件列表：
+{part_details_text}
+"""
+
     prompt = f"""
 你是工业设备故障树生成助手。请根据“图谱局部子图骨架”和“精简证据 chunks”输出最终故障树 JSON。
 
@@ -338,7 +351,7 @@ def build_fault_tree_from_subgraph_and_chunks(
 7. documents 必须输出完整结构：chunk_id、chunk_name、section_path、source_page。
 8. 每个节点都保留 graphNodeId 和 kg_key，值与输入骨架一致。
 9. rules 使用数组；如果只有单条 rule 字符串，也请把它转成一条规则对象或留空数组。不要输出未定义字段。
-10. 只输出 JSON，不要输出 markdown。
+10. 只输出 JSON，不要输出 markdown。{physical_ref_block}
 
 输出格式：
 {{
@@ -930,6 +943,7 @@ def build_fault_tree_from_chunk_elements(
     chunks: List[Dict[str, Any]],
     requirements: str = "",
     previous_issues: Optional[List[Dict[str, Any]]] = None,
+    part_details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     chunks_ref = [
         {
@@ -952,6 +966,17 @@ def build_fault_tree_from_chunk_elements(
         if error_msgs:
             retry_hint = "\n## 上次生成存在以下问题，请修正\n" + "\n".join(error_msgs) + "\n"
 
+    pd = part_details if isinstance(part_details, dict) and part_details else None
+    part_details_text = json.dumps(pd, ensure_ascii=False, indent=2) if pd else ""
+    physical_ref_chunk = ""
+    if pd:
+        physical_ref_chunk = f"""
+## 三维部件对标（与爆炸图网格名 Object_X 一致）
+在构建故障树的每一个事件节点时，请在 description 字段的末尾，按照 [Ref: Object_X] 的格式标注其物理关联组件。
+其中 Object_X 为该事件对应的物理组件 ID。以下是该设备的物理组件列表：
+{part_details_text}
+"""
+
     prompt = f"""你是工业设备故障树分析专家，精通FTA方法。
 
 ## 参考知识（来自设备手册）
@@ -965,7 +990,7 @@ def build_fault_tree_from_chunk_elements(
 {retry_hint}
 ## 用户额外要求
 {requirements or '无'}
-
+{physical_ref_chunk}
 ## 任务
 为顶事件“{top_event}”生成完整、规范的故障树。
 
@@ -1401,6 +1426,8 @@ def generate_fault_tree(
     selected_file_version_ids: Optional[List[str]] = None,
     root_graph_node_id: Optional[str] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+    part_details: Optional[Dict[str, Any]] = None,
 ) -> dict:
     # Keep this later definition as the runtime-active implementation.
     def emit(message: str):
@@ -1519,6 +1546,7 @@ def generate_fault_tree(
                     subgraph_bundle=subgraph_bundle,
                     evidence_chunks=raw_chunks,
                     requirements=requirements,
+                    part_details=part_details,
                 )
             else:
                 draft_tree = build_fault_tree_from_chunk_elements(
@@ -1527,6 +1555,7 @@ def generate_fault_tree(
                     chunks=raw_chunks,
                     requirements=requirements,
                     previous_issues=previous_issues,
+                    part_details=part_details,
                 )
             emit(
                 f"[graph-draft] generated draft attempt={attempt} "
@@ -1541,6 +1570,12 @@ def generate_fault_tree(
             continue
 
         emit(f"[graph-validate] validating draft attempt={attempt}")
+        if progress_callback:
+            progress_callback(
+                72,
+                "graph_validate",
+                f"Structural validation (draft attempt {attempt})…",
+            )
         validation = validate_full(draft_tree, skip_semantic=True)
         draft_tree["validation"] = validation
         if validation["passed"]:
@@ -1571,6 +1606,8 @@ def generate_fault_tree(
             emit(f"[history-repair] applying {len(corrections)} relevant corrections")
             repaired = repair_fault_tree(draft_tree, format_corrections_for_repair(corrections), raw_chunks)
             emit("[graph-validate] validating repaired draft")
+            if progress_callback:
+                progress_callback(78, "graph_validate", "Validating repaired draft…")
             repair_validation = validate_full(repaired, skip_semantic=True)
             if repair_validation["passed"]:
                 repaired["validation"] = repair_validation
@@ -1590,6 +1627,8 @@ def generate_fault_tree(
         emit(f"[history-repair] skipped due to error: {exc}")
 
     emit("[graph-validate] validating final tree")
+    if progress_callback:
+        progress_callback(82, "graph_validate", "Running full validation (including semantics)…")
     final_validation = validate_full(final_tree, skip_semantic=False)
     final_tree["validation"] = final_validation
     emit(
@@ -1633,6 +1672,7 @@ def generate_fault_tree_with_progress(
     root_graph_node_id: Optional[str] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    part_details: Optional[Dict[str, Any]] = None,
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
@@ -1650,6 +1690,8 @@ def generate_fault_tree_with_progress(
         selected_file_version_ids=selected_file_version_ids,
         root_graph_node_id=root_graph_node_id,
         log_callback=log_callback,
+        progress_callback=progress_callback,
+        part_details=part_details,
     )
 
     if progress_callback:
