@@ -1506,7 +1506,33 @@ if _VALIDATOR_DIR.exists():
 
         @app.post("/validate-fault-tree")
         def validate_fault_tree(payload: _validator_main.ValidateRequest):  # type: ignore[name-defined]
-            return _validator_main.validate_fault_tree(payload)  # type: ignore[attr-defined]
+            out = _validator_main.validate_fault_tree(payload)  # type: ignore[attr-defined]
+            try:
+                validation = out.get("validation") if isinstance(out, dict) else None
+                issues = validation.get("issues") if isinstance(validation, dict) else None
+                if isinstance(issues, list):
+                    for it in issues:
+                        if not isinstance(it, dict):
+                            continue
+                        code = str(it.get("code") or "")
+                        msg = str(it.get("message") or "")
+                        if code == "MISSING_EVENT_FIELD":
+                            soft = (
+                                "description",
+                                "priority",
+                                "probability",
+                                "showProbability",
+                                "investigateMethod",
+                                "rule",
+                                "rules",
+                            )
+                            if any(f in msg for f in soft):
+                                it["level"] = "INFO"
+                        if code in ("NO_ERROR_LEVEL", "NO_DOCUMENTS"):
+                            it["level"] = "INFO"
+            except Exception:
+                pass
+            return out
 
         @app.post("/export-fault-tree-image")
         async def export_fault_tree_image(payload: _validator_main.ExportImageRequest):  # type: ignore[name-defined]
@@ -2501,6 +2527,7 @@ def api_get_chunk(chunk_id: str):
 def api_list_chunks(
     file_names: Optional[List[str]] = None,
     file_version_ids: Optional[List[str]] = None,
+    all: bool = False,
     limit: int = 200,
 ):
     """
@@ -2512,6 +2539,11 @@ def api_list_chunks(
     names = [str(n or "").strip() for n in (file_names or []) if str(n or "").strip()]
     fvs = [str(v or "").strip() for v in (file_version_ids or []) if str(v or "").strip()]
 
+    # 临时支持：拉取全库 chunks（用于前端“预览全部 chunks”）
+    if bool(all):
+        chunks = list_all_chunks(selected_file_version_ids=None)
+        return {"chunks": chunks[:safe_limit], "total": len(chunks)}
+        
     # 防止误返回“全库 chunks”：必须给出过滤条件（文件名或 file_version_id）
     if not names and not fvs:
         return {"chunks": [], "total": 0}

@@ -407,6 +407,106 @@ def _coerce_rules(rule_value: Any) -> List[Dict[str, Any]]:
     return []
 
 
+_REF_SUFFIX_RE = re.compile(r"\s*\[Ref:\s*Object_\d+\s*\]\s*$", re.IGNORECASE)
+
+
+def _sorted_object_keys(part_details: Dict[str, Any]) -> List[str]:
+    keys = [str(k) for k in part_details.keys() if str(k).strip().startswith("Object_")]
+
+    def _obj_num(k: str) -> int:
+        m = re.search(r"Object_(\d+)", str(k))
+        return int(m.group(1)) if m else 999
+
+    keys.sort(key=lambda x: (_obj_num(x), x))
+    return keys
+
+
+def _fallback_object_key(part_details: Dict[str, Any]) -> str:
+    keys = _sorted_object_keys(part_details)
+    return keys[0] if keys else "Object_2"
+
+
+def _best_object_key_for_event_label(label: str, part_details: Dict[str, Any]) -> Optional[str]:
+    """Match event name / text to a mesh key (Object_N) using part name / id overlap."""
+    raw = str(label or "").strip()
+    if not raw:
+        return None
+    label_l = raw.lower()
+    label_compact = re.sub(r"\s+", "", raw).lower()
+    best_k: Optional[str] = None
+    best_score = 0.0
+    for obj_key, meta in part_details.items():
+        if not isinstance(meta, dict):
+            continue
+        name = str(meta.get("name") or "").strip()
+        pid = str(meta.get("id") or "").strip()
+        score = 0.0
+        if name:
+            if name in raw:
+                score = max(score, min(1.0, len(name) / max(len(raw), 1)))
+            elif raw in name:
+                score = max(score, 0.42)
+            name_c = re.sub(r"\s+", "", name).lower()
+            if name_c and name_c in label_compact:
+                score = max(score, 0.48)
+        if pid:
+            pl = pid.lower()
+            if pl and pl in label_l:
+                score = max(score, 0.52)
+        sk = str(obj_key)
+        if sk and sk in raw:
+            score = max(score, 0.35)
+        if score > best_score:
+            best_score = score
+            best_k = str(obj_key)
+    return best_k if best_score >= 0.12 else None
+
+
+def apply_physical_refs_to_fault_tree_data(
+    tree: Dict[str, Any],
+    part_details: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Ensure non-top event nodes end with `` [Ref: Object_N]`` when part_details is provided.
+    LLMs often skip the instruction; this is a deterministic post-pass.
+    """
+    pd = part_details if isinstance(part_details, dict) and part_details else None
+    if not pd:
+        return tree
+    out = dict(tree)
+    nodes_in = out.get("nodeList") or []
+    fb = _fallback_object_key(pd)
+    new_nodes: List[Dict[str, Any]] = []
+    for n in nodes_in:
+        if not isinstance(n, dict):
+            new_nodes.append(n)
+            continue
+        nt = str(n.get("type") or "")
+        if nt == "top_event":
+            new_nodes.append(n)
+            continue
+        ev = n.get("event")
+        if not isinstance(ev, dict):
+            new_nodes.append(n)
+            continue
+        name = str(n.get("name") or ev.get("name") or "")
+        desc = str(ev.get("description") or "")
+        if _REF_SUFFIX_RE.search(desc):
+            new_nodes.append(n)
+            continue
+        obj_key = _best_object_key_for_event_label(name, pd) or _best_object_key_for_event_label(desc, pd) or fb
+        base = _REF_SUFFIX_RE.sub("", desc).rstrip()
+        suffix = f" [Ref: {obj_key}]"
+        new_desc = (base + suffix).strip() if base else f"[Ref: {obj_key}]"
+        ev2 = dict(ev)
+        ev2["description"] = new_desc
+        nn = dict(n)
+        nn["event"] = ev2
+        new_nodes.append(nn)
+    out["nodeList"] = new_nodes
+    return out
+
+
 def _post_process_generated_tree(
     tree: Dict[str, Any],
     skeleton: Dict[str, Any],
@@ -747,6 +847,7 @@ def generate_fault_tree_with_progress(
     selected_file_version_ids: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    part_details: Optional[Dict[str, Any]] = None,
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
@@ -765,7 +866,10 @@ def generate_fault_tree_with_progress(
         requirements,
         selected_file_version_ids=selected_file_version_ids,
         log_callback=log_callback,
+        part_details=part_details,
     )
+    if part_details:
+        tree_data = apply_physical_refs_to_fault_tree_data(tree_data, part_details)
 
     if progress_callback:
         progress_callback(90, "persistence", "Generation completed, persisting result")
@@ -1547,6 +1651,7 @@ def generate_fault_tree_with_progress(
     root_graph_node_id: Optional[str] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    part_details: Optional[Dict[str, Any]] = None,
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
@@ -1566,7 +1671,10 @@ def generate_fault_tree_with_progress(
         selected_file_version_ids=selected_file_version_ids,
         root_graph_node_id=root_graph_node_id,
         log_callback=log_callback,
+        part_details=part_details,
     )
+    if part_details:
+        tree_data = apply_physical_refs_to_fault_tree_data(tree_data, part_details)
 
     if progress_callback:
         progress_callback(90, "persistence", "Generation completed, persisting result")
@@ -1841,6 +1949,10 @@ def generate_fault_tree(
     except Exception as exc:
         emit(f"[history-repair] skipped due to error: {exc}")
 
+    # LLM 常忽略「在 description 末尾追加 [Ref: Object_X]」；有部件列表时必须做确定性后处理
+    if part_details:
+        final_tree = apply_physical_refs_to_fault_tree_data(final_tree, part_details)
+
     emit("[graph-validate] validating final tree")
     if progress_callback:
         progress_callback(82, "graph_validate", "Running full validation (including semantics)…")
@@ -1946,6 +2058,8 @@ def generate_fault_tree_with_progress(
         progress_callback=progress_callback,
         part_details=part_details,
     )
+    if part_details:
+        tree_data = apply_physical_refs_to_fault_tree_data(tree_data, part_details)
 
     if progress_callback:
         progress_callback(90, "persistence", "Generation completed, persisting result")
@@ -2293,7 +2407,7 @@ Skeleton constraints:
 6. Every non-top node must have a complete `event` object.
 7. Keep `graphNodeId` and `kg_key` identical to the input skeleton.
 8. `documents` should be filled from the recalled evidence chunks.
-9. Return JSON only.
+9. Return JSON only. 事件节点名称需要是中文的故障现象。
 
 Graph skeleton:
 {json.dumps(skeleton_for_prompt, ensure_ascii=False, indent=2)}

@@ -1,3 +1,139 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class Issue:
+    level: str  # "ERROR" | "WARNING" | "INFO"
+    code: str
+    message: str
+    node_id: Optional[str] = None
+    node_name: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"level": self.level, "code": self.code, "message": self.message}
+        if self.node_id:
+            out["node_id"] = self.node_id
+        if self.node_name:
+            out["node_name"] = self.node_name
+        return out
+
+
+def _str(v: Any) -> str:
+    return str(v) if v is not None else ""
+
+
+def _is_missing(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    return False
+
+
+def validate_full(tree_data: Dict[str, Any], *, skip_semantic: bool = False) -> Dict[str, Any]:
+    """
+    Structural validator used by:
+    - POST /api/tree/validate
+    - POST /api/tree/{tree_id}/save (blocks save when ERROR exists)
+    - generation pipeline post-checks
+
+    IMPORTANT policy:
+    - Missing "soft" event fields should NOT block submission.
+      They are reported as INFO (or specialized INFO codes).
+    """
+    issues: List[Issue] = []
+
+    if not isinstance(tree_data, dict):
+        issues.append(Issue("ERROR", "INVALID_PAYLOAD", "tree_data 必须是对象（dict）"))
+        return {"passed": False, "error_count": 1, "warning_count": 0, "info_count": 0, "issues": [i.to_dict() for i in issues]}
+
+    node_list = tree_data.get("nodeList")
+    link_list = tree_data.get("linkList")
+    if not isinstance(node_list, list) or not isinstance(link_list, list):
+        issues.append(Issue("ERROR", "INVALID_TREE_SHAPE", "缺少 nodeList 或 linkList（必须为数组）"))
+        return {"passed": False, "error_count": 1, "warning_count": 0, "info_count": 0, "issues": [i.to_dict() for i in issues]}
+
+    # Basic node-level checks.
+    id_set = set()
+    for n in node_list:
+        if not isinstance(n, dict):
+            issues.append(Issue("ERROR", "INVALID_NODE", "nodeList 中存在非对象节点"))
+            continue
+        node_id = _str(n.get("id") or "").strip()
+        node_name = _str(n.get("name") or "").strip()
+        node_type = _str(n.get("type") or "").strip()
+        if not node_id:
+            issues.append(Issue("ERROR", "MISSING_NODE_ID", "节点缺少 id"))
+        else:
+            if node_id in id_set:
+                issues.append(Issue("ERROR", "DUPLICATE_NODE_ID", f"节点 id 重复：{node_id}", node_id=node_id, node_name=node_name))
+            id_set.add(node_id)
+
+        if not node_type:
+            issues.append(Issue("ERROR", "MISSING_NODE_TYPE", "节点缺少 type", node_id=node_id or None, node_name=node_name or None))
+        if not node_name:
+            issues.append(Issue("ERROR", "MISSING_NODE_NAME", "节点缺少 name", node_id=node_id or None, node_name=node_name or None))
+
+        # Event checks
+        ev = n.get("event")
+        if node_type == "top_event":
+            if ev is not None:
+                issues.append(Issue("ERROR", "TOP_EVENT_EVENT_NOT_NULL", "顶事件节点的 event 必须为 null", node_id=node_id or None, node_name=node_name or None))
+            continue
+
+        if not isinstance(ev, dict):
+            issues.append(Issue("ERROR", "MISSING_EVENT", "非顶事件节点必须包含 event 对象", node_id=node_id or None, node_name=node_name or None))
+            continue
+
+        # Hard required fields (block submission)
+        hard_fields = ("id", "name")
+        for f in hard_fields:
+            if _is_missing(ev.get(f)):
+                issues.append(Issue("ERROR", "MISSING_EVENT_FIELD", f"event对象缺少字段：{f}", node_id=node_id or None, node_name=node_name or None))
+
+        # Soft fields (do NOT block submission) -> INFO
+        # Keep existing INFO codes used by UI.
+        if _is_missing(ev.get("errorLevel")):
+            issues.append(Issue("INFO", "NO_ERROR_LEVEL", "没有故障等级（errorLevel为空）", node_id=node_id or None, node_name=node_name or None))
+        if not isinstance(ev.get("documents"), list) or len(ev.get("documents") or []) == 0:
+            issues.append(Issue("INFO", "NO_DOCUMENTS", "没有溯源文档（documents为空）", node_id=node_id or None, node_name=node_name or None))
+
+        soft_fields = ("description", "priority", "probability", "showProbability", "investigateMethod", "rules")
+        for f in soft_fields:
+            if f in ("errorLevel", "documents"):
+                continue
+            if ev.get(f) is None:
+                issues.append(Issue("INFO", "MISSING_EVENT_FIELD", f"event对象缺少字段：{f}", node_id=node_id or None, node_name=node_name or None))
+            elif isinstance(ev.get(f), str) and not str(ev.get(f)).strip():
+                issues.append(Issue("INFO", "MISSING_EVENT_FIELD", f"event对象缺少字段：{f}", node_id=node_id or None, node_name=node_name or None))
+
+    # Link checks (basic)
+    for e in link_list:
+        if not isinstance(e, dict):
+            issues.append(Issue("ERROR", "INVALID_LINK", "linkList 中存在非对象边"))
+            continue
+        s = _str(e.get("sourceId") or "").strip()
+        t = _str(e.get("targetId") or "").strip()
+        if not s or not t:
+            issues.append(Issue("ERROR", "MISSING_LINK_ENDPOINT", "连线缺少 sourceId 或 targetId"))
+            continue
+        if s not in id_set or t not in id_set:
+            issues.append(Issue("ERROR", "BROKEN_LINK", "连线指向不存在的节点", node_id=None, node_name=None))
+
+    error_count = sum(1 for i in issues if i.level == "ERROR")
+    warning_count = sum(1 for i in issues if i.level == "WARNING")
+    info_count = sum(1 for i in issues if i.level == "INFO")
+    return {
+        "passed": error_count == 0,
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "info_count": info_count,
+        "issues": [i.to_dict() for i in issues],
+    }
+
 """
 validator.py —— 故障树逻辑校验模块
 
@@ -202,11 +338,28 @@ def validate_structure(tree_data: dict) -> list:
         validation = out.get("validation") or {}
         raw_issues = validation.get("issues") or []
 
+        def _downgrade_level(it: dict) -> str:
+            """
+            validator-service 的部分规则会把“信息不完整”当成 ERROR。
+            但在本系统里这些字段允许为空（不阻断提交），只做 INFO 提示。
+            """
+            level = str(it.get("level") or "WARNING").upper()
+            code = str(it.get("code") or "")
+            msg = str(it.get("message") or "")
+            if code == "MISSING_EVENT_FIELD":
+                # 这些字段缺失不应阻断提交（允许后续人工补齐）
+                soft = ("description", "priority", "probability", "showProbability", "investigateMethod", "rule", "rules")
+                if any(f in msg for f in soft):
+                    return "INFO"
+            if code in ("NO_ERROR_LEVEL", "NO_DOCUMENTS"):
+                return "INFO"
+            return level
+
         issues = []
         for it in raw_issues:
             issues.append(
                 ValidationIssue(
-                    level=(it.get("level") or "WARNING"),
+                    level=_downgrade_level(it),
                     code=(it.get("code") or "STRUCT_ISSUE"),
                     message=(it.get("message") or ""),
                     node_id="",
