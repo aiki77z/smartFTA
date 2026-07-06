@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from env_loader import load_local_env
 from import_relations_to_neo4j import (
     GraphDatabase,
     clear_graph,
@@ -27,6 +28,7 @@ from import_relations_to_neo4j import (
 )
 
 ROOT_DIR = Path(__file__).parent.resolve()
+load_local_env(ROOT_DIR / ".env")
 RUN_SCRIPT = ROOT_DIR / "run.py"
 DEFAULT_GENERATE_FTA_BASE_URL = os.getenv("GENERATE_FTA_BASE_URL", "http://127.0.0.1:8000")
 

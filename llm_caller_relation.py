@@ -4,6 +4,10 @@ import time
 import threading
 from openai import OpenAI
 
+from env_loader import load_local_env
+
+load_local_env()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "qwen3.5-plus")
