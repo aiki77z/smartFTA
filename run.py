@@ -15,6 +15,11 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 SCRIPT_DIR = Path(__file__).parent.absolute()
 
 def run_command(cmd, description):
@@ -97,6 +102,25 @@ def get_latest_version_dir(output_root: Path, file_id: str) -> Path:
     if latest_dir is None:
         raise FileNotFoundError(f"在 {base_dir} 下未找到任何版本目录 (格式: {file_id}_vN)")
     return latest_dir
+
+
+def ensure_skip_mineru_version_dir(output_root: Path, file_id: str) -> Path:
+    """Return latest version dir, or wrap legacy non-PDF markdown output in v1."""
+    try:
+        return get_latest_version_dir(output_root, file_id)
+    except FileNotFoundError:
+        base_dir = output_root / file_id
+        legacy_md = base_dir / f"{file_id}.md"
+        if not legacy_md.exists():
+            raise
+        version_dir = base_dir / f"{file_id}_v1"
+        version_dir.mkdir(parents=True, exist_ok=True)
+        target_md = version_dir / legacy_md.name
+        if not target_md.exists():
+            target_md.write_bytes(legacy_md.read_bytes())
+        print(f"检测到旧版非 PDF Markdown 产物，已使用版本目录: {version_dir}")
+        print(f"VERSION_DIR={version_dir}")
+        return version_dir
 
 def _discover_pdf_stem(import_only_dir: Path, explicit_stem: str | None) -> str:
     if explicit_stem:
@@ -240,8 +264,9 @@ def main():
         else:
             file_id = pdf_stem
         try:
-            version_dir = get_latest_version_dir(output_root, file_id)
+            version_dir = ensure_skip_mineru_version_dir(output_root, file_id)
             print(f"使用最新版本目录: {version_dir}")
+            print(f"VERSION_DIR={version_dir}")
         except FileNotFoundError as e:
             print(f"错误: {e}")
             sys.exit(1)

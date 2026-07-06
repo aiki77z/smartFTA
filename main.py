@@ -202,6 +202,37 @@ def _build_artifacts_for_dir(pdf_stem: str, result_dir: Path) -> Dict[str, str]:
     }
 
 
+def _next_version_dir(output_root: Path, file_id: str) -> Path:
+    base_dir = output_root / file_id
+    max_version = 0
+    if base_dir.exists():
+        prefix = f"{file_id}_v"
+        for item in base_dir.iterdir():
+            if not item.is_dir() or not item.name.startswith(prefix):
+                continue
+            suffix = item.name[len(prefix):]
+            if suffix.isdigit():
+                max_version = max(max_version, int(suffix))
+    return base_dir / f"{file_id}_v{max_version + 1}"
+
+
+def _latest_version_dir(output_root: Path, file_id: str) -> Optional[Path]:
+    base_dir = output_root / file_id
+    if not base_dir.exists():
+        return None
+    latest: Optional[Path] = None
+    max_version = 0
+    prefix = f"{file_id}_v"
+    for item in base_dir.iterdir():
+        if not item.is_dir() or not item.name.startswith(prefix):
+            continue
+        suffix = item.name[len(prefix):]
+        if suffix.isdigit() and int(suffix) > max_version:
+            max_version = int(suffix)
+            latest = item
+    return latest.resolve() if latest else None
+
+
 
 def _resolve_import_display_file_name(request: PipelineJobRequest, pdf_stem: str) -> str:
     explicit = (request.file_name or "").strip()
@@ -456,6 +487,8 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
 
     # 版本化产物：优先使用 run.py 输出的 VERSION_DIR，避免同步阶段找不到 chunks 文件
     version_dir = _extract_version_dir_from_stdout(stdout_text)
+    if not version_dir:
+        version_dir = _latest_version_dir(Path(request.output_dir).expanduser().resolve(), pdf_stem)
     if version_dir:
         artifacts = _build_artifacts_for_dir(pdf_stem, version_dir)
         try:
@@ -672,7 +705,7 @@ async def run_pipeline_job_upload(
     force_skip_mineru = ext in {".txt", ".csv", ".md"}
     if force_skip_mineru:
         try:
-            result_dir = out_root / saved_path.stem
+            result_dir = _next_version_dir(out_root, saved_path.stem)
             result_dir.mkdir(parents=True, exist_ok=True)
             md_path = result_dir / f"{saved_path.stem}.md"
             if ext == ".md":
