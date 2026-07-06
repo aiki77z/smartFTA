@@ -1,10 +1,12 @@
 from typing import Any, Dict, List, Set
 
+import asyncio
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
 import os
+import sys
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -435,8 +437,7 @@ def _resolve_export_url(req: ExportImageRequest) -> str:
   return urljoin(base_url.rstrip('/') + '/', path.lstrip('/'))
 
 
-@app.post('/export-fault-tree-image')
-async def export_fault_tree_image(req: ExportImageRequest) -> Response:
+async def _capture_fault_tree_image(req: ExportImageRequest) -> bytes:
   """
   使用 Headless 浏览器对前端页面进行截图，保留前端真实渲染效果（包括字体）。
 
@@ -533,5 +534,28 @@ async def export_fault_tree_image(req: ExportImageRequest) -> Response:
     await context.close()
     await browser.close()
 
+  return content_png
+
+
+def _capture_fault_tree_image_sync(req: ExportImageRequest) -> bytes:
+  if sys.platform == 'win32':
+    loop = asyncio.ProactorEventLoop()
+    try:
+      asyncio.set_event_loop(loop)
+      return loop.run_until_complete(_capture_fault_tree_image(req))
+    finally:
+      asyncio.set_event_loop(None)
+      loop.close()
+  return asyncio.run(_capture_fault_tree_image(req))
+
+
+@app.post('/export-fault-tree-image')
+async def export_fault_tree_image(req: ExportImageRequest) -> Response:
+  if sys.platform == 'win32':
+    # Uvicorn reload mode can run on SelectorEventLoop on Windows. That loop
+    # cannot spawn subprocesses, while Playwright must spawn Chromium.
+    content_png = await asyncio.to_thread(_capture_fault_tree_image_sync, req)
+  else:
+    content_png = await _capture_fault_tree_image(req)
   return Response(content_png, media_type='image/png')
 
