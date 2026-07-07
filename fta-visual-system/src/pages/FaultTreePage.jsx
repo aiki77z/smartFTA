@@ -75,6 +75,105 @@ const MAX_HIRES_SNAPSHOT_JSON_LEN = 7000
 const AI_ASSIST_STORE_PREFIX = 'fta-ai-assistant:'
 const AI_ASSIST_FILE_PREFIX = 'fta-ai-selected-files:'
 
+function renderAssistantInlineMarkdown(text, keyPrefix) {
+  const source = String(text || '')
+  const parts = []
+  const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g
+  let last = 0
+  let index = 0
+  for (const match of source.matchAll(pattern)) {
+    if (match.index > last) {
+      parts.push(source.slice(last, match.index))
+    }
+    const token = match[0]
+    if (token.startsWith('**')) {
+      parts.push(
+        <strong key={`${keyPrefix}-strong-${index}`}>
+          {token.slice(2, -2)}
+        </strong>,
+      )
+    } else {
+      parts.push(
+        <code key={`${keyPrefix}-code-${index}`}>
+          {token.slice(1, -1)}
+        </code>,
+      )
+    }
+    last = match.index + token.length
+    index += 1
+  }
+  if (last < source.length) {
+    parts.push(source.slice(last))
+  }
+  return parts
+}
+
+function AssistantMarkdownMessage({ content }) {
+  const lines = String(content || '').split(/\r?\n/)
+  const blocks = []
+  let paragraph = []
+  let listItems = []
+  let listType = 'ul'
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return
+    const text = paragraph.join('\n')
+    const key = `p-${blocks.length}`
+    blocks.push(
+      <p key={key}>
+        {renderAssistantInlineMarkdown(text, key)}
+      </p>,
+    )
+    paragraph = []
+  }
+
+  const flushList = () => {
+    if (!listItems.length) return
+    const key = `list-${blocks.length}`
+    const Tag = listType
+    blocks.push(
+      <Tag key={key}>
+        {listItems.map((item, idx) => (
+          <li key={`${key}-${idx}`}>
+            {renderAssistantInlineMarkdown(item, `${key}-${idx}`)}
+          </li>
+        ))}
+      </Tag>,
+    )
+    listItems = []
+  }
+
+  lines.forEach((line) => {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      flushParagraph()
+      flushList()
+      return
+    }
+
+    const unordered = trimmed.match(/^[-*]\s+(.+)$/)
+    const ordered = trimmed.match(/^\d+[.)]\s+(.+)$/)
+    if (unordered || ordered) {
+      flushParagraph()
+      const nextType = unordered ? 'ul' : 'ol'
+      if (listItems.length && listType !== nextType) {
+        flushList()
+      }
+      listType = nextType
+      listItems.push((unordered || ordered)[1])
+      return
+    }
+
+    flushList()
+    paragraph.push(trimmed)
+  })
+
+  flushParagraph()
+  flushList()
+
+  return <div className="fta-assistant-markdown">{blocks}</div>
+}
+
 /** 说明后端约束：当前 FTA-GNR 在排队生成前会校验顶事件必须在选源内图谱/目录可解析（见 _ensure_catalog_entry），非前端列表导致 */
 function formatGenerateBackendError(raw) {
   const s = String(raw || '')
@@ -4888,7 +4987,9 @@ function FaultTreeAssistantPanel({
                           <span className="dot" />
                         </span>
                       ) : null}
-                      <span className="fta-assistant-msg-text">{String(m.content || '')}</span>
+                      <span className="fta-assistant-msg-text">
+                        <AssistantMarkdownMessage content={m.content} />
+                      </span>
                     </div>
                   </div>
                 )}
