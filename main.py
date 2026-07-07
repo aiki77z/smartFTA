@@ -26,6 +26,7 @@ from import_relations_to_neo4j import (
     import_rows,
     load_json,
 )
+from maintenance_cases import import_maintenance_cases
 
 ROOT_DIR = Path(__file__).parent.resolve()
 load_local_env(ROOT_DIR / ".env")
@@ -91,6 +92,16 @@ class Neo4jImportRequest(BaseModel):
     database: str = Field("neo4j", description="Neo4j 数据库")
     batch_size: int = Field(200, ge=1, le=5000)
     clear: bool = False
+
+
+class MaintenanceImportRequest(BaseModel):
+    input_path: str = Field(..., description="维修记录文件路径，支持 md/txt/docx/pdf")
+    output_dir: str = Field("./output", description="输出目录")
+    case_id_prefix: str = Field("case", description="维修案例编号前缀")
+    max_summary_chars: int = Field(800, ge=120, le=4000)
+    skip_entity: bool = False
+    skip_relation: bool = False
+    print_raw_text: bool = False
 
 
 
@@ -546,6 +557,7 @@ def root():
         "endpoints": {
             "run_pipeline": "/api/kb/jobs/run",
             "run_upload": "/api/kb/jobs/run-upload",
+            "import_maintenance_cases": "/api/knowledge/import-maintenance-cases",
             "get_job": "/api/kb/jobs/{job_id}",
             "import_relations_to_neo4j": "/api/kb/neo4j/import",
         },
@@ -559,6 +571,40 @@ def root():
                 "也支持 import_only_dir 模式直接复用已有产物后同步到 generate-fta",
             ],
         },
+    }
+
+
+@app.post("/api/knowledge/import-maintenance-cases")
+def import_maintenance_cases_api(request: MaintenanceImportRequest):
+    input_path = Path(request.input_path).expanduser().resolve()
+    if not input_path.exists():
+        raise HTTPException(status_code=400, detail=f"维修记录文件不存在: {input_path}")
+
+    try:
+        result = import_maintenance_cases(
+            str(input_path),
+            output_dir=request.output_dir,
+            case_id_prefix=request.case_id_prefix,
+            max_summary_chars=request.max_summary_chars,
+            skip_entity=request.skip_entity,
+            skip_relation=request.skip_relation,
+            print_raw_text=request.print_raw_text,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("import maintenance cases failed path=%s err=%s", input_path, exc)
+        raise HTTPException(status_code=500, detail=f"维修记录导入失败: {exc}")
+
+    return {
+        "status": "success",
+        "source_type": "maintenance_record",
+        "chunk_type": "case_summary",
+        "skip_entity": request.skip_entity,
+        "skip_relation": request.skip_relation,
+        **result,
     }
 
 
