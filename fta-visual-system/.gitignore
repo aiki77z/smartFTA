@@ -50,3 +50,4 @@ public/demo/*
 fta-ai-service/.venv/
 fta-ai-service/.env
 fta-ai-service/app/__pycache__/
+fta-ai-service/app/data/

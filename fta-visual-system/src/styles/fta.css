@@ -1,7 +1,7 @@
 @font-face {
-  font-family: 'jyhphy';
-  src: url('/font/jyhphy.ttf') format('truetype');
-  font-weight: normal;
+  font-family: 'HanYiZhongYuanJian';
+  src: url('/font/HanYiZhongYuanJian-1.ttf') format('truetype');
+  font-weight: 400 700;
   font-style: normal;
   font-display: swap;
 }
@@ -145,7 +145,7 @@
   box-sizing: border-box;
   background: var(--fta-bg);
   color: var(--fta-text-main);
-  font-family: 'jyhphy', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'HanYiZhongYuanJian', 'Segoe UI', system-ui, -apple-system, sans-serif;
 }
 
 /* ── Header ── */
@@ -1186,7 +1186,7 @@
   text-align: right;
   color: var(--fta-text-main);
   word-break: break-all;
-  font-family: 'jyhphy', system-ui, -apple-system, BlinkMacSystemFont,
+  font-family: 'HanYiZhongYuanJian', system-ui, -apple-system, BlinkMacSystemFont,
     'Segoe UI', sans-serif;
 }
 
@@ -2702,7 +2702,7 @@
   min-width: 320px;
   min-height: 220px;
   max-width: 80vw;
-  font-family: 'jyhphy', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'HanYiZhongYuanJian', 'Segoe UI', system-ui, -apple-system, sans-serif;
 }
 
 .fta-ai-anchor {
@@ -2837,7 +2837,7 @@
   background: #f9fafb;
   border-radius: 0.5rem;
   border: 1px solid var(--fta-border);
-  font-family: 'jyhphy', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'HanYiZhongYuanJian', 'Segoe UI', system-ui, -apple-system, sans-serif;
   font-size: 13px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -2993,7 +2993,7 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  font-family: 'jyhphy', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'HanYiZhongYuanJian', 'Segoe UI', system-ui, -apple-system, sans-serif;
 }
 
 .fta-layout--dark .fta-assistant-panel {

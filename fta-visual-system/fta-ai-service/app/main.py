@@ -361,7 +361,7 @@ def _call_llm_edit(instruction: str, tree_json: Any, selected_files: List[Select
     return parsed
 
 
-app = FastAPI(title="FTA AI Editor Service", version="0.1.0")
+app = FastAPI(title="FTA AI Assistant Service", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -374,7 +374,26 @@ app.add_middleware(
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "service": "fta-ai-assistant",
+        "version": "0.2.0",
+        "legacy_editor_endpoint": "/api/fta-edit",
+        "assistant_endpoint": "/api/assistant/message",
+    }
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "FTA AI Assistant Service",
+        "version": "0.2.0",
+        "endpoints": {
+            "legacy_edit": "/api/fta-edit",
+            "assistant_message": "/api/assistant/message",
+            "assistant_session": "/api/assistant/session/{session_id}",
+        },
+    }
 
 
 @app.post("/api/fta-edit", response_model=EditResponse)
@@ -396,4 +415,55 @@ def fta_edit(req: EditRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# AssistantAgent endpoints. They are added alongside the legacy editor endpoint
+# so the current frontend can keep using /api/fta-edit during migration.
+from app.agents.assistant_agent import assistant_agent  # noqa: E402
+from app.memory.session_store import session_store  # noqa: E402
+from app.schemas import (  # noqa: E402
+    AssistantMessageRequest,
+    AssistantMessageResponse,
+    AssistantSessionResponse,
+    AssistantTruncateRequest,
+    AssistantTruncateResponse,
+)
+
+
+@app.post("/api/assistant/message", response_model=AssistantMessageResponse)
+def assistant_message(req: AssistantMessageRequest):
+    try:
+        return assistant_agent.handle_message(req)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/assistant/session/{session_id}", response_model=AssistantSessionResponse)
+def assistant_session(session_id: str):
+    return AssistantSessionResponse(
+        session_id=session_id,
+        memory=session_store.get_session(session_id),
+        messages=session_store.list_messages(session_id),
+        pending_actions=session_store.list_pending_actions(session_id),
+        messages_path=session_store.session_messages_path(session_id),
+    )
+
+
+@app.post("/api/assistant/session/{session_id}/truncate", response_model=AssistantTruncateResponse)
+def assistant_truncate_session(session_id: str, req: AssistantTruncateRequest):
+    result = session_store.truncate_messages(
+        session_id,
+        frontend_message_id=req.frontend_message_id,
+        keep_before_index=req.keep_before_index,
+    )
+    return AssistantTruncateResponse(
+        session_id=session_id,
+        removed_count=result["removed_count"],
+        remaining_count=result["remaining_count"],
+        messages_path=session_store.session_messages_path(session_id),
+    )
 

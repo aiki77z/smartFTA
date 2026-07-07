@@ -24,7 +24,7 @@ import {
   validateTreeSemantic,
   getChunk,
 } from '../api/ftaBackend.js'
-import { editFaultTreeWithAi } from '../api/ftaAiEditor.js'
+import { editFaultTreeWithAi, sendAssistantAgentMessage, truncateAssistantSession } from '../api/ftaAiEditor.js'
 import {
   parseRawFtaJson,
   parseTreeDataJson,
@@ -1487,7 +1487,7 @@ function FaultTreePage() {
   }, [])
 
   const runGenerateTaskFromEmptyCanvas = useCallback(
-    async (prompt) => {
+    async (prompt, options = {}) => {
       const now = Date.now()
       const taskId = `task-${now}-${Math.random().toString(36).slice(2, 9)}`
       const promptPreview = prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt
@@ -1780,7 +1780,7 @@ function FaultTreePage() {
 
       let resp
       try {
-        resp = await doGenerate()
+        resp = options?.initialResponse ? normalizeGenerateResponse(options.initialResponse) : await doGenerate()
       } catch (e) {
         const msg = formatGenerateBackendError(e?.message || String(e))
         setAssistantTasks((prev) =>
@@ -1888,6 +1888,8 @@ function FaultTreePage() {
     if (!text) return
     const now = Date.now()
     const wasEmptyCanvas = graphData.nodes.length === 0
+    const textLooksLikeGenerate = /生成|构建|新建|重新生成|重建|画一棵|创建|generate|create/i.test(text)
+    const textLooksLikeHelp = /你好|您好|介绍一下|你能做什么|能做什么|帮助|怎么用|怎么说|如何表达|示例|例子|举例|模板|格式|hello|hi|help/i.test(text)
 
     const wsEpoch =
       projectIdFromQuery ? Number(getWorkspace(projectIdFromQuery)?.kbDatasetEpoch) || 0 : 0
@@ -1942,17 +1944,169 @@ function FaultTreePage() {
         id: thinkingMsgId,
         role: 'assistant',
         kind: 'thinking',
-        content: wasEmptyCanvas
-          ? '正在生成故障树…'
-          : mustUseGeneratePipeline
-            ? '正在根据知识库变更重新生成故障树…'
-            : '正在修改故障树…',
+        content: '正在理解你的请求…',
         at: Date.now(),
       },
     ])
     try {
+      const selectedFilesForAgent = (selectedSourceFiles || []).map((id) => {
+        const f =
+          assistantEligibleFiles.find((x) => String(x.id) === String(id)) ||
+          projectFiles.find((x) => String(x.id) === String(id))
+        return { id, name: f?.name || id, file_version_id: f?.fileVersionId || f?.file_version_id || '' }
+      })
+      const baselineFileVersionIdsForAgent = baselineFvSig
+        ? baselineFvSig.split('|').map((s) => String(s || '').trim()).filter(Boolean)
+        : []
+      let assistantAgentResp = null
+      try {
+        assistantAgentResp = await sendAssistantAgentMessage({
+          sessionId: assistantStoreKey,
+          projectId: projectIdFromQuery,
+          canvasId: canvasIdFromQuery || treeIdFromQuery || backendTreeId || '',
+          message: text,
+          currentTree: safeJsonParse(rawJsonText, graphData),
+          currentTreeId: backendTreeId || treeIdFromQuery || '',
+          selectedFileVersionIds: selectedFileVersionIdsForAssistant,
+          baselineFileVersionIds: baselineFileVersionIdsForAgent,
+          selectedFiles: selectedFilesForAgent,
+          workspaceKbEpoch: wsEpoch,
+          forceGenerate: mustUseGeneratePipeline,
+          frontendMessageId: userMsg.id,
+          frontendContext: {
+            wasEmptyCanvas,
+            mustUseGeneratePipeline,
+            requireGenerateViaGenerate: requireGenerateViaGenerateRef.current,
+            hasPending: Boolean(assistantPending),
+          },
+        })
+      } catch (agentErr) {
+        console.warn('AssistantAgent unavailable, falling back to legacy keyword route:', agentErr)
+      }
+
+      if (assistantAgentResp) {
+        const action = String(assistantAgentResp.action || '')
+        const intent = String(assistantAgentResp.intent || '')
+        if (action === 'chat' || action === 'need_source_files' || action === 'validation_finished' || action === 'need_current_tree') {
+          setAssistantMessages((prev) =>
+            prev
+              .filter((m) => m.id !== thinkingMsgId)
+              .concat({
+                id: `a-${Date.now()}`,
+                role: 'assistant',
+                kind: action === 'validation_finished' ? 'patch' : 'text',
+                content: assistantAgentResp.assistant_message || 'AssistantAgent 已处理请求。',
+                at: Date.now(),
+              })
+              .slice(-320),
+          )
+          return
+        }
+
+        if (intent === 'generate_tree' || intent === 'regenerate_tree' || action.startsWith('generation_') || action === 'need_top_event_confirmation') {
+          if (mustUseGeneratePipeline) requireGenerateViaGenerateRef.current = false
+          const gen = await runGenerateTaskFromEmptyCanvas(text, { initialResponse: assistantAgentResp.result || {} })
+          setAssistantMessages((prev) =>
+            prev.filter((m) => m.id !== thinkingMsgId).concat({
+              id: `a-${Date.now()}`,
+              role: 'assistant',
+              kind: 'text',
+              content: gen?.needConfirmation
+                ? 'AssistantAgent 已找到多个相似顶事件候选。请在上方进度卡片下方选择一个候选，以继续生成。'
+                : gen?.treeId
+                  ? assistantAgentResp.assistant_message || `已生成故障树并加载到画布（tree_id=${gen.treeId}）。`
+                  : `生成失败：${gen?.error || '未知错误'}`,
+              at: Date.now(),
+            }),
+          )
+          if (gen?.needConfirmation) {
+            if (mustUseGeneratePipeline) requireGenerateViaGenerateRef.current = true
+            return
+          }
+          if (gen?.treeId) {
+            setAssistantPending({
+              kind: 'generate',
+              backendTreeId: gen.treeId,
+              deleteOnUndo: gen.reuse !== true,
+              prev: { graphData: preGraph, rawJsonText: preRaw },
+            })
+            kbSyncedBaselineEpochRef.current = wsEpoch
+            kbSyncedBaselineFvSigRef.current = currentFvSig
+            requireGenerateViaGenerateRef.current = false
+          } else if (mustUseGeneratePipeline) {
+            requireGenerateViaGenerateRef.current = true
+          }
+          return
+        }
+
+        if (action === 'edit_draft_created') {
+          const prevGraph = graphData
+          const prevRaw = rawJsonText
+          const updated = assistantAgentResp?.result?.updated_tree_json
+          if (!updated) throw new Error('AssistantAgent 未返回 updated_tree_json')
+
+          const nextGraph = normalizeToGraph(updated)
+          const diff = computeGraphDiff(prevGraph, nextGraph)
+          const { pendingGraph: decorated, finalGraph } = buildPendingAiEditGraph(
+            prevGraph,
+            nextGraph,
+            diff,
+          )
+
+          applyEdit(decorated)
+          setAssistantPending({
+            kind: 'edit',
+            prev: { graphData: prevGraph, rawJsonText: prevRaw },
+            finalGraph,
+            diff,
+            at: Date.now(),
+            pendingId: assistantAgentResp?.pending_action?.pending_id || '',
+          })
+
+          const snap = {
+            id: `s-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            at: Date.now(),
+            title: text.length > 26 ? `${text.slice(0, 26)}…` : text,
+            graphData: decorated,
+            rawJsonText: prevRaw,
+          }
+          setAssistantSnapshots((prev) => [...prev, snap].slice(-120))
+
+          const diffText = `新增 ${diff.added.length} · 修改 ${diff.modified.length} · 删除 ${diff.removed.length}`
+          setAssistantMessages((prev) =>
+            prev
+              .filter((m) => m.id !== thinkingMsgId)
+              .concat({
+                id: `a-${Date.now()}`,
+                role: 'assistant',
+                kind: 'patch',
+                content: `${assistantAgentResp.assistant_message || diffText}\n已在画布中标注：新增的节点为绿色、修改的节点为黄色、删除的节点为红色。`,
+                at: Date.now(),
+                snapshotId: snap.id,
+                diff,
+              })
+              .slice(-320),
+          )
+          return
+        }
+
+        setAssistantMessages((prev) =>
+          prev
+            .filter((m) => m.id !== thinkingMsgId)
+            .concat({
+              id: `a-${Date.now()}`,
+              role: 'assistant',
+              kind: 'text',
+              content: assistantAgentResp.assistant_message || 'AssistantAgent 已处理请求。',
+              at: Date.now(),
+            })
+            .slice(-320),
+        )
+        return
+      }
+
       // 规则：如果当前画布为空 => 视为“生成一棵故障树”的任务（走 FTA-Latest 并生成任务/进度/泳道图）
-      if (wasEmptyCanvas) {
+      if (wasEmptyCanvas && textLooksLikeGenerate && !textLooksLikeHelp) {
         const gen = await runGenerateTaskFromEmptyCanvas(text)
         setAssistantMessages((prev) =>
           prev.filter((m) => m.id !== thinkingMsgId).concat({
@@ -1982,6 +2136,23 @@ function FaultTreePage() {
           kbSyncedBaselineFvSigRef.current = currentFvSig
           requireGenerateViaGenerateRef.current = false
         }
+        return
+      }
+
+      if (wasEmptyCanvas) {
+        setAssistantMessages((prev) =>
+          prev
+            .filter((m) => m.id !== thinkingMsgId)
+            .concat({
+              id: `a-${Date.now()}`,
+              role: 'assistant',
+              kind: 'text',
+              content:
+                '当前画布还没有故障树。我可以帮你生成、编辑、校验故障树，也可以解释如何描述生成需求。要开始生成时，请明确说“为某个顶事件生成故障树”。',
+              at: Date.now(),
+            })
+            .slice(-320),
+        )
         return
       }
 
@@ -2107,6 +2278,12 @@ function FaultTreePage() {
     selectedSourceFiles,
     projectFiles,
     assistantEligibleFiles,
+    selectedFileVersionIdsForAssistant,
+    assistantStoreKey,
+    canvasIdFromQuery,
+    treeIdFromQuery,
+    backendTreeId,
+    assistantPending,
     applyEdit,
     projectIdFromQuery,
   ])
@@ -2161,10 +2338,19 @@ function FaultTreePage() {
 
   /** 回溯到某条用户消息之前：恢复画布、截断后续对话、原文填入输入框 */
   const handleRollbackUserMessage = useCallback(
-    (userMsgId) => {
+    async (userMsgId) => {
       const idx = assistantMessages.findIndex((m) => m.id === userMsgId)
       if (idx < 0) return
       const msg = assistantMessages[idx]
+      try {
+        await truncateAssistantSession({
+          sessionId: assistantStoreKey,
+          frontendMessageId: userMsgId,
+          keepBeforeIndex: idx,
+        })
+      } catch (err) {
+        console.warn('truncate AssistantAgent session failed:', err)
+      }
       const snapId = msg.rollbackSnapshotId
       if (snapId) {
         const snap = assistantSnapshots.find((s) => s.id === snapId)
@@ -2174,7 +2360,7 @@ function FaultTreePage() {
       setAssistantPending(null)
       setAssistantMessages((prev) => prev.slice(0, idx))
     },
-    [assistantMessages, assistantSnapshots, restoreSnapshot],
+    [assistantMessages, assistantSnapshots, restoreSnapshot, assistantStoreKey],
   )
 
   // 手动触发“逻辑校验”（规则引擎，来自 validator-service `/validate-fault-tree`）
