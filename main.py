@@ -27,6 +27,7 @@ from import_relations_to_neo4j import (
     load_json,
 )
 from maintenance_cases import import_maintenance_cases
+from work_order_import import import_work_order_file, profile_work_order_file
 
 ROOT_DIR = Path(__file__).parent.resolve()
 load_local_env(ROOT_DIR / ".env")
@@ -82,6 +83,26 @@ class PipelineJobRequest(BaseModel):
         None,
         description="显式传给 GNR 的 file_version_id，需与 chunks/relations 产物一致",
     )
+    source_type: str = Field(
+        "manual_document",
+        description="来源业务类型，如 manual_document / standard_document",
+    )
+    file_format: Optional[str] = Field(
+        None,
+        description="原始输入文件格式；不传时由 run.py 根据输入文件推断",
+    )
+    chunk_type: str = Field(
+        "document_section",
+        description="chunk 内容类型；阶段0文档链路默认 document_section",
+    )
+    source_record_type: Optional[str] = Field(
+        None,
+        description="原始记录类型，文档类通常为空",
+    )
+    source_record_id: Optional[str] = Field(
+        None,
+        description="原始记录 ID，文档类通常为空",
+    )
 
 
 class Neo4jImportRequest(BaseModel):
@@ -95,7 +116,7 @@ class Neo4jImportRequest(BaseModel):
 
 
 class MaintenanceImportRequest(BaseModel):
-    input_path: str = Field(..., description="维修记录文件路径，支持 md/txt/docx/pdf")
+    input_path: str = Field(..., description="维修记录文件路径，支持 md/txt/docx/pdf/csv")
     output_dir: str = Field("./output", description="输出目录")
     case_id_prefix: str = Field("case", description="维修案例编号前缀")
     max_summary_chars: int = Field(800, ge=120, le=4000)
@@ -213,6 +234,37 @@ def _build_artifacts_for_dir(pdf_stem: str, result_dir: Path) -> Dict[str, str]:
     }
 
 
+def _next_version_dir(output_root: Path, file_id: str) -> Path:
+    base_dir = output_root / file_id
+    max_version = 0
+    if base_dir.exists():
+        prefix = f"{file_id}_v"
+        for item in base_dir.iterdir():
+            if not item.is_dir() or not item.name.startswith(prefix):
+                continue
+            suffix = item.name[len(prefix):]
+            if suffix.isdigit():
+                max_version = max(max_version, int(suffix))
+    return base_dir / f"{file_id}_v{max_version + 1}"
+
+
+def _latest_version_dir(output_root: Path, file_id: str) -> Optional[Path]:
+    base_dir = output_root / file_id
+    if not base_dir.exists():
+        return None
+    latest: Optional[Path] = None
+    max_version = 0
+    prefix = f"{file_id}_v"
+    for item in base_dir.iterdir():
+        if not item.is_dir() or not item.name.startswith(prefix):
+            continue
+        suffix = item.name[len(prefix):]
+        if suffix.isdigit() and int(suffix) > max_version:
+            max_version = int(suffix)
+            latest = item
+    return latest.resolve() if latest else None
+
+
 
 def _resolve_import_display_file_name(request: PipelineJobRequest, pdf_stem: str) -> str:
     explicit = (request.file_name or "").strip()
@@ -304,6 +356,30 @@ def _post_generate_fta_import(
         raise RuntimeError(f"无法连接 generate-fta 服务: {exc}") from exc
 
 
+def _post_generate_fta_artifacts(
+    *,
+    base_url: str,
+    payload: Dict[str, object],
+) -> Dict[str, object]:
+    endpoint = base_url.rstrip("/") + "/api/integration/import-knowledge-artifacts"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib_request.Request(
+        endpoint,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=300) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {"status": "success"}
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"generate-fta 导入接口返回 {exc.code}: {detail}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"无法连接 generate-fta 服务: {exc}") from exc
+
+
 
 def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
     pdf_stem = _resolve_pdf_stem(request.pdf_path, request.pdf_stem, request.import_only_dir)
@@ -331,6 +407,16 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
         cmd.append("--skip-relation")
     if request.print_raw_text:
         cmd.append("--print-raw-text")
+    if request.source_type:
+        cmd.extend(["--source-type", request.source_type])
+    if request.file_format:
+        cmd.extend(["--file-format", request.file_format])
+    if request.chunk_type:
+        cmd.extend(["--chunk-type", request.chunk_type])
+    if request.source_record_type:
+        cmd.extend(["--source-record-type", request.source_record_type])
+    if request.source_record_id:
+        cmd.extend(["--source-record-id", request.source_record_id])
 
     _set_job(
         job_id,
@@ -467,6 +553,8 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
 
     # 版本化产物：优先使用 run.py 输出的 VERSION_DIR，避免同步阶段找不到 chunks 文件
     version_dir = _extract_version_dir_from_stdout(stdout_text)
+    if not version_dir:
+        version_dir = _latest_version_dir(Path(request.output_dir).expanduser().resolve(), pdf_stem)
     if version_dir:
         artifacts = _build_artifacts_for_dir(pdf_stem, version_dir)
         try:
@@ -560,6 +648,8 @@ def root():
             "import_maintenance_cases": "/api/knowledge/import-maintenance-cases",
             "get_job": "/api/kb/jobs/{job_id}",
             "import_relations_to_neo4j": "/api/kb/neo4j/import",
+            "profile_work_orders": "/api/knowledge/profile",
+            "import_work_orders": "/api/knowledge/import-work-orders",
         },
         "downstream": {
             "generate_fta_repo": "D:\\fwwb\\fault_tree_system",
@@ -685,6 +775,11 @@ async def run_pipeline_job_upload(
     generate_fta_base_url: str = Form(DEFAULT_GENERATE_FTA_BASE_URL),
     # 默认不清空图谱：GNR 版本化知识库模式禁止 clear_graph=true
     clear_graph_before_import: bool = Form(False),
+    source_type: str = Form("manual_document"),
+    file_format: Optional[str] = Form(None),
+    chunk_type: str = Form("document_section"),
+    source_record_type: Optional[str] = Form(None),
+    source_record_id: Optional[str] = Form(None),
 ):
     """
     兼容前端上传模式（multipart/form-data）：
@@ -718,7 +813,7 @@ async def run_pipeline_job_upload(
     force_skip_mineru = ext in {".txt", ".csv", ".md"}
     if force_skip_mineru:
         try:
-            result_dir = out_root / saved_path.stem
+            result_dir = _next_version_dir(out_root, saved_path.stem)
             result_dir.mkdir(parents=True, exist_ok=True)
             md_path = result_dir / f"{saved_path.stem}.md"
             if ext == ".md":
@@ -749,6 +844,11 @@ async def run_pipeline_job_upload(
         generate_fta_base_url=str(generate_fta_base_url or DEFAULT_GENERATE_FTA_BASE_URL),
         clear_graph_before_import=bool(clear_graph_before_import),
         file_name=safe_name,
+        source_type=str(source_type or "manual_document"),
+        file_format=str(file_format).strip() if file_format is not None and str(file_format).strip() else None,
+        chunk_type=str(chunk_type or "document_section"),
+        source_record_type=str(source_record_type).strip() if source_record_type is not None and str(source_record_type).strip() else None,
+        source_record_id=str(source_record_id).strip() if source_record_id is not None and str(source_record_id).strip() else None,
     )
     resp = run_pipeline_job(req)
     try:
@@ -758,6 +858,118 @@ async def run_pipeline_job_upload(
     except Exception:
         pass
     return resp
+
+
+def _parse_field_mapping_json(field_mapping_json: Optional[str]) -> Dict[str, str]:
+    raw = str(field_mapping_json or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"field_mapping_json 不是合法 JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="field_mapping_json 必须是 JSON 对象")
+    normalized: Dict[str, str] = {}
+    for key, value in data.items():
+        k = str(key or "").strip()
+        v = str(value or "").strip()
+        if k and v:
+            normalized[k] = v
+    return normalized
+
+
+@app.post("/api/knowledge/profile")
+async def profile_work_orders(
+    file: UploadFile = File(...),
+    output_dir: str = Form("./output"),
+):
+    name = (file.filename or "upload.bin").strip()
+    safe_name = "".join([c for c in name if c not in '\\/:*?"<>|']) or "upload.bin"
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in {".csv", ".xlsx"}:
+        raise HTTPException(status_code=400, detail="工单画像目前仅支持 csv / xlsx")
+
+    out_root = Path(output_dir).expanduser().resolve()
+    upload_dir = out_root / "_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = upload_dir / f"{Path(safe_name).stem}_{uuid.uuid4().hex[:8]}{suffix}"
+
+    try:
+        content = await file.read()
+        saved_path.write_bytes(content)
+        profile = profile_work_order_file(saved_path)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"工单画像失败: {exc}") from exc
+
+    return {
+        "status": "success",
+        "file_path": str(saved_path),
+        **profile,
+    }
+
+
+@app.post("/api/knowledge/import-work-orders")
+async def import_work_orders(
+    file: UploadFile = File(...),
+    output_dir: str = Form("./output"),
+    file_id: Optional[str] = Form(None),
+    field_mapping_json: Optional[str] = Form(None),
+    sync_to_generate_fta: bool = Form(False),
+    generate_fta_base_url: str = Form(DEFAULT_GENERATE_FTA_BASE_URL),
+    clear_graph_before_import: bool = Form(False),
+):
+    name = (file.filename or "upload.bin").strip()
+    safe_name = "".join([c for c in name if c not in '\\/:*?"<>|']) or "upload.bin"
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in {".csv", ".xlsx"}:
+        raise HTTPException(status_code=400, detail="工单导入目前仅支持 csv / xlsx")
+
+    out_root = Path(output_dir).expanduser().resolve()
+    upload_dir = out_root / "_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = upload_dir / f"{Path(safe_name).stem}_{uuid.uuid4().hex[:8]}{suffix}"
+
+    try:
+        content = await file.read()
+        saved_path.write_bytes(content)
+        field_mapping = _parse_field_mapping_json(field_mapping_json)
+        result = import_work_order_file(
+            saved_path,
+            output_dir=str(out_root),
+            file_id=(str(file_id).strip() if file_id else None),
+            field_mapping=field_mapping,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"工单导入失败: {exc}") from exc
+
+    if sync_to_generate_fta:
+        payload = {
+            "chunks_file": result["artifacts"]["chunks_json"],
+            "entities_file": result["artifacts"]["entities_merged_json"],
+            "relations_file": result["artifacts"]["relations_jsonl"],
+            "clear_graph": bool(clear_graph_before_import),
+            "import_relations": True,
+            "source": "knowledge_base_construction:work_order_import",
+            "file_id": result["file"]["file_id"],
+            "file_name": result["file"]["file_name"],
+            "file_version_id": result["file"]["file_version_id"],
+        }
+        try:
+            sync_response = _post_generate_fta_artifacts(
+                base_url=generate_fta_base_url,
+                payload=payload,
+            )
+            result["sync_response"] = sync_response
+        except Exception as exc:
+            result["sync_error"] = str(exc)
+            result["status"] = "completed_with_sync_error"
+
+    return result
 
 
 @app.get("/api/kb/jobs/{job_id}/download")

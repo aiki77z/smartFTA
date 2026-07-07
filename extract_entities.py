@@ -16,6 +16,17 @@ ALLOWED_ENTITY_TYPES = {"故障原因与现象", "逻辑与"}
 
 write_lock = threading.Lock()
 
+
+def extract_chunk_common_fields(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source_type": str(chunk.get("source_type") or "").strip() or None,
+        "file_format": str(chunk.get("file_format") or "").strip() or None,
+        "chunk_type": str(chunk.get("chunk_type") or "").strip() or None,
+        "source_record_type": str(chunk.get("source_record_type") or "").strip() or None,
+        "source_record_id": str(chunk.get("source_record_id") or "").strip() or None,
+    }
+
+
 def standardize_entity_name(name: str) -> str:
     # ... 原有代码保持不变 ...
     if not name:
@@ -93,6 +104,7 @@ def parse_entities(text: str, chunk: Dict) -> List[Dict]:
 
         fid = str(chunk.get("file_id") or "").strip()
         fvid = str(chunk.get("file_version_id") or "").strip()
+        common_fields = extract_chunk_common_fields(chunk)
         entity_obj = {
             "name": name,
             "entity_type": entity_type,
@@ -114,6 +126,7 @@ def parse_entities(text: str, chunk: Dict) -> List[Dict]:
             "file_version_id": fvid,
             "is_active": bool(chunk.get("is_active", True)),
         }
+        entity_obj.update(common_fields)
         valid_entities.append(entity_obj)
         seen_names.add(name)
 
@@ -190,6 +203,7 @@ def process_single_chunk(chunk: Dict, print_raw_text: bool, write_lock, output_f
         "content": content,
         "entities": entities
     }
+    result.update(extract_chunk_common_fields(chunk))
 
     with write_lock:
         with open(output_file, "a", encoding="utf-8") as f:
@@ -377,6 +391,11 @@ def merge_entities(entities_results: List[Dict], output_file: str, max_workers: 
                 "file_id": str(entity.get("file_id") or "").strip(),
                 "file_version_id": str(entity.get("file_version_id") or "").strip(),
                 "is_active": bool(entity.get("is_active", True)),
+                "source_type": str(entity.get("source_type") or "").strip() or None,
+                "file_format": str(entity.get("file_format") or "").strip() or None,
+                "chunk_type": str(entity.get("chunk_type") or "").strip() or None,
+                "source_record_type": str(entity.get("source_record_type") or "").strip() or None,
+                "source_record_id": str(entity.get("source_record_id") or "").strip() or None,
             }
             name_to_instances[name].append(instance)
 
@@ -487,6 +506,11 @@ def merge_entities(entities_results: List[Dict], output_file: str, max_workers: 
             "file_id": _fid,
             "file_version_id": _fvid,
             "is_active": bool(first.get("is_active", True)),
+            "source_type": str(first.get("source_type") or "").strip() or None,
+            "file_format": str(first.get("file_format") or "").strip() or None,
+            "chunk_type": str(first.get("chunk_type") or "").strip() or None,
+            "source_record_type": str(first.get("source_record_type") or "").strip() or None,
+            "source_record_id": str(first.get("source_record_id") or "").strip() or None,
         }
         merged_entities.append(merged_entity)
 
