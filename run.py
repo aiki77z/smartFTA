@@ -22,6 +22,16 @@ if hasattr(sys.stderr, "reconfigure"):
 
 SCRIPT_DIR = Path(__file__).parent.absolute()
 
+
+def infer_file_format(input_path: Path) -> str:
+    ext = input_path.suffix.lower().lstrip(".")
+    if ext == "markdown":
+        return "md"
+    if not ext:
+        return "txt"
+    return ext
+
+
 def run_command(cmd, description):
     """执行 shell 命令，安全处理 UTF-8 输出，并记录耗时。返回 subprocess.CompletedProcess。"""
     start = time.time()
@@ -190,6 +200,24 @@ def main():
     parser.add_argument("--skip-relation", action="store_true", help="跳过关系统取（只执行到实体合并）")
     parser.add_argument("--print-raw-text", action="store_true", help="打印 LLM 返回的原始文本（用于调试）")
     parser.add_argument("--import-only-dir", help="直接从此目录复用已有的 chunks/实体/关系产物，跳过所有生成步骤")
+    parser.add_argument(
+        "--source-type",
+        default="manual_document",
+        choices=["manual_document", "standard_document", "work_order", "maintenance_record", "time_series_event"],
+        help="业务来源类型；阶段0文档链路默认 manual_document",
+    )
+    parser.add_argument(
+        "--file-format",
+        help="显式指定原始输入文件格式；未传时根据输入文件扩展名推断",
+    )
+    parser.add_argument(
+        "--chunk-type",
+        default="document_section",
+        choices=["document_section", "table_row_summary", "case_summary", "sensor_event_summary"],
+        help="chunk 内容类型；阶段0文档链路默认 document_section",
+    )
+    parser.add_argument("--source-record-type", help="原始记录类型，文档类默认留空")
+    parser.add_argument("--source-record-id", help="原始记录ID，文档类默认留空")
     args = parser.parse_args()
 
     if args.import_only_dir:
@@ -209,6 +237,7 @@ def main():
     output_root.mkdir(parents=True, exist_ok=True)
 
     pdf_stem = pdf_path.stem
+    file_format = (args.file_format or infer_file_format(pdf_path)).strip().lower()
 
     # === 整个流水线开始时间 ===
     pipeline_start = time.time()
@@ -320,7 +349,14 @@ def main():
         "--chunk_size", str(args.chunk_size),
         "--file_id", pdf_stem,
         "--file_version_id", file_version_id,
+        "--source_type", args.source_type,
+        "--file_format", file_format,
+        "--chunk_type", args.chunk_type,
     ]
+    if args.source_record_type:
+        cmd_chunk.extend(["--source_record_type", str(args.source_record_type)])
+    if args.source_record_id:
+        cmd_chunk.extend(["--source_record_id", str(args.source_record_id)])
     run_command(cmd_chunk, "文档分块")
     print(f"分块结果保存至: {chunks_json}")
 

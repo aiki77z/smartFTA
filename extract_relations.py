@@ -12,6 +12,17 @@ from collections import defaultdict
 from generate_prompt_relation import generate_relation_prompt_and_context_second
 from llm_caller_relation import call_llm, reset_token_usage, get_token_usage
 
+
+def extract_chunk_common_fields(chunk: Dict) -> Dict:
+    return {
+        "source_type": str(chunk.get("source_type") or "").strip() or None,
+        "file_format": str(chunk.get("file_format") or "").strip() or None,
+        "chunk_type": str(chunk.get("chunk_type") or "").strip() or None,
+        "source_record_type": str(chunk.get("source_record_type") or "").strip() or None,
+        "source_record_id": str(chunk.get("source_record_id") or "").strip() or None,
+    }
+
+
 def normalize_entity_name(name: str) -> str:
     if not name:
         return ""
@@ -126,7 +137,15 @@ def build_entity_props(entity: Dict) -> Dict:
     if "support_count" in entity:
         props["support_count"] = entity["support_count"]
     # 版本化知识库：合并实体 JSON 中应携带 file_id / file_version_id，供 Neo4j 写入与按版本过滤
-    for k in ("file_id", "file_version_id"):
+    for k in (
+        "file_id",
+        "file_version_id",
+        "source_type",
+        "file_format",
+        "chunk_type",
+        "source_record_type",
+        "source_record_id",
+    ):
         v = entity.get(k)
         if v not in (None, ""):
             props[k] = v
@@ -140,7 +159,21 @@ def save_relations_to_csv_second(relations: List[Dict], output_csv_path: str) ->
     fieldnames = set()
     for rel in relations:
         fieldnames.update(rel.keys())
-    preferred_order = ["chunk_id", "entity1", "entity2", "relation_type", "entity1_type", "entity2_type"]
+    preferred_order = [
+        "chunk_id",
+        "file_id",
+        "file_version_id",
+        "source_type",
+        "file_format",
+        "chunk_type",
+        "source_record_type",
+        "source_record_id",
+        "entity1",
+        "entity2",
+        "relation_type",
+        "entity1_type",
+        "entity2_type",
+    ]
     fieldnames = [f for f in preferred_order if f in fieldnames] + [f for f in fieldnames if f not in preferred_order]
     with open(output_csv_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -217,6 +250,7 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
         file_version_id = chunk.get("file_version_id", "")
         is_active = chunk.get("is_active", True)
         file_name = chunk.get("file", "")  # 原始文件名
+        common_fields = extract_chunk_common_fields(chunk)
         
         # 拼接章节信息
         title_parts = []
@@ -309,6 +343,7 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
                             rel["file_version_id"] = file_version_id
                             rel["file_name"] = file_name
                             rel["is_active"] = is_active
+                            rel.update(common_fields)
                             
                             valid_relations.append(rel)
                     else:
@@ -323,6 +358,7 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
                 "is_active": is_active,
                 "relations": valid_relations,
             }
+            result.update(common_fields)
             print(f"chunk {chunk_id} 提取有效关系数：{len(valid_relations)}")
             return result
         except Exception as e:

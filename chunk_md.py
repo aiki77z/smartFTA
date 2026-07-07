@@ -5,6 +5,30 @@ import json
 import argparse
 import bisect
 import time
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def build_chunk_common_fields(
+    *,
+    source_type,
+    file_format,
+    chunk_type,
+    source_record_type=None,
+    source_record_id=None,
+):
+    return {
+        "source_type": source_type,
+        "file_format": file_format,
+        "chunk_type": chunk_type,
+        "source_record_type": source_record_type,
+        "source_record_id": source_record_id,
+    }
+
 
 def save_json(data, file_path):
     with open(file_path, 'w', encoding='utf-8') as f:
@@ -109,7 +133,19 @@ def split_text_by_tables(text):
                 segments.append((para_text, False))
     return segments
 
-def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id, file_version_id):
+def parse_markdown_hierarchy(
+    content,
+    chunk_size,
+    doc_name,
+    source_file,
+    file_id,
+    file_version_id,
+    source_type,
+    file_format,
+    chunk_type,
+    source_record_type=None,
+    source_record_id=None,
+):
     lines_with_breaks = content.splitlines(keepends=True)
     line_starts = []
     pos = 0
@@ -152,6 +188,15 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id
                 "is_active": True,
                 "chunk_uid": f"{file_version_id}::0"
             }
+            chunk_obj.update(
+                build_chunk_common_fields(
+                    source_type=source_type,
+                    file_format=file_format,
+                    chunk_type=chunk_type,
+                    source_record_type=source_record_type,
+                    source_record_id=source_record_id,
+                )
+            )
             img_paths = extract_image_paths(block_content)
             if img_paths:
                 chunk_obj["image_paths"] = img_paths
@@ -183,6 +228,15 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id
                         "is_active": True,
                         "chunk_uid": f"{file_version_id}::{chunk_id}"
                     }
+                    chunk_obj.update(
+                        build_chunk_common_fields(
+                            source_type=source_type,
+                            file_format=file_format,
+                            chunk_type=chunk_type,
+                            source_record_type=source_record_type,
+                            source_record_id=source_record_id,
+                        )
+                    )
                     img_paths = extract_image_paths(chunk_text)
                     if img_paths:
                         chunk_obj["image_paths"] = img_paths
@@ -212,6 +266,15 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id
                     "is_active": True,
                     "chunk_uid": f"{file_version_id}::{chunk_id}"
                 }
+                chunk_obj.update(
+                    build_chunk_common_fields(
+                        source_type=source_type,
+                        file_format=file_format,
+                        chunk_type=chunk_type,
+                        source_record_type=source_record_type,
+                        source_record_id=source_record_id,
+                    )
+                )
                 img_paths = extract_image_paths(chunk_text)
                 if img_paths:
                     chunk_obj["image_paths"] = img_paths
@@ -292,6 +355,15 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id
                     "chunk_uid": f"{file_version_id}::{chunk_id}",
                     "table": seg_text
                 }
+                chunk_obj.update(
+                    build_chunk_common_fields(
+                        source_type=source_type,
+                        file_format=file_format,
+                        chunk_type=chunk_type,
+                        source_record_type=source_record_type,
+                        source_record_id=source_record_id,
+                    )
+                )
                 img_paths = extract_image_paths(seg_text)
                 if img_paths:
                     chunk_obj["image_paths"] = img_paths
@@ -316,6 +388,15 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id
                         "is_active": True,
                         "chunk_uid": f"{file_version_id}::{chunk_id}"
                     }
+                    chunk_obj.update(
+                        build_chunk_common_fields(
+                            source_type=source_type,
+                            file_format=file_format,
+                            chunk_type=chunk_type,
+                            source_record_type=source_record_type,
+                            source_record_id=source_record_id,
+                        )
+                    )
                     img_paths = extract_image_paths(seg_text)
                     if img_paths:
                         chunk_obj["image_paths"] = img_paths
@@ -346,6 +427,15 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id
                                     "is_active": True,
                                     "chunk_uid": f"{file_version_id}::{chunk_id}"
                                 }
+                                chunk_obj.update(
+                                    build_chunk_common_fields(
+                                        source_type=source_type,
+                                        file_format=file_format,
+                                        chunk_type=chunk_type,
+                                        source_record_type=source_record_type,
+                                        source_record_id=source_record_id,
+                                    )
+                                )
                                 img_paths = extract_image_paths(chunk_text)
                                 if img_paths:
                                     chunk_obj["image_paths"] = img_paths
@@ -374,6 +464,15 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id
                                 "is_active": True,
                                 "chunk_uid": f"{file_version_id}::{chunk_id}"
                             }
+                            chunk_obj.update(
+                                build_chunk_common_fields(
+                                    source_type=source_type,
+                                    file_format=file_format,
+                                    chunk_type=chunk_type,
+                                    source_record_type=source_record_type,
+                                    source_record_id=source_record_id,
+                                )
+                            )
                             img_paths = extract_image_paths(chunk_text)
                             if img_paths:
                                 chunk_obj["image_paths"] = img_paths
@@ -382,13 +481,33 @@ def parse_markdown_hierarchy(content, chunk_size, doc_name, source_file, file_id
 
     return all_chunks
 
-def process_single_document_flow(input_file_path, chunk_size, file_id, file_version_id):
+def process_single_document_flow(
+    input_file_path,
+    chunk_size,
+    file_id,
+    file_version_id,
+    source_type,
+    file_format,
+    chunk_type,
+    source_record_type=None,
+    source_record_id=None,
+):
     doc_name, content = load_single_file(input_file_path)
     if not content:
         print("内容为空，跳过处理。")
         return []
     all_chunks = parse_markdown_hierarchy(
-        content, chunk_size, doc_name, os.path.basename(input_file_path), file_id, file_version_id
+        content,
+        chunk_size,
+        doc_name,
+        os.path.basename(input_file_path),
+        file_id,
+        file_version_id,
+        source_type,
+        file_format,
+        chunk_type,
+        source_record_type,
+        source_record_id,
     )
     return all_chunks
 
@@ -399,6 +518,25 @@ def main():
     parser.add_argument('--chunk_size', '-s', type=int, default=800, help='分块大小（字符数）')
     parser.add_argument('--file_id', required=True, help='文件ID')
     parser.add_argument('--file_version_id', required=True, help='文件版本ID')
+    parser.add_argument(
+        '--source_type',
+        default='manual_document',
+        choices=['manual_document', 'standard_document', 'work_order', 'maintenance_record', 'time_series_event'],
+        help='chunk 来源业务类型',
+    )
+    parser.add_argument(
+        '--file_format',
+        required=True,
+        help='原始输入文件格式，如 pdf / md / xlsx / csv / docx / parquet',
+    )
+    parser.add_argument(
+        '--chunk_type',
+        default='document_section',
+        choices=['document_section', 'table_row_summary', 'case_summary', 'sensor_event_summary'],
+        help='chunk 内容形态',
+    )
+    parser.add_argument('--source_record_type', default=None, help='原始记录类型，文档类可为空')
+    parser.add_argument('--source_record_id', default=None, help='原始记录ID，文档类可为空')
     args = parser.parse_args()
 
     start_time = time.time()
@@ -407,7 +545,17 @@ def main():
         print(f"❌ 错误: 输入路径 '{args.input}' 是一个文件夹，请提供具体的文件路径。")
         return
 
-    chunks = process_single_document_flow(args.input, args.chunk_size, args.file_id, args.file_version_id)
+    chunks = process_single_document_flow(
+        args.input,
+        args.chunk_size,
+        args.file_id,
+        args.file_version_id,
+        args.source_type,
+        args.file_format,
+        args.chunk_type,
+        args.source_record_type,
+        args.source_record_id,
+    )
     if chunks:
         save_json(chunks, args.output)
         print(f"✅ 文档分块完成，结果已保存到 {args.output}")
