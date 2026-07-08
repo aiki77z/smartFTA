@@ -7,9 +7,17 @@ import {
   listAllChunks,
   pollBatchJob,
 } from '../api/ftaBackend.js'
-import { downloadKbJobUploadedFile, pollKbJob, startKbJobUpload } from '../api/kbBackend.js'
+import {
+  downloadKbJobUploadedFile,
+  importMaintenanceCases,
+  importWorkOrders,
+  pollKbJob,
+  profileKnowledgeFile,
+  startKbJobUpload,
+} from '../api/kbBackend.js'
 import KnowledgeBasePanel from '../components/KnowledgeBasePanel.jsx'
 import KnowledgeGraphModal from '../components/KnowledgeGraphModal.jsx'
+import KnowledgeImportModal from '../components/KnowledgeImportModal.jsx'
 import Exploded3dUploadModal from '../components/Exploded3dUploadModal.jsx'
 import {
   chunkBelongsToKbFile,
@@ -108,6 +116,32 @@ function formatFaultTreeChatTime(ts) {
   const d = new Date(Number(ts))
   if (Number.isNaN(d.getTime())) return '暂无对话'
   return d.toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'short' })
+}
+
+function kbCategoryLabel(category) {
+  switch (String(category || '').trim()) {
+    case 'document':
+      return '文档资料'
+    case 'work_order':
+      return '工单数据'
+    case 'maintenance_record':
+      return '维修记录'
+    default:
+      return ''
+  }
+}
+
+function inferSourceTypeFromCategory(category) {
+  switch (String(category || '').trim()) {
+    case 'document':
+      return 'manual_document'
+    case 'work_order':
+      return 'work_order'
+    case 'maintenance_record':
+      return 'maintenance_record'
+    default:
+      return ''
+  }
 }
 
 function MiniFaultTreeThumbnail({ graphData }) {
@@ -341,6 +375,9 @@ function HomePage() {
   const [workspaceReady, setWorkspaceReady] = useState(false)
   const [previewModalOpen, setPreviewModalOpen] = useState(false)
   const [previewFileObject, setPreviewFileObject] = useState(null)
+  const [importModalOpen, setImportModalOpen] = useState(false)
+  const [pendingImportItems, setPendingImportItems] = useState([])
+  const [importSubmitting, setImportSubmitting] = useState(false)
   /** 知识库构建：对接 FTA-KB job（GET /api/kb/jobs/{job_id}） */
   const [kbJob, setKbJob] = useState(null)
   const [kbPrimaryFileId, setKbPrimaryFileId] = useState('')
@@ -421,9 +458,44 @@ function HomePage() {
     return 'processing'
   }, [])
 
-  useEffect(() => {
-    kbPrimaryFileIdRef.current = kbPrimaryFileId || ''
-  }, [kbPrimaryFileId])
+  const updateKbFileAfterDirectImport = useCallback((fileId, payload, category) => {
+    const fileMeta = payload?.file || {}
+    const counts = payload?.imported || payload?.counts || {}
+    setFiles((prevFiles) =>
+      prevFiles.map((f) => {
+        if (f.id !== fileId) return f
+        return {
+          ...f,
+          status: 'done',
+          kbImportComplete: true,
+          parseProgress: 100,
+          kbCategory: category,
+          kbCategoryLabel: kbCategoryLabel(category),
+          sourceType: payload?.source_type || inferSourceTypeFromCategory(category),
+          fileVersionId: fileMeta?.file_version_id || f.fileVersionId || '',
+          fileId: fileMeta?.file_id || f.fileId || '',
+          importedFileName: fileMeta?.file_name || f.importedFileName || '',
+          resultSummary: counts,
+        }
+      }),
+    )
+  }, [])
+
+  const markKbFileImportFailed = useCallback((fileId, category, error) => {
+    setFiles((prevFiles) =>
+      prevFiles.map((f) => {
+        if (f.id !== fileId) return f
+        return {
+          ...f,
+          status: 'failed',
+          kbCategory: category,
+          kbCategoryLabel: kbCategoryLabel(category),
+          sourceType: inferSourceTypeFromCategory(category),
+          error: error?.message || String(error || '导入失败'),
+        }
+      }),
+    )
+  }, [])
 
   const startKbPollingForFile = useCallback(
     (fileId, jobId) => {
@@ -479,6 +551,237 @@ function HomePage() {
     },
     [kbProgressFromJob, kbStatusFromJob, kbHydrating],
   )
+
+  const profileWorkOrderForModal = useCallback(async (file) => {
+    return await profileKnowledgeFile({ file, outputDir: './output' })
+  }, [])
+
+  const startDocumentImportForFile = useCallback(
+    (meta, file, plan) => {
+      const generateFtaBaseUrl = import.meta?.env?.VITE_FTA_BACKEND_URL || DEFAULT_FTA_BASE_URL
+      setKbPrimaryFileId(meta.id)
+      setKbJob({
+        job_id: '',
+        status: 'queued',
+        stage: 'queued',
+        progress: 0,
+        message: `正在提交文档到 KB 后端…（${file.name}）`,
+        uploaded_file: { name: file.name },
+      })
+      startKbJobUpload({
+        file,
+        outputDir: './output',
+        chunkSize: Number(plan?.documentConfig?.chunkSize) || 800,
+        skipEntity: Boolean(plan?.documentConfig?.skipEntity),
+        skipRelation: Boolean(plan?.documentConfig?.skipRelation),
+        syncToGenerateFta: plan?.documentConfig?.syncToGenerateFta !== false,
+        generateFtaBaseUrl,
+        clearGraphBeforeImport: false,
+      })
+        .then((resp) => {
+          const jobId = resp?.job_id || resp?.jobId || ''
+          if (jobId) kbJobIdByFileIdRef.current.set(meta.id, jobId)
+          setFiles((prevFiles) =>
+            prevFiles.map((f) =>
+              f.id === meta.id
+                ? {
+                    ...f,
+                    kbJobId: jobId,
+                    kbCategory: 'document',
+                    kbCategoryLabel: kbCategoryLabel('document'),
+                    sourceType: 'manual_document',
+                  }
+                : f,
+            ),
+          )
+          setKbJob((prev) => (prev && typeof prev === 'object' ? { ...prev, ...resp } : resp))
+          startKbPollingForFile(meta.id, jobId)
+        })
+        .catch((e) => {
+          setKbJob({
+            job_id: '',
+            status: 'failed',
+            stage: 'failed',
+            progress: 0,
+            message: '提交 KB 任务失败',
+            error: e?.message || '提交 KB 任务失败',
+          })
+          markKbFileImportFailed(meta.id, 'document', e)
+        })
+    },
+    [markKbFileImportFailed, startKbPollingForFile],
+  )
+
+  const startWorkOrderImportForFile = useCallback(
+    (meta, file, plan) => {
+      const generateFtaBaseUrl = import.meta?.env?.VITE_FTA_BACKEND_URL || DEFAULT_FTA_BASE_URL
+      setKbPrimaryFileId(meta.id)
+      setKbJob({
+        job_id: '',
+        status: 'running',
+        stage: 'chunk',
+        progress: 30,
+        message: `正在导入工单数据…（${file.name}）`,
+      })
+      importWorkOrders({
+        file,
+        outputDir: './output',
+        fileId: plan?.workOrderConfig?.fileId || undefined,
+        fieldMapping: plan?.fieldMapping || {},
+        syncToGenerateFta: plan?.workOrderConfig?.syncToGenerateFta !== false,
+        generateFtaBaseUrl,
+        clearGraphBeforeImport: false,
+      })
+        .then((resp) => {
+          updateKbFileAfterDirectImport(meta.id, resp, 'work_order')
+          setKbJob({
+            job_id: '',
+            status: resp?.status === 'completed_with_sync_error' ? 'completed_with_sync_error' : 'success',
+            stage: resp?.status === 'completed_with_sync_error' ? 'completed_with_sync_error' : 'success',
+            progress: 100,
+            message: `工单导入完成（${Number(resp?.imported?.work_orders || 0)} 条）`,
+            sync_error: resp?.sync_error || '',
+            sync_response: resp?.sync_response,
+          })
+        })
+        .catch((e) => {
+          setKbJob({
+            job_id: '',
+            status: 'failed',
+            stage: 'failed',
+            progress: 100,
+            message: '工单导入失败',
+            error: e?.message || '工单导入失败',
+          })
+          markKbFileImportFailed(meta.id, 'work_order', e)
+        })
+    },
+    [markKbFileImportFailed, updateKbFileAfterDirectImport],
+  )
+
+  const startMaintenanceImportForFile = useCallback(
+    (meta, file, plan) => {
+      const generateFtaBaseUrl = import.meta?.env?.VITE_FTA_BACKEND_URL || DEFAULT_FTA_BASE_URL
+      setKbPrimaryFileId(meta.id)
+      setKbJob({
+        job_id: '',
+        status: 'running',
+        stage: 'entity',
+        progress: 35,
+        message: `正在导入维修记录…（${file.name}）`,
+      })
+      importMaintenanceCases({
+        file,
+        outputDir: './output',
+        caseIdPrefix: plan?.maintenanceConfig?.caseIdPrefix || 'case',
+        maxSummaryChars: Number(plan?.maintenanceConfig?.maxSummaryChars) || 800,
+        skipEntity: Boolean(plan?.maintenanceConfig?.skipEntity),
+        skipRelation: Boolean(plan?.maintenanceConfig?.skipRelation),
+        syncToGenerateFta: plan?.maintenanceConfig?.syncToGenerateFta !== false,
+        generateFtaBaseUrl,
+        clearGraphBeforeImport: false,
+      })
+        .then((resp) => {
+          updateKbFileAfterDirectImport(meta.id, resp, 'maintenance_record')
+          const count = Number(resp?.counts?.maintenance_cases || 0)
+          setKbJob({
+            job_id: '',
+            status: resp?.status === 'completed_with_sync_error' ? 'completed_with_sync_error' : 'success',
+            stage: resp?.status === 'completed_with_sync_error' ? 'completed_with_sync_error' : 'success',
+            progress: 100,
+            message: `维修记录导入完成（${count} 个案例）`,
+            sync_error: resp?.sync_error || '',
+            sync_response: resp?.sync_response,
+          })
+        })
+        .catch((e) => {
+          setKbJob({
+            job_id: '',
+            status: 'failed',
+            stage: 'failed',
+            progress: 100,
+            message: '维修记录导入失败',
+            error: e?.message || '维修记录导入失败',
+          })
+          markKbFileImportFailed(meta.id, 'maintenance_record', e)
+        })
+    },
+    [markKbFileImportFailed, updateKbFileAfterDirectImport],
+  )
+
+  const handleImportPlans = useCallback(
+    (plans) => {
+      const wasEmpty = files.length === 0
+      const batchId = Date.now()
+      const incoming = (plans || []).map((plan, idx) => {
+        const id = `${batchId}-${idx}`
+        fileObjectStoreRef.current.set(id, plan.file)
+        return {
+          id,
+          name: plan.file.name,
+          size: plan.file.size,
+          uploadProgress: 100,
+          parseProgress: 0,
+          status: 'processing',
+          kbCategory: plan.category,
+          kbCategoryLabel: kbCategoryLabel(plan.category),
+          sourceType: inferSourceTypeFromCategory(plan.category),
+        }
+      })
+
+      let base = [...files]
+      const removedIds = []
+      for (const inc of incoming) {
+        const di = base.findIndex((f) => f.name === inc.name)
+        if (di >= 0) {
+          removedIds.push(base[di].id)
+          fileObjectStoreRef.current.delete(base[di].id)
+          base.splice(di, 1)
+        }
+      }
+
+      setFiles([...incoming, ...base])
+      setKbChunkIncludeById((prev) => {
+        const next = { ...prev }
+        for (const rid of removedIds) delete next[rid]
+        for (const inc of incoming) next[inc.id] = true
+        return next
+      })
+      bumpKbDatasetEpoch()
+      setSelectedFileId(null)
+      if (wasEmpty && incoming.length && projectId) {
+        const updated = renameProjectFromFirstFile(projectId, incoming[0].name)
+        if (updated) setProjectName(updated.name)
+      }
+
+      incoming.forEach((meta, idx) => {
+        const plan = plans[idx]
+        if (!plan?.file) return
+        if (plan.category === 'document') {
+          startDocumentImportForFile(meta, plan.file, plan)
+          return
+        }
+        if (plan.category === 'work_order') {
+          startWorkOrderImportForFile(meta, plan.file, plan)
+          return
+        }
+        if (plan.category === 'maintenance_record') {
+          startMaintenanceImportForFile(meta, plan.file, plan)
+        }
+      })
+    },
+    [
+      files,
+      projectId,
+      startDocumentImportForFile,
+      startMaintenanceImportForFile,
+      startWorkOrderImportForFile,
+    ],
+  )
+
+  useEffect(() => {
+    kbPrimaryFileIdRef.current = kbPrimaryFileId || ''
+  }, [kbPrimaryFileId])
 
   useEffect(() => {
     if (!projectId) return
@@ -901,100 +1204,15 @@ function HomePage() {
   const handleFileChange = (event) => {
     const selected = Array.from(event.target.files || [])
     if (!selected.length) return
-    const wasEmpty = files.length === 0
     const batchId = Date.now()
-    const incoming = selected.map((file, idx) => {
-      const id = `${batchId}-${idx}`
-      fileObjectStoreRef.current.set(id, file)
-      return {
-        id,
-        name: file.name,
-        size: file.size,
-        uploadProgress: 100,
-        parseProgress: 0,
-        status: 'processing',
-      }
-    })
-    let base = [...files]
-    const removedIds = []
-    for (const inc of incoming) {
-      const di = base.findIndex((f) => f.name === inc.name)
-      if (di >= 0) {
-        removedIds.push(base[di].id)
-        fileObjectStoreRef.current.delete(base[di].id)
-        base.splice(di, 1)
-      }
-    }
-    setFiles([...incoming, ...base])
-    setKbChunkIncludeById((prev) => {
-      const next = { ...prev }
-      for (const rid of removedIds) delete next[rid]
-      for (const inc of incoming) next[inc.id] = true
-      return next
-    })
-    bumpKbDatasetEpoch()
-    // 刚上传的文件还在构建知识库（processing），按需求不允许在左栏选择/预览
-    setSelectedFileId(null)
-    if (wasEmpty && incoming.length && projectId) {
-      const updated = renameProjectFromFirstFile(projectId, incoming[0].name)
-      if (updated) setProjectName(updated.name)
-    }
-
-    // 立刻触发 FTA-KB 知识构建：对本次选择的每个文件各建一个 job 并轮询
-    const generateFtaBaseUrl = import.meta?.env?.VITE_FTA_BACKEND_URL || DEFAULT_FTA_BASE_URL
-    for (const meta of incoming) {
-      const fo = fileObjectStoreRef.current.get(meta.id)
-      if (!fo) continue
-      // 预先把“提交中”状态写入（左侧进度条会立即变化）
-      setFiles((prevFiles) =>
-        prevFiles.map((f) =>
-          f.id === meta.id ? { ...f, status: 'processing', parseProgress: Math.max(f.parseProgress || 0, 1) } : f,
-        ),
-      )
-      setKbPrimaryFileId(meta.id)
-      setKbJob({
-        job_id: '',
-        status: 'queued',
-        stage: 'queued',
-        progress: 0,
-        message: `正在提交到 KB 后端…（${fo.name}）`,
-        uploaded_file: { name: fo.name },
-      })
-      startKbJobUpload({
-        file: fo,
-        outputDir: './output',
-        chunkSize: 800,
-        syncToGenerateFta: true,
-        generateFtaBaseUrl,
-        // 版本化知识库模式下禁止 clear_graph（会导致 GNR 导入阶段 400）
-        clearGraphBeforeImport: false,
-      })
-        .then((resp) => {
-          const jobId = resp?.job_id || resp?.jobId || ''
-          if (jobId) kbJobIdByFileIdRef.current.set(meta.id, jobId)
-          // 将 jobId 写回文件记录，便于离开页面后恢复轮询/预览
-          setFiles((prevFiles) =>
-            prevFiles.map((f) => (f.id === meta.id ? { ...f, kbJobId: jobId } : f)),
-          )
-          // 保留“提交中”的提示文案；并确保后端返回的 stage/progress/message 能立即展示
-          setKbJob((prev) => (prev && typeof prev === 'object' ? { ...prev, ...resp } : resp))
-          startKbPollingForFile(meta.id, jobId)
-        })
-        .catch((e) => {
-          setKbJob({
-            job_id: '',
-            status: 'failed',
-            stage: 'failed',
-            progress: 0,
-            message: '提交 KB 任务失败',
-            error: e?.message || '提交 KB 任务失败',
-          })
-          setFiles((prevFiles) =>
-            prevFiles.map((f) => (f.id === meta.id ? { ...f, status: 'failed' } : f)),
-          )
-        })
-    }
-
+    const incoming = selected.map((file, idx) => ({
+      id: `${batchId}-${idx}`,
+      file,
+      name: file.name,
+      size: file.size,
+    }))
+    setPendingImportItems(incoming)
+    setImportModalOpen(true)
     event.target.value = ''
   }
 
@@ -1228,6 +1446,9 @@ function HomePage() {
                         {file.name}
                       </div>
                       <div className="home-file-card-meta">
+                        {file.kbCategoryLabel ? (
+                          <span className="home-file-pill home-file-pill--type">{file.kbCategoryLabel}</span>
+                        ) : null}
                         <span className={`home-file-pill home-file-pill--${file.status || 'processing'}`}>
                           {file.status === 'done' ? '已完成' : file.status === 'failed' ? '失败' : '处理中'}
                         </span>
@@ -1257,6 +1478,20 @@ function HomePage() {
                         <span className="home-file-bar-num">{Math.max(0, Math.min(100, Number(file.parseProgress) || 0))}%</span>
                       </div>
                     </div>
+                    {file.fileVersionId ? (
+                      <div className="home-file-import-meta">
+                        <span>版本：{file.fileVersionId}</span>
+                        {file.resultSummary ? (
+                          <span>
+                            摘要：
+                            {Object.entries(file.resultSummary)
+                              .filter(([, value]) => Number.isFinite(Number(value)))
+                              .map(([key, value]) => `${key}=${value}`)
+                              .join(' · ')}
+                          </span>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </button>
                   {file.status === 'done' ? (
                     <button
@@ -1495,6 +1730,32 @@ function HomePage() {
         projectId={projectId}
         onSaved={handleExploded3dSaved}
         onClear={handleExploded3dClear}
+      />
+
+      <KnowledgeImportModal
+        open={importModalOpen}
+        items={pendingImportItems}
+        busy={importSubmitting}
+        onClose={() => {
+          if (importSubmitting) return
+          setImportModalOpen(false)
+          setPendingImportItems([])
+        }}
+        onProfileWorkOrder={profileWorkOrderForModal}
+        onConfirm={(plans) => {
+          const resolvedPlans = plans.map((plan) => ({
+            ...plan,
+            file: pendingImportItems.find((item) => item.id === plan.id)?.file || null,
+          }))
+          setImportSubmitting(true)
+          try {
+            handleImportPlans(resolvedPlans.filter((plan) => plan.file))
+            setImportModalOpen(false)
+            setPendingImportItems([])
+          } finally {
+            setImportSubmitting(false)
+          }
+        }}
       />
 
       {previewModalOpen && (

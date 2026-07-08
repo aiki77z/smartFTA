@@ -65,6 +65,13 @@ function delayWithAbort(ms, signal) {
   })
 }
 
+function appendIfPresent(form, key, value) {
+  if (value === undefined || value === null) return
+  const text = String(value).trim()
+  if (!text) return
+  form.append(key, text)
+}
+
 export function startKbJobUpload({
   file,
   outputDir = './output',
@@ -93,6 +100,70 @@ export function startKbJobUpload({
   form.append('clear_graph_before_import', String(Boolean(clearGraphBeforeImport)))
 
   return requestJson('/api/kb/jobs/run-upload', { method: 'POST', body: form, signal })
+}
+
+export function profileKnowledgeFile({ file, outputDir = './output', signal } = {}) {
+  if (!file) throw new Error('缺少上传文件')
+  const form = new FormData()
+  form.append('file', file)
+  form.append('output_dir', outputDir)
+  return requestJson('/api/knowledge/profile', { method: 'POST', body: form, signal })
+}
+
+export function importWorkOrders({
+  file,
+  outputDir = './output',
+  fileId,
+  fieldMapping,
+  syncToGenerateFta = true,
+  generateFtaBaseUrl,
+  clearGraphBeforeImport = false,
+  signal,
+} = {}) {
+  if (!file) throw new Error('缺少上传文件')
+  const form = new FormData()
+  form.append('file', file)
+  form.append('output_dir', outputDir)
+  appendIfPresent(form, 'file_id', fileId)
+  if (fieldMapping && typeof fieldMapping === 'object' && !Array.isArray(fieldMapping)) {
+    form.append('field_mapping_json', JSON.stringify(fieldMapping))
+  }
+  form.append('sync_to_generate_fta', String(Boolean(syncToGenerateFta)))
+  appendIfPresent(form, 'generate_fta_base_url', generateFtaBaseUrl)
+  form.append('clear_graph_before_import', String(Boolean(clearGraphBeforeImport)))
+  return requestJson('/api/knowledge/import-work-orders', { method: 'POST', body: form, signal })
+}
+
+export function importMaintenanceCases({
+  file,
+  outputDir = './output',
+  caseIdPrefix = 'case',
+  maxSummaryChars = 800,
+  skipEntity = false,
+  skipRelation = false,
+  printRawText = false,
+  syncToGenerateFta = true,
+  generateFtaBaseUrl,
+  clearGraphBeforeImport = false,
+  signal,
+} = {}) {
+  if (!file) throw new Error('缺少上传文件')
+  const form = new FormData()
+  form.append('file', file)
+  form.append('output_dir', outputDir)
+  form.append('case_id_prefix', String(caseIdPrefix || 'case'))
+  form.append('max_summary_chars', String(Math.max(120, Number(maxSummaryChars) || 800)))
+  form.append('skip_entity', String(Boolean(skipEntity)))
+  form.append('skip_relation', String(Boolean(skipRelation)))
+  form.append('print_raw_text', String(Boolean(printRawText)))
+  form.append('sync_to_generate_fta', String(Boolean(syncToGenerateFta)))
+  appendIfPresent(form, 'generate_fta_base_url', generateFtaBaseUrl)
+  form.append('clear_graph_before_import', String(Boolean(clearGraphBeforeImport)))
+  return requestJson('/api/knowledge/import-maintenance-cases-upload', {
+    method: 'POST',
+    body: form,
+    signal,
+  })
 }
 
 export function getKbJob({ jobId, signal } = {}) {
