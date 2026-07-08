@@ -36,6 +36,8 @@ versions_col = db["fault_tree_versions"]
 files_col = db["files"]
 file_versions_col = db["file_versions"]
 chunks_col = db["chunks"]
+work_orders_col = db["work_orders"]
+maintenance_cases_col = db["maintenance_cases"]
 entity_reverse_index_col = db["entity_reverse_index"]
 top_event_catalog_col = db["top_event_catalog"]
 generation_jobs_col = db["generation_jobs"]
@@ -352,6 +354,39 @@ def _normalize_chunk_import_doc(
     return normalized
 
 
+def _normalize_source_record_import_doc(
+    doc: Dict[str, Any],
+    *,
+    source_record_type: str,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    is_active: bool = True,
+) -> Dict[str, Any]:
+    normalized = dict(doc)
+    normalized_file_id = _normalize_identifier(file_id) or _normalize_identifier(normalized.get("file_id"))
+    normalized_file_version_id = _normalize_identifier(file_version_id) or _normalize_identifier(normalized.get("file_version_id"))
+    normalized["file_id"] = normalized_file_id
+    normalized["file_version_id"] = normalized_file_version_id
+    normalized["is_active"] = bool(normalized.get("is_active", is_active))
+    normalized["source_record_type"] = (
+        _normalize_identifier(normalized.get("source_record_type")) or _normalize_identifier(source_record_type)
+    )
+
+    source_record_id = _normalize_identifier(normalized.get("source_record_id"))
+    if not source_record_id:
+        fallback_keys = ("record_id", "case_id", "work_order_no")
+        for key in fallback_keys:
+            candidate = _normalize_identifier(normalized.get(key))
+            if candidate:
+                source_record_id = candidate
+                break
+    normalized["source_record_id"] = source_record_id
+
+    if normalized_file_version_id and source_record_id:
+        normalized["_id"] = f"{normalized_file_version_id}{CHUNK_REF_SEPARATOR}{source_record_id}"
+    return normalized
+
+
 def _format_scope_mismatch_examples(mismatches: List[str], *, max_items: int = 5) -> str:
     preview = mismatches[:max_items]
     suffix = "" if len(mismatches) <= max_items else f" ... (+{len(mismatches) - max_items} more)"
@@ -429,6 +464,46 @@ def assert_relation_artifacts_align_with_file_version(
     if mismatches:
         raise ValueError(
             "Relation artifacts do not align with target file version: "
+            + _format_scope_mismatch_examples(mismatches)
+        )
+
+
+def assert_source_record_artifacts_align_with_file_version(
+    records: List[Dict[str, Any]],
+    *,
+    file_id: str,
+    file_version_id: str,
+    expected_source_record_type: str,
+) -> None:
+    normalized_file_id = _normalize_identifier(file_id)
+    normalized_file_version_id = _normalize_identifier(file_version_id)
+    normalized_record_type = _normalize_identifier(expected_source_record_type)
+    mismatches: List[str] = []
+    for index, record in enumerate(records or []):
+        if not isinstance(record, dict):
+            continue
+        record_label = _normalize_identifier(record.get("source_record_id") or record.get("record_id") or record.get("case_id")) or f"index={index}"
+        embedded_file_id = _normalize_identifier(record.get("file_id"))
+        embedded_file_version_id = _normalize_identifier(record.get("file_version_id"))
+        embedded_record_type = _normalize_identifier(record.get("source_record_type"))
+        embedded_record_id = _normalize_identifier(record.get("source_record_id"))
+        if embedded_file_id and embedded_file_id != normalized_file_id:
+            mismatches.append(f"record {record_label} file_id={embedded_file_id} != expected {normalized_file_id}")
+        if embedded_file_version_id and embedded_file_version_id != normalized_file_version_id:
+            mismatches.append(
+                f"record {record_label} file_version_id={embedded_file_version_id} != expected {normalized_file_version_id}"
+            )
+        if embedded_record_type and embedded_record_type != normalized_record_type:
+            mismatches.append(
+                f"record {record_label} source_record_type={embedded_record_type} != expected {normalized_record_type}"
+            )
+        if not embedded_record_id:
+            fallback_id = _normalize_identifier(record.get("record_id") or record.get("case_id") or record.get("work_order_no"))
+            if not fallback_id:
+                mismatches.append(f"record {record_label} missing source_record_id")
+    if mismatches:
+        raise ValueError(
+            "Source record artifacts do not align with target file version: "
             + _format_scope_mismatch_examples(mismatches)
         )
 
@@ -1288,6 +1363,10 @@ def _ensure_indexes():
         (chunks_col, [("chunk_uid", ASCENDING)]),
         (chunks_col, [("file_version_id", ASCENDING), ("chunk_id", ASCENDING)]),
         (chunks_col, [("file_id", ASCENDING), ("file_version_id", ASCENDING), ("is_active", ASCENDING)]),
+        (work_orders_col, [("file_version_id", ASCENDING), ("source_record_id", ASCENDING)]),
+        (work_orders_col, [("file_id", ASCENDING), ("file_version_id", ASCENDING), ("is_active", ASCENDING)]),
+        (maintenance_cases_col, [("file_version_id", ASCENDING), ("source_record_id", ASCENDING)]),
+        (maintenance_cases_col, [("file_id", ASCENDING), ("file_version_id", ASCENDING), ("is_active", ASCENDING)]),
         (trees_col, [("catalog_name", ASCENDING), ("updated_at", DESCENDING)]),
         (trees_col, [("normalized_top_event", ASCENDING), ("updated_at", DESCENDING)]),
         (trees_col, [("source_scope_key", ASCENDING), ("normalized_top_event", ASCENDING), ("updated_at", DESCENDING)]),
@@ -1312,6 +1391,55 @@ def _ensure_indexes():
 
 
 _ensure_indexes()
+
+
+def _import_source_records(
+    records: list,
+    *,
+    collection: Any,
+    source_record_type: str,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    is_active: bool = True,
+) -> Dict[str, Any]:
+    normalized_records = []
+    skipped = 0
+    for record in records or []:
+        if not isinstance(record, dict):
+            skipped += 1
+            continue
+        normalized_records.append(
+            _normalize_source_record_import_doc(
+                record,
+                source_record_type=source_record_type,
+                file_id=file_id,
+                file_version_id=file_version_id,
+                is_active=is_active,
+            )
+        )
+
+    scoped_query: Dict[str, Any] = {}
+    if _normalize_identifier(file_version_id):
+        scoped_query["file_version_id"] = _normalize_identifier(file_version_id)
+    elif _normalize_identifier(file_id):
+        scoped_query["file_id"] = _normalize_identifier(file_id)
+
+    if scoped_query:
+        collection.delete_many(scoped_query)
+    else:
+        collection.delete_many({})
+
+    if normalized_records:
+        collection.insert_many(normalized_records)
+
+    return {
+        "scope": scoped_query or "all",
+        "received": len(records or []),
+        "processed": len(normalized_records),
+        "inserted": len(normalized_records),
+        "updated": 0,
+        "skipped": skipped,
+    }
 
 
 def import_chunks(
@@ -1445,6 +1573,44 @@ def import_entity_reverse_index(
     if scoped_entries:
         entity_reverse_index_col.insert_many(scoped_entries)
     print(f"Imported {len(scoped_entries)} reverse-index entities")
+
+
+def import_work_orders(
+    records: list,
+    *,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    is_active: bool = True,
+) -> Dict[str, Any]:
+    stats = _import_source_records(
+        records,
+        collection=work_orders_col,
+        source_record_type="work_order",
+        file_id=file_id,
+        file_version_id=file_version_id,
+        is_active=is_active,
+    )
+    print(f"Imported {stats['inserted']} work order records")
+    return stats
+
+
+def import_maintenance_cases(
+    records: list,
+    *,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    is_active: bool = True,
+) -> Dict[str, Any]:
+    stats = _import_source_records(
+        records,
+        collection=maintenance_cases_col,
+        source_record_type="maintenance_case",
+        file_id=file_id,
+        file_version_id=file_version_id,
+        is_active=is_active,
+    )
+    print(f"Imported {stats['inserted']} maintenance case records")
+    return stats
 
 
 def list_entity_reverse_index(selected_file_version_ids: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
@@ -1844,6 +2010,22 @@ def activate_file_version(file_id: str, file_version_id: str) -> Dict[str, Any]:
         {"file_id": normalized_file_id, "file_version_id": normalized_file_version_id},
         {"$set": {"is_active": True, "updated_at": now}},
     )
+    work_orders_col.update_many(
+        {"file_id": normalized_file_id, "file_version_id": {"$ne": normalized_file_version_id}},
+        {"$set": {"is_active": False, "updated_at": now}},
+    )
+    work_orders_col.update_many(
+        {"file_id": normalized_file_id, "file_version_id": normalized_file_version_id},
+        {"$set": {"is_active": True, "updated_at": now}},
+    )
+    maintenance_cases_col.update_many(
+        {"file_id": normalized_file_id, "file_version_id": {"$ne": normalized_file_version_id}},
+        {"$set": {"is_active": False, "updated_at": now}},
+    )
+    maintenance_cases_col.update_many(
+        {"file_id": normalized_file_id, "file_version_id": normalized_file_version_id},
+        {"$set": {"is_active": True, "updated_at": now}},
+    )
     top_event_catalog_col.update_many(
         {"file_id": normalized_file_id, "file_version_id": {"$ne": normalized_file_version_id}},
         {"$set": {"is_active": False, "updated_at": now}},
@@ -1876,6 +2058,14 @@ def archive_file(file_id: str, *, status: str = "archived") -> Optional[Dict[str
         {"$set": {"is_active": False, "status": status, "updated_at": now}},
     )
     chunks_col.update_many(
+        {"file_id": normalized_file_id},
+        {"$set": {"is_active": False, "updated_at": now}},
+    )
+    work_orders_col.update_many(
+        {"file_id": normalized_file_id},
+        {"$set": {"is_active": False, "updated_at": now}},
+    )
+    maintenance_cases_col.update_many(
         {"file_id": normalized_file_id},
         {"$set": {"is_active": False, "updated_at": now}},
     )

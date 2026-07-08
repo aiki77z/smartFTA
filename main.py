@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -22,6 +23,7 @@ from database import (
     archive_file,
     append_generation_job_item_event,
     assert_chunk_artifacts_align_with_file_version,
+    assert_source_record_artifacts_align_with_file_version,
     assert_relation_artifacts_align_with_file_version,
     claim_generation_job_item,
     collect_subgraph_chunks,
@@ -40,6 +42,8 @@ from database import (
     get_chunks_by_ids,
     import_chunks as import_chunks_to_db,
     import_entity_reverse_index as import_entity_reverse_index_to_db,
+    import_maintenance_cases as import_maintenance_cases_to_db,
+    import_work_orders as import_work_orders_to_db,
     get_chunk_by_id,
     list_all_chunks,
     get_generation_job,
@@ -1615,6 +1619,8 @@ class KnowledgeArtifactsImportRequest(BaseModel):
     chunks_file: str
     entities_file: Optional[str] = None
     relations_file: Optional[str] = None
+    work_orders_file: Optional[str] = None
+    maintenance_cases_file: Optional[str] = None
     file_id: Optional[str] = None
     file_name: Optional[str] = None
     file_version_id: Optional[str] = None
@@ -1757,6 +1763,64 @@ def _derive_file_name_from_artifacts(
         return chunks_path.stem + ".md"
 
     raise ValueError("无法推断 file_name，请显式传入 file_name")
+
+
+def _derive_file_identity_from_chunks(
+    chunks: Optional[List[Dict[str, Any]]],
+    *,
+    explicit_file_id: Optional[str],
+    explicit_file_version_id: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    if explicit_file_id and explicit_file_version_id:
+        return explicit_file_id, explicit_file_version_id
+
+    first_chunk = (chunks or [{}])[0] if chunks else {}
+    chunk_file_id = str(first_chunk.get("file_id") or "").strip() or None
+    chunk_file_version_id = str(first_chunk.get("file_version_id") or "").strip() or None
+
+    return explicit_file_id or chunk_file_id, explicit_file_version_id or chunk_file_version_id
+
+
+def _load_json_documents(file_path: Path) -> List[Dict[str, Any]]:
+    with file_path.open("r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    if isinstance(loaded, list):
+        return [item for item in loaded if isinstance(item, dict)]
+    if isinstance(loaded, dict):
+        return [loaded]
+    raise ValueError(f"Unsupported JSON root type in {file_path}")
+
+
+def _discover_sidecar_record_file(
+    chunks_path: Path,
+    chunks: List[Dict[str, Any]],
+    *,
+    explicit_path: Optional[Path],
+    source_type: str,
+) -> Optional[Path]:
+    if explicit_path:
+        return explicit_path if explicit_path.exists() else None
+
+    normalized_source_type = str(source_type or "").strip()
+    suffix_by_source_type = {
+        "work_order": "_work_orders.json",
+        "maintenance_record": "_maintenance_cases.json",
+    }
+    suffix = suffix_by_source_type.get(normalized_source_type)
+    if not suffix:
+        return None
+
+    first_chunk = (chunks or [{}])[0] if chunks else {}
+    file_id = str(first_chunk.get("file_id") or "").strip()
+    if not file_id:
+        stem = chunks_path.stem
+        if stem.endswith("_chunks"):
+            file_id = stem[: -len("_chunks")]
+    if not file_id:
+        return None
+
+    candidate = chunks_path.with_name(f"{file_id}{suffix}")
+    return candidate if candidate.exists() else None
 
 
 def _import_relations_from_file(
@@ -1916,6 +1980,8 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
     chunks_path = Path(req.chunks_file).expanduser().resolve()
     entities_path = Path(req.entities_file).expanduser().resolve() if req.entities_file else None
     relations_path = Path(req.relations_file).expanduser().resolve() if req.relations_file else None
+    work_orders_path = Path(req.work_orders_file).expanduser().resolve() if req.work_orders_file else None
+    maintenance_cases_path = Path(req.maintenance_cases_file).expanduser().resolve() if req.maintenance_cases_file else None
 
     if not chunks_path.exists():
         raise HTTPException(status_code=400, detail=f"chunks_file 不存在: {chunks_path}")
@@ -1923,6 +1989,10 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
         raise HTTPException(status_code=400, detail=f"entities_file 不存在: {entities_path}")
     if req.import_relations and relations_path and not relations_path.exists():
         raise HTTPException(status_code=400, detail=f"relations_file 不存在: {relations_path}")
+    if work_orders_path and not work_orders_path.exists():
+        raise HTTPException(status_code=400, detail=f"work_orders_file 不存在: {work_orders_path}")
+    if maintenance_cases_path and not maintenance_cases_path.exists():
+        raise HTTPException(status_code=400, detail=f"maintenance_cases_file 不存在: {maintenance_cases_path}")
     if req.clear_graph:
         raise HTTPException(status_code=400, detail="版本化知识库模式下禁止 clear_graph，请通过 file_version 失活旧版本。")
 
@@ -1939,15 +2009,39 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
             chunks_path=chunks_path,
             relations_path=relations_path,
         )
+        resolved_file_id, resolved_file_version_id = _derive_file_identity_from_chunks(
+            chunks,
+            explicit_file_id=req.file_id,
+            explicit_file_version_id=req.file_version_id,
+        )
+        chunk_source_types = {
+            str(item.get("source_type") or "").strip()
+            for item in (chunks or [])
+            if isinstance(item, dict) and str(item.get("source_type") or "").strip()
+        }
+        auto_work_orders_path = _discover_sidecar_record_file(
+            chunks_path,
+            chunks,
+            explicit_path=work_orders_path,
+            source_type="work_order",
+        )
+        auto_maintenance_cases_path = _discover_sidecar_record_file(
+            chunks_path,
+            chunks,
+            explicit_path=maintenance_cases_path,
+            source_type="maintenance_record",
+        )
         file_version = create_file_version_record(
             file_name=file_name,
-            file_id=req.file_id,
-            file_version_id=req.file_version_id,
+            file_id=resolved_file_id,
+            file_version_id=resolved_file_version_id,
             source=req.source,
             metadata={
                 "chunks_file": str(chunks_path),
                 "entities_file": str(entities_path) if entities_path else None,
                 "relations_file": str(relations_path) if relations_path else None,
+                "work_orders_file": str(auto_work_orders_path) if auto_work_orders_path else None,
+                "maintenance_cases_file": str(auto_maintenance_cases_path) if auto_maintenance_cases_path else None,
             },
         )
         assert_chunk_artifacts_align_with_file_version(
@@ -1963,6 +2057,38 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
             file_version_id=file_version["file_version_id"],
             is_active=True,
         )
+
+        work_order_result = None
+        if auto_work_orders_path and "work_order" in chunk_source_types:
+            work_orders = _load_json_documents(auto_work_orders_path)
+            assert_source_record_artifacts_align_with_file_version(
+                work_orders,
+                file_id=file_version["file_id"],
+                file_version_id=file_version["file_version_id"],
+                expected_source_record_type="work_order",
+            )
+            work_order_result = import_work_orders_to_db(
+                work_orders,
+                file_id=file_version["file_id"],
+                file_version_id=file_version["file_version_id"],
+                is_active=True,
+            )
+
+        maintenance_case_result = None
+        if auto_maintenance_cases_path and "maintenance_record" in chunk_source_types:
+            maintenance_cases = _load_json_documents(auto_maintenance_cases_path)
+            assert_source_record_artifacts_align_with_file_version(
+                maintenance_cases,
+                file_id=file_version["file_id"],
+                file_version_id=file_version["file_version_id"],
+                expected_source_record_type="maintenance_case",
+            )
+            maintenance_case_result = import_maintenance_cases_to_db(
+                maintenance_cases,
+                file_id=file_version["file_id"],
+                file_version_id=file_version["file_version_id"],
+                is_active=True,
+            )
 
         entity_count = 0
         if entities_path:
@@ -2000,6 +2126,8 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
             },
             "imported": {
                 "chunks": chunk_import_result,
+                "work_orders": work_order_result,
+                "maintenance_cases": maintenance_case_result,
                 "entity_reverse_index": entity_count,
                 "relations": relation_result,
                 "top_event_catalog": len(catalog_entries),
@@ -2008,6 +2136,8 @@ def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
                 "chunks_file": str(chunks_path),
                 "entities_file": str(entities_path) if entities_path else None,
                 "relations_file": str(relations_path) if relations_path else None,
+                "work_orders_file": str(auto_work_orders_path) if auto_work_orders_path else None,
+                "maintenance_cases_file": str(auto_maintenance_cases_path) if auto_maintenance_cases_path else None,
             },
             "next_steps": {
                 "resolve_top_event": "/api/tree/resolve-top-event",
