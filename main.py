@@ -123,6 +123,12 @@ class MaintenanceImportRequest(BaseModel):
     skip_entity: bool = False
     skip_relation: bool = False
     print_raw_text: bool = False
+    sync_to_generate_fta: bool = False
+    generate_fta_base_url: str = Field(
+        DEFAULT_GENERATE_FTA_BASE_URL,
+        description="故障树自动生成服务地址，例如 http://127.0.0.1:8000",
+    )
+    clear_graph_before_import: bool = False
 
 
 
@@ -688,7 +694,7 @@ def import_maintenance_cases_api(request: MaintenanceImportRequest):
         logger.exception("import maintenance cases failed path=%s err=%s", input_path, exc)
         raise HTTPException(status_code=500, detail=f"维修记录导入失败: {exc}")
 
-    return {
+    response = {
         "status": "success",
         "source_type": "maintenance_record",
         "chunk_type": "case_summary",
@@ -696,6 +702,77 @@ def import_maintenance_cases_api(request: MaintenanceImportRequest):
         "skip_relation": request.skip_relation,
         **result,
     }
+    if request.sync_to_generate_fta:
+        payload = {
+            "chunks_file": result["artifacts"]["chunks_json"],
+            "entities_file": result["artifacts"].get("entities_merged_json"),
+            "relations_file": result["artifacts"].get("relations_jsonl"),
+            "clear_graph": bool(request.clear_graph_before_import),
+            "import_relations": bool(result["artifacts"].get("relations_jsonl")),
+            "source": "knowledge_base_construction:maintenance_case_import",
+            "file_id": result["file"]["file_id"],
+            "file_name": result["file"]["file_name"],
+            "file_version_id": result["file"]["file_version_id"],
+        }
+        try:
+            sync_response = _post_generate_fta_artifacts(
+                base_url=request.generate_fta_base_url,
+                payload=payload,
+            )
+            response["sync_response"] = sync_response
+        except Exception as exc:
+            response["sync_error"] = str(exc)
+            response["status"] = "completed_with_sync_error"
+    return response
+
+
+@app.post("/api/knowledge/import-maintenance-cases-upload")
+async def import_maintenance_cases_upload(
+    file: UploadFile = File(...),
+    output_dir: str = Form("./output"),
+    case_id_prefix: str = Form("case"),
+    max_summary_chars: int = Form(800),
+    skip_entity: bool = Form(False),
+    skip_relation: bool = Form(False),
+    print_raw_text: bool = Form(False),
+    sync_to_generate_fta: bool = Form(False),
+    generate_fta_base_url: str = Form(DEFAULT_GENERATE_FTA_BASE_URL),
+    clear_graph_before_import: bool = Form(False),
+):
+    name = (file.filename or "upload.bin").strip()
+    safe_name = "".join([c for c in name if c not in '\\/:*?"<>|']) or "upload.bin"
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in {".csv", ".md", ".txt", ".pdf", ".docx"}:
+        raise HTTPException(status_code=400, detail="维修记录导入目前仅支持 csv / md / txt / pdf / docx")
+
+    out_root = Path(output_dir).expanduser().resolve()
+    upload_dir = out_root / "_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = upload_dir / f"{Path(safe_name).stem}_{uuid.uuid4().hex[:8]}{suffix}"
+
+    try:
+        content = await file.read()
+        saved_path.write_bytes(content)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"保存维修记录上传文件失败: {exc}") from exc
+
+    req = MaintenanceImportRequest(
+        input_path=str(saved_path),
+        output_dir=str(out_root),
+        case_id_prefix=str(case_id_prefix or "case"),
+        max_summary_chars=max(120, int(max_summary_chars or 800)),
+        skip_entity=bool(skip_entity),
+        skip_relation=bool(skip_relation),
+        print_raw_text=bool(print_raw_text),
+        sync_to_generate_fta=bool(sync_to_generate_fta),
+        generate_fta_base_url=str(generate_fta_base_url or DEFAULT_GENERATE_FTA_BASE_URL),
+        clear_graph_before_import=bool(clear_graph_before_import),
+    )
+    response = import_maintenance_cases_api(req)
+    if isinstance(response, dict):
+        response["uploaded_file_path"] = str(saved_path)
+        response["uploaded_file_name"] = safe_name
+    return response
 
 
 @app.post("/api/kb/jobs/run")
