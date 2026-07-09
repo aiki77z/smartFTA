@@ -2648,41 +2648,6 @@ Required JSON shape:
     return normalized_tree
 
 
-def discover_top_events_from_entity_index(entries: List[dict]) -> List[dict]:
-    # Kept for backward compatibility; the new batch flow no longer depends on Mongo entity index.
-    results = []
-    for entry in entries or []:
-        name = normalize_top_event_name(entry.get("entity_name"))
-        if not name:
-            continue
-        if not any(word in name for word in ("故障", "异常", "报警", "停机", "失败", "触发")):
-            continue
-        results.append(
-            {
-                "name": name,
-                "aliases": [entry.get("entity_name")] if entry.get("entity_name") and entry.get("entity_name") != name else [],
-                "source_chunk_ids": list(dict.fromkeys(entry.get("chunk_ids") or [])),
-            }
-        )
-    deduped = {}
-    for item in results:
-        deduped.setdefault(item["name"], item)
-    return sorted(deduped.values(), key=lambda item: item["name"])
-
-
-def discover_top_events(chunks: List[dict]) -> List[dict]:
-    # Backward-compatible wrapper. New default source is the graph itself.
-    graph_candidates = list_graph_top_event_candidates()
-    return [
-        {
-            "name": item["name"],
-            "aliases": [],
-            "source_chunk_ids": item.get("source_chunk_ids") or [],
-        }
-        for item in graph_candidates
-    ]
-
-
 def _extract_json_text(raw: str) -> str:
     clean = re.sub(r"```json|```", "", raw or "").strip()
     if not clean:

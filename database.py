@@ -33,12 +33,8 @@ db = client[MONGO_DB_NAME]
 
 trees_col = db["fault_trees"]
 versions_col = db["fault_tree_versions"]
-files_col = db["files"]
 file_versions_col = db["file_versions"]
 chunks_col = db["chunks"]
-work_orders_col = db["work_orders"]
-maintenance_cases_col = db["maintenance_cases"]
-entity_reverse_index_col = db["entity_reverse_index"]
 top_event_catalog_col = db["top_event_catalog"]
 generation_jobs_col = db["generation_jobs"]
 generation_job_items_col = db["generation_job_items"]
@@ -278,23 +274,27 @@ def resolve_selected_file_version_ids(
     require_existing: bool = True,
     require_active: bool = True,
 ) -> List[str]:
+    explicit_selection = bool(_normalize_file_version_ids(selected_file_version_ids, fallback_to_active=False))
     normalized = _normalize_file_version_ids(selected_file_version_ids, fallback_to_active=fallback_to_active)
     if not normalized:
         return []
 
-    if not require_existing and not require_active:
+    effective_require_active = require_active and not explicit_selection
+    if not require_existing and not effective_require_active:
         return normalized
 
-    query: Dict[str, Any] = {"file_version_id": {"$in": normalized}}
-    if require_active:
-        query["status"] = {"$nin": list(STATUS_INACTIVE_VALUES)}
+    query: Dict[str, Any] = {
+        "file_version_id": {"$in": normalized},
+        "status": {"$nin": list(STATUS_INACTIVE_VALUES)},
+    }
+    if effective_require_active:
         query["is_active"] = True
     docs = list(file_versions_col.find(query, {"_id": 0, "file_version_id": 1}))
     found = {_normalize_identifier(doc.get("file_version_id")) for doc in docs if _normalize_identifier(doc.get("file_version_id"))}
     missing = [file_version_id for file_version_id in normalized if file_version_id not in found]
     if missing and require_existing:
         raise ValueError(f"Unknown or inactive file_version_id(s): {', '.join(missing)}")
-    return [file_version_id for file_version_id in normalized if file_version_id in found] if require_existing or require_active else normalized
+    return [file_version_id for file_version_id in normalized if file_version_id in found] if require_existing or effective_require_active else normalized
 
 
 def _strip_mongo_id(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -328,203 +328,6 @@ def _get_chunk_identifier(doc: Optional[Dict[str, Any]]) -> Any:
     if not doc:
         return None
     return doc.get("id", doc.get("chunk_id"))
-
-
-def _normalize_chunk_import_doc(
-    doc: Dict[str, Any],
-    *,
-    file_id: Optional[str] = None,
-    file_version_id: Optional[str] = None,
-    is_active: bool = True,
-) -> Dict[str, Any]:
-    normalized = dict(doc)
-    chunk_id = normalized.get("chunk_id")
-    doc_id = normalized.get("id")
-    if chunk_id in (None, "") and doc_id not in (None, ""):
-        normalized["chunk_id"] = doc_id
-    if doc_id in (None, "") and chunk_id not in (None, ""):
-        normalized["id"] = chunk_id
-    normalized_file_id = _normalize_identifier(file_id) or _normalize_identifier(normalized.get("file_id"))
-    normalized_file_version_id = _normalize_identifier(file_version_id) or _normalize_identifier(normalized.get("file_version_id"))
-    normalized["file_id"] = normalized_file_id
-    normalized["file_version_id"] = normalized_file_version_id
-    normalized["is_active"] = bool(normalized.get("is_active", is_active))
-    if normalized_file_version_id and normalized.get("chunk_id") not in (None, ""):
-        normalized["chunk_uid"] = _make_chunk_ref(normalized_file_version_id, normalized.get("chunk_id"))
-    return normalized
-
-
-def _normalize_source_record_import_doc(
-    doc: Dict[str, Any],
-    *,
-    source_record_type: str,
-    file_id: Optional[str] = None,
-    file_version_id: Optional[str] = None,
-    is_active: bool = True,
-) -> Dict[str, Any]:
-    normalized = dict(doc)
-    normalized_file_id = _normalize_identifier(file_id) or _normalize_identifier(normalized.get("file_id"))
-    normalized_file_version_id = _normalize_identifier(file_version_id) or _normalize_identifier(normalized.get("file_version_id"))
-    normalized["file_id"] = normalized_file_id
-    normalized["file_version_id"] = normalized_file_version_id
-    normalized["is_active"] = bool(normalized.get("is_active", is_active))
-    normalized["source_record_type"] = (
-        _normalize_identifier(normalized.get("source_record_type")) or _normalize_identifier(source_record_type)
-    )
-
-    source_record_id = _normalize_identifier(normalized.get("source_record_id"))
-    if not source_record_id:
-        fallback_keys = ("record_id", "case_id", "work_order_no")
-        for key in fallback_keys:
-            candidate = _normalize_identifier(normalized.get(key))
-            if candidate:
-                source_record_id = candidate
-                break
-    normalized["source_record_id"] = source_record_id
-
-    if normalized_file_version_id and source_record_id:
-        normalized["_id"] = f"{normalized_file_version_id}{CHUNK_REF_SEPARATOR}{source_record_id}"
-    return normalized
-
-
-def _format_scope_mismatch_examples(mismatches: List[str], *, max_items: int = 5) -> str:
-    preview = mismatches[:max_items]
-    suffix = "" if len(mismatches) <= max_items else f" ... (+{len(mismatches) - max_items} more)"
-    return "; ".join(preview) + suffix
-
-
-def assert_chunk_artifacts_align_with_file_version(
-    chunks: List[Dict[str, Any]],
-    *,
-    file_id: str,
-    file_version_id: str,
-) -> None:
-    normalized_file_id = _normalize_identifier(file_id)
-    normalized_file_version_id = _normalize_identifier(file_version_id)
-    mismatches: List[str] = []
-    for index, chunk in enumerate(chunks or []):
-        if not isinstance(chunk, dict):
-            continue
-        chunk_label = _normalize_identifier(chunk.get("chunk_id") or chunk.get("id")) or f"index={index}"
-        embedded_file_id = _normalize_identifier(chunk.get("file_id"))
-        embedded_file_version_id = _normalize_identifier(chunk.get("file_version_id"))
-        if embedded_file_id and embedded_file_id != normalized_file_id:
-            mismatches.append(
-                f"chunk {chunk_label} file_id={embedded_file_id} != expected {normalized_file_id}"
-            )
-        if embedded_file_version_id and embedded_file_version_id != normalized_file_version_id:
-            mismatches.append(
-                f"chunk {chunk_label} file_version_id={embedded_file_version_id} != expected {normalized_file_version_id}"
-            )
-    if mismatches:
-        raise ValueError(
-            "Chunk artifacts do not align with target file version: "
-            + _format_scope_mismatch_examples(mismatches)
-        )
-
-
-def assert_relation_artifacts_align_with_file_version(
-    relation_rows: List[Dict[str, Any]],
-    *,
-    file_id: str,
-    file_version_id: str,
-) -> None:
-    normalized_file_id = _normalize_identifier(file_id)
-    normalized_file_version_id = _normalize_identifier(file_version_id)
-    mismatches: List[str] = []
-    for row_index, row in enumerate(relation_rows or []):
-        if not isinstance(row, dict):
-            continue
-        chunk_label = _normalize_identifier(row.get("chunk_id")) or f"row={row_index}"
-        row_file_id = _normalize_identifier(row.get("file_id"))
-        row_file_version_id = _normalize_identifier(row.get("file_version_id"))
-        if row_file_id and row_file_id != normalized_file_id:
-            mismatches.append(
-                f"relation row {chunk_label} file_id={row_file_id} != expected {normalized_file_id}"
-            )
-        if row_file_version_id and row_file_version_id != normalized_file_version_id:
-            mismatches.append(
-                f"relation row {chunk_label} file_version_id={row_file_version_id} != expected {normalized_file_version_id}"
-            )
-        for rel_index, rel in enumerate(row.get("relations") or []):
-            if not isinstance(rel, dict):
-                continue
-            rel_file_id = _normalize_identifier(rel.get("file_id"))
-            rel_file_version_id = _normalize_identifier(rel.get("file_version_id"))
-            rel_label = (
-                f"relation row {chunk_label} item={rel_index} "
-                f"({rel.get('entity1') or '?'}->{rel.get('entity2') or '?'})"
-            )
-            if rel_file_id and rel_file_id != normalized_file_id:
-                mismatches.append(f"{rel_label} file_id={rel_file_id} != expected {normalized_file_id}")
-            if rel_file_version_id and rel_file_version_id != normalized_file_version_id:
-                mismatches.append(
-                    f"{rel_label} file_version_id={rel_file_version_id} != expected {normalized_file_version_id}"
-                )
-    if mismatches:
-        raise ValueError(
-            "Relation artifacts do not align with target file version: "
-            + _format_scope_mismatch_examples(mismatches)
-        )
-
-
-def assert_source_record_artifacts_align_with_file_version(
-    records: List[Dict[str, Any]],
-    *,
-    file_id: str,
-    file_version_id: str,
-    expected_source_record_type: str,
-) -> None:
-    normalized_file_id = _normalize_identifier(file_id)
-    normalized_file_version_id = _normalize_identifier(file_version_id)
-    normalized_record_type = _normalize_identifier(expected_source_record_type)
-    mismatches: List[str] = []
-    for index, record in enumerate(records or []):
-        if not isinstance(record, dict):
-            continue
-        record_label = _normalize_identifier(record.get("source_record_id") or record.get("record_id") or record.get("case_id")) or f"index={index}"
-        embedded_file_id = _normalize_identifier(record.get("file_id"))
-        embedded_file_version_id = _normalize_identifier(record.get("file_version_id"))
-        embedded_record_type = _normalize_identifier(record.get("source_record_type"))
-        embedded_record_id = _normalize_identifier(record.get("source_record_id"))
-        if embedded_file_id and embedded_file_id != normalized_file_id:
-            mismatches.append(f"record {record_label} file_id={embedded_file_id} != expected {normalized_file_id}")
-        if embedded_file_version_id and embedded_file_version_id != normalized_file_version_id:
-            mismatches.append(
-                f"record {record_label} file_version_id={embedded_file_version_id} != expected {normalized_file_version_id}"
-            )
-        if embedded_record_type and embedded_record_type != normalized_record_type:
-            mismatches.append(
-                f"record {record_label} source_record_type={embedded_record_type} != expected {normalized_record_type}"
-            )
-        if not embedded_record_id:
-            fallback_id = _normalize_identifier(record.get("record_id") or record.get("case_id") or record.get("work_order_no"))
-            if not fallback_id:
-                mismatches.append(f"record {record_label} missing source_record_id")
-    if mismatches:
-        raise ValueError(
-            "Source record artifacts do not align with target file version: "
-            + _format_scope_mismatch_examples(mismatches)
-        )
-
-
-def _coerce_int_identifier(value: Any) -> Optional[int]:
-    if value in (None, ""):
-        return None
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
-def _get_max_chunk_numeric_identifier() -> int:
-    max_identifier = 0
-    for doc in chunks_col.find({}, {"_id": 0, "chunk_id": 1, "id": 1}):
-        for key in ("chunk_id", "id"):
-            numeric_value = _coerce_int_identifier(doc.get(key))
-            if numeric_value is not None and numeric_value > max_identifier:
-                max_identifier = numeric_value
-    return max_identifier
 
 
 def _neo4j_available() -> bool:
@@ -1210,70 +1013,7 @@ def list_graph_top_event_candidates(
         require_active=False,
     )
     cypher = """
-    MATCH (n:Entity)
-    WHERE (n:FaultPhenomenon OR n.entity_type = '故障现象与报警')
-      AND ($enforce_active_only = false OR coalesce(n.is_active, true) = true)
-      AND ($selected_file_version_ids = [] OR coalesce(n.file_version_id, '') IN $selected_file_version_ids)
-    RETURN elementId(n) AS graph_node_id, labels(n) AS labels, properties(n) AS props
-    """
-    with driver.session(database=NEO4J_DATABASE) as session:
-        rows = session.run(
-            cypher,
-            selected_file_version_ids=scoped_file_version_ids,
-            enforce_active_only=(not explicit_scope),
-        ).data()
-
-    decoded = [_decode_graph_node(row) for row in rows]
-    filtered = []
-    for node in decoded:
-        if str(node.get("node_type") or "").upper() == "AND":
-            continue
-        name = _normalize_text(node.get("name"))
-        if not name or len(name) < 2 or len(name) > 40:
-            continue
-        if _looks_like_fault_code(name):
-            continue
-        filtered.append(node)
-
-    filtered.sort(key=_score_top_event_candidate, reverse=True)
-    if limit:
-        filtered = filtered[:limit]
-
-    return [
-        {
-            "graph_node_id": node.get("graph_node_id"),
-            "name": node.get("name"),
-            "normalized_name": node.get("normalized_name"),
-            "file_id": node.get("file_id"),
-            "file_version_id": node.get("file_version_id"),
-            "support_count": int(node.get("support_count") or len(node.get("source_chunk_ids") or [])),
-            "source_chunk_ids": node.get("source_chunk_ids") or [],
-            "source_chunk_refs": node.get("source_chunk_refs") or [],
-            "documents": node.get("documents") or [],
-        }
-        for node in filtered
-    ]
-
-
-# Override the historical implementation above: some imported graphs only have `Entity`
-# nodes and use `故障原因与现象` rather than the old `FaultPhenomenon/故障现象与报警` labels.
-def list_graph_top_event_candidates(
-    limit: Optional[int] = None,
-    *,
-    selected_file_version_ids: Optional[List[Any]] = None,
-) -> List[Dict[str, Any]]:
-    driver = _get_neo4j_driver()
-    if driver is None:
-        return []
-
-    explicit_scope = bool(_normalize_file_version_ids(selected_file_version_ids, fallback_to_active=False))
-    scoped_file_version_ids = resolve_selected_file_version_ids(
-        selected_file_version_ids,
-        fallback_to_active=True,
-        require_active=False,
-    )
-    cypher = """
-    MATCH (n:Entity)
+    MATCH (n:Entity:FaultPhenomenon)
     WHERE ($enforce_active_only = false OR coalesce(n.is_active, true) = true)
       AND ($selected_file_version_ids = [] OR coalesce(n.file_version_id, '') IN $selected_file_version_ids)
     RETURN elementId(n) AS graph_node_id, labels(n) AS labels, properties(n) AS props
@@ -1290,12 +1030,9 @@ def list_graph_top_event_candidates(
     for node in decoded:
         if str(node.get("node_type") or "").upper() == "AND":
             continue
-        if not _is_fault_like_entity_type(node.get("entity_type")):
-            continue
+
         name = _normalize_text(node.get("name"))
-        if not name or len(name) < 2 or len(name) > 40:
-            continue
-        if _looks_like_fault_code(name):
+        if not name:
             continue
         filtered.append(node)
 
@@ -1354,7 +1091,6 @@ def update_graph_node_properties(graph_node_id: str, properties: Dict[str, Any])
 
 def _ensure_indexes():
     index_specs = [
-        (files_col, [("normalized_name", ASCENDING)]),
         (file_versions_col, [("file_id", ASCENDING), ("version_no", DESCENDING)]),
         (file_versions_col, [("file_version_id", ASCENDING)]),
         (file_versions_col, [("is_active", ASCENDING), ("status", ASCENDING)]),
@@ -1363,15 +1099,9 @@ def _ensure_indexes():
         (chunks_col, [("chunk_uid", ASCENDING)]),
         (chunks_col, [("file_version_id", ASCENDING), ("chunk_id", ASCENDING)]),
         (chunks_col, [("file_id", ASCENDING), ("file_version_id", ASCENDING), ("is_active", ASCENDING)]),
-        (work_orders_col, [("file_version_id", ASCENDING), ("source_record_id", ASCENDING)]),
-        (work_orders_col, [("file_id", ASCENDING), ("file_version_id", ASCENDING), ("is_active", ASCENDING)]),
-        (maintenance_cases_col, [("file_version_id", ASCENDING), ("source_record_id", ASCENDING)]),
-        (maintenance_cases_col, [("file_id", ASCENDING), ("file_version_id", ASCENDING), ("is_active", ASCENDING)]),
         (trees_col, [("catalog_name", ASCENDING), ("updated_at", DESCENDING)]),
         (trees_col, [("normalized_top_event", ASCENDING), ("updated_at", DESCENDING)]),
         (trees_col, [("source_scope_key", ASCENDING), ("normalized_top_event", ASCENDING), ("updated_at", DESCENDING)]),
-        (entity_reverse_index_col, [("entity_type", ASCENDING), ("count", DESCENDING)]),
-        (entity_reverse_index_col, [("entity_name", ASCENDING)]),
         (top_event_catalog_col, [("normalized_name", ASCENDING)]),
         (top_event_catalog_col, [("normalized_aliases", ASCENDING)]),
         (top_event_catalog_col, [("file_version_id", ASCENDING), ("normalized_name", ASCENDING)]),
@@ -1393,261 +1123,40 @@ def _ensure_indexes():
 _ensure_indexes()
 
 
-def _import_source_records(
-    records: list,
-    *,
-    collection: Any,
-    source_record_type: str,
-    file_id: Optional[str] = None,
-    file_version_id: Optional[str] = None,
-    is_active: bool = True,
-) -> Dict[str, Any]:
-    normalized_records = []
-    skipped = 0
-    for record in records or []:
-        if not isinstance(record, dict):
-            skipped += 1
-            continue
-        normalized_records.append(
-            _normalize_source_record_import_doc(
-                record,
-                source_record_type=source_record_type,
-                file_id=file_id,
-                file_version_id=file_version_id,
-                is_active=is_active,
-            )
-        )
-
-    scoped_query: Dict[str, Any] = {}
-    if _normalize_identifier(file_version_id):
-        scoped_query["file_version_id"] = _normalize_identifier(file_version_id)
-    elif _normalize_identifier(file_id):
-        scoped_query["file_id"] = _normalize_identifier(file_id)
-
-    if scoped_query:
-        collection.delete_many(scoped_query)
-    else:
-        collection.delete_many({})
-
-    if normalized_records:
-        collection.insert_many(normalized_records)
-
-    return {
-        "scope": scoped_query or "all",
-        "received": len(records or []),
-        "processed": len(normalized_records),
-        "inserted": len(normalized_records),
-        "updated": 0,
-        "skipped": skipped,
-    }
-
-
-def import_chunks(
-    chunks: list,
-    mode: str = "replace",
-    *,
-    file_id: Optional[str] = None,
-    file_version_id: Optional[str] = None,
-    is_active: bool = True,
-) -> Dict[str, Any]:
-    """
-    Import chunks into MongoDB.
-
-    mode="replace": clear old data first, then insert the full input.
-    mode="append": keep existing data and assign new global auto-increment chunk IDs.
-    """
-    normalized_mode = str(mode or "replace").strip().lower()
-    if normalized_mode not in {"replace", "append"}:
-        raise ValueError("chunks import mode must be 'replace' or 'append'")
-
-    normalized_chunks = []
-    skipped = 0
-    for chunk in chunks or []:
-        if not isinstance(chunk, dict):
-            skipped += 1
-            continue
-        normalized_chunks.append(
-            _normalize_chunk_import_doc(
-                chunk,
-                file_id=file_id,
-                file_version_id=file_version_id,
-                is_active=is_active,
-            )
-        )
-
-    version_scoped = bool(_normalize_identifier(file_id) or _normalize_identifier(file_version_id))
-    scoped_query: Dict[str, Any] = {}
-    if _normalize_identifier(file_version_id):
-        scoped_query["file_version_id"] = _normalize_identifier(file_version_id)
-    elif _normalize_identifier(file_id):
-        scoped_query["file_id"] = _normalize_identifier(file_id)
-
-    if normalized_mode == "replace":
-        if version_scoped:
-            chunks_col.delete_many(scoped_query)
-        else:
-            chunks_col.drop()
-            _ensure_indexes()
-        if normalized_chunks:
-            chunks_col.insert_many(normalized_chunks)
-        stats = {
-            "mode": "replace",
-            "scope": scoped_query or "all",
-            "received": len(chunks or []),
-            "processed": len(normalized_chunks),
-            "inserted": len(normalized_chunks),
-            "updated": 0,
-            "skipped": skipped,
-        }
-        print(f"Imported {len(normalized_chunks)} chunks with mode=replace")
-        return stats
-
-    next_identifier = _get_max_chunk_numeric_identifier() if not version_scoped else 0
-    remapped_chunks = []
-    remapped_count = 0
-    start_chunk_id = next_identifier + 1 if normalized_chunks else None
-    for chunk in normalized_chunks:
-        remapped_chunk = dict(chunk)
-        original_chunk_id = remapped_chunk.get("chunk_id")
-        original_id = remapped_chunk.get("id")
-        if not version_scoped:
-            next_identifier += 1
-            remapped_chunk["chunk_id"] = next_identifier
-            remapped_chunk["id"] = next_identifier
-            if original_chunk_id not in (None, "") and original_chunk_id != next_identifier:
-                remapped_chunk["original_chunk_id"] = original_chunk_id
-            if original_id not in (None, "") and original_id != next_identifier:
-                remapped_chunk["original_id"] = original_id
-        chunk_value = remapped_chunk.get("chunk_id")
-        if remapped_chunk.get("file_version_id") and chunk_value not in (None, ""):
-            remapped_chunk["chunk_uid"] = _make_chunk_ref(remapped_chunk.get("file_version_id"), chunk_value)
-        remapped_chunks.append(remapped_chunk)
-        if not version_scoped and (original_chunk_id != next_identifier or original_id != next_identifier):
-            remapped_count += 1
-
-    if remapped_chunks:
-        chunks_col.insert_many(remapped_chunks)
-
-    stats = {
-        "mode": "append",
-        "scope": scoped_query or "all",
-        "received": len(chunks or []),
-        "processed": len(normalized_chunks),
-        "inserted": len(remapped_chunks),
-        "updated": 0,
-        "skipped": skipped,
-        "remapped": remapped_count,
-        "start_chunk_id": start_chunk_id,
-        "end_chunk_id": next_identifier if remapped_chunks else None,
-    }
-    print(
-        "Imported chunks with mode=append "
-        f"(processed={stats['processed']}, inserted={stats['inserted']}, "
-        f"remapped={stats['remapped']}, id_range={stats['start_chunk_id']}..{stats['end_chunk_id']})"
-    )
-    return stats
-
-
-def import_entity_reverse_index(
-    entries: list,
-    *,
-    file_id: Optional[str] = None,
-    file_version_id: Optional[str] = None,
-    is_active: bool = True,
-):
-    """Import aggregated entity reverse-index data into MongoDB."""
-    scoped_entries = []
-    for entry in entries or []:
-        if not isinstance(entry, dict):
-            continue
-        copied = dict(entry)
-        copied["file_id"] = _normalize_identifier(file_id) or _normalize_identifier(copied.get("file_id"))
-        copied["file_version_id"] = _normalize_identifier(file_version_id) or _normalize_identifier(copied.get("file_version_id"))
-        copied["is_active"] = bool(copied.get("is_active", is_active))
-        scoped_entries.append(copied)
-
-    if _normalize_identifier(file_version_id):
-        entity_reverse_index_col.delete_many({"file_version_id": _normalize_identifier(file_version_id)})
-    else:
-        entity_reverse_index_col.drop()
-    if scoped_entries:
-        entity_reverse_index_col.insert_many(scoped_entries)
-    print(f"Imported {len(scoped_entries)} reverse-index entities")
-
-
-def import_work_orders(
-    records: list,
-    *,
-    file_id: Optional[str] = None,
-    file_version_id: Optional[str] = None,
-    is_active: bool = True,
-) -> Dict[str, Any]:
-    stats = _import_source_records(
-        records,
-        collection=work_orders_col,
-        source_record_type="work_order",
-        file_id=file_id,
-        file_version_id=file_version_id,
-        is_active=is_active,
-    )
-    print(f"Imported {stats['inserted']} work order records")
-    return stats
-
-
-def import_maintenance_cases(
-    records: list,
-    *,
-    file_id: Optional[str] = None,
-    file_version_id: Optional[str] = None,
-    is_active: bool = True,
-) -> Dict[str, Any]:
-    stats = _import_source_records(
-        records,
-        collection=maintenance_cases_col,
-        source_record_type="maintenance_case",
-        file_id=file_id,
-        file_version_id=file_version_id,
-        is_active=is_active,
-    )
-    print(f"Imported {stats['inserted']} maintenance case records")
-    return stats
-
-
-def list_entity_reverse_index(selected_file_version_ids: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
-    query = _build_file_version_filter(selected_file_version_ids) or {}
-    cursor = entity_reverse_index_col.find(query, {"_id": 0}).sort([("count", DESCENDING), ("entity_name", ASCENDING)])
-    return list(cursor)
-
-
 def search_chunks_by_entity_names(
     entity_names: List[str],
     limit: int = 8,
     *,
     selected_file_version_ids: Optional[List[Any]] = None,
 ) -> list:
-    """
-    Recall chunks directly from the entity reverse index using exact entity names.
-    """
-    cleaned_names = []
-    for name in entity_names or []:
-        text = str(name).strip()
-        if text and text not in cleaned_names:
-            cleaned_names.append(text)
-
+    cleaned_names = _dedupe_keep_order([str(name or "").strip() for name in entity_names or []])
     if not cleaned_names:
         return []
-
-    query: Dict[str, Any] = {"entity_name": {"$in": cleaned_names}}
-    version_filter = _build_file_version_filter(selected_file_version_ids)
-    if version_filter:
-        query = {"$and": [query, version_filter]}
-    reverse_index_hits = list(entity_reverse_index_col.find(query, {"_id": 0, "chunk_ids": 1}))
-    indexed_chunk_ids = []
-    for hit in reverse_index_hits:
-        indexed_chunk_ids.extend(hit.get("chunk_ids") or [])
-
-    return _fetch_chunks_by_identifiers(indexed_chunk_ids, limit, selected_file_version_ids=selected_file_version_ids)
-
+    driver = _get_neo4j_driver()
+    if driver is None:
+        return []
+    scoped_versions = resolve_selected_file_version_ids(
+        selected_file_version_ids,
+        fallback_to_active=True,
+        require_active=False,
+    )
+    cypher = """
+    MATCH (n:Entity)
+    WHERE n.name IN $entity_names
+      AND ($file_version_ids = [] OR n.file_version_id IN $file_version_ids)
+    RETURN n.file_version_id AS file_version_id,
+           coalesce(n.source_chunk_refs, n.source_chunk_ids, []) AS chunk_refs
+    """
+    refs = []
+    with driver.session(database=NEO4J_DATABASE) as session:
+        for row in session.run(cypher, entity_names=cleaned_names, file_version_ids=scoped_versions):
+            for value in row.get("chunk_refs") or []:
+                ref = str(value or "").strip()
+                if ref and CHUNK_REF_SEPARATOR not in ref:
+                    ref = _make_chunk_ref(row.get("file_version_id"), ref)
+                if ref and ref not in refs:
+                    refs.append(ref)
+    return _fetch_chunks_by_identifiers(refs, limit, selected_file_version_ids=scoped_versions)
 
 def search_chunks_by_keywords(
     keywords: list,
@@ -1669,24 +1178,6 @@ def search_chunks_by_keywords(
 
     results = []
     seen_ids = set()
-
-    reverse_query: Dict[str, Any] = {"entity_name": {"$in": cleaned_keywords}}
-    version_filter = _build_file_version_filter(selected_file_version_ids)
-    if version_filter:
-        reverse_query = {"$and": [reverse_query, version_filter]}
-    reverse_index_hits = list(entity_reverse_index_col.find(reverse_query, {"_id": 0, "chunk_ids": 1}))
-    indexed_chunk_ids = []
-    for hit in reverse_index_hits:
-        indexed_chunk_ids.extend(hit.get("chunk_ids") or [])
-
-    for doc in _fetch_chunks_by_identifiers(indexed_chunk_ids, limit, selected_file_version_ids=selected_file_version_ids):
-        doc_id = _get_chunk_identifier(doc)
-        if doc_id not in seen_ids:
-            results.append(doc)
-            seen_ids.add(doc_id)
-
-    if len(results) >= limit:
-        return results[:limit]
 
     exact_query: Dict[str, Any] = {"key_word": {"$in": cleaned_keywords}}
     if version_filter:
@@ -1730,375 +1221,9 @@ def search_chunks_by_keywords(
     return results[:limit]
 
 
-def list_all_chunks(selected_file_version_ids: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
-    query = _build_file_version_filter(selected_file_version_ids) or {}
-    chunks = list(chunks_col.find(query, {"_id": 0}))
-    return sorted(chunks, key=_chunk_sort_key)
-
-
-def get_chunk_by_id(chunk_id: Any, *, selected_file_version_ids: Optional[List[Any]] = None) -> dict:
-    candidates = _dedupe_keep_order([chunk_id, str(chunk_id).strip()])
-    version_id, plain_chunk_id = _split_chunk_ref(chunk_id)
-    if plain_chunk_id and plain_chunk_id not in candidates:
-        candidates.append(plain_chunk_id)
-    try:
-        numeric_value = int(str(chunk_id).strip())
-        candidates = _dedupe_keep_order(candidates + [numeric_value])
-    except (TypeError, ValueError):
-        pass
-
-    or_conditions = [
-        {"id": {"$in": candidates}},
-        {"chunk_id": {"$in": candidates}},
-    ]
-    if version_id and plain_chunk_id:
-        or_conditions.append({"chunk_uid": _make_chunk_ref(version_id, plain_chunk_id)})
-        or_conditions.append({"file_version_id": version_id, "chunk_id": plain_chunk_id})
-
-    query: Dict[str, Any] = {"$or": or_conditions}
-    version_filter = _build_file_version_filter(selected_file_version_ids)
-    if version_filter:
-        query = {"$and": [query, version_filter]}
-    return chunks_col.find_one(query)
-
-
-def get_file(file_id: str) -> Optional[Dict[str, Any]]:
-    return _strip_mongo_id(files_col.find_one({"_id": file_id}))
-
 
 def get_file_version(file_version_id: str) -> Optional[Dict[str, Any]]:
     return _strip_mongo_id(file_versions_col.find_one({"file_version_id": file_version_id}))
-
-
-def _parse_version_no_from_explicit_file_version_id(
-    file_version_id: str,
-    *,
-    file_id: Optional[str] = None,
-) -> tuple[str, int]:
-    normalized_file_version_id = _normalize_identifier(file_version_id)
-    match = re.fullmatch(r"(.+)_v(\d+)", normalized_file_version_id)
-    if not match:
-        raise ValueError(
-            f"Invalid file_version_id '{normalized_file_version_id}', expected format '<file_id>_v<version_no>'"
-        )
-    parsed_file_id = _normalize_identifier(match.group(1))
-    version_no = int(match.group(2))
-    normalized_file_id = _normalize_identifier(file_id)
-    if normalized_file_id and parsed_file_id != normalized_file_id:
-        raise ValueError(
-            f"file_version_id '{normalized_file_version_id}' does not belong to file_id '{normalized_file_id}'"
-        )
-    if version_no <= 0:
-        raise ValueError(f"Invalid version number in file_version_id '{normalized_file_version_id}'")
-    return parsed_file_id, version_no
-
-
-def create_file_version_record(
-    *,
-    file_name: str,
-    file_id: Optional[str] = None,
-    file_version_id: Optional[str] = None,
-    source: str = "knowledge_import",
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    normalized_file_name = _normalize_file_name(file_name)
-    if not normalized_file_name:
-        raise ValueError("file_name is required")
-
-    now = _now()
-    normalized_explicit_file_version_id = _normalize_identifier(file_version_id)
-    explicit_file_id = ""
-    explicit_version_no: Optional[int] = None
-    if normalized_explicit_file_version_id:
-        explicit_file_id, explicit_version_no = _parse_version_no_from_explicit_file_version_id(
-            normalized_explicit_file_version_id,
-            file_id=file_id,
-        )
-
-    file_doc = None
-    normalized_file_id = _normalize_identifier(file_id) or explicit_file_id
-    if normalized_file_id:
-        file_doc = files_col.find_one({"_id": normalized_file_id})
-    if not file_doc:
-        file_doc = files_col.find_one({"normalized_name": normalized_file_name})
-        if file_doc and normalized_file_id and file_doc.get("_id") != normalized_file_id:
-            raise ValueError(
-                f"file_name '{file_name}' is already associated with file_id '{file_doc.get('_id')}', "
-                f"not '{normalized_file_id}'"
-            )
-
-    if file_doc:
-        normalized_file_id = file_doc["_id"]
-        version_no = explicit_version_no if explicit_version_no is not None else int(file_doc.get("latest_version_no") or 0) + 1
-        files_col.update_one(
-            {"_id": normalized_file_id},
-            {
-                "$set": {
-                    "name": file_name,
-                    "normalized_name": normalized_file_name,
-                    "status": "processing",
-                    "updated_at": now,
-                    "source": source,
-                }
-            },
-        )
-    else:
-        normalized_file_id = normalized_file_id or f"file_{uuid4().hex[:12]}"
-        version_no = explicit_version_no if explicit_version_no is not None else 1
-        files_col.insert_one(
-            {
-                "_id": normalized_file_id,
-                "file_id": normalized_file_id,
-                "name": file_name,
-                "normalized_name": normalized_file_name,
-                "status": "processing",
-                "source": source,
-                "latest_version_no": int(version_no or 0),
-                "current_file_version_id": None,
-                "created_at": now,
-                "updated_at": now,
-            }
-        )
-
-    if explicit_version_no is not None:
-        files_col.update_one(
-            {"_id": normalized_file_id},
-            {
-                "$max": {"latest_version_no": explicit_version_no},
-                "$set": {"updated_at": now},
-            },
-        )
-
-    resolved_file_version_id = normalized_explicit_file_version_id or f"{normalized_file_id}_v{version_no}"
-    existing_version = file_versions_col.find_one({"_id": resolved_file_version_id})
-    if existing_version:
-        if existing_version.get("file_id") != normalized_file_id:
-            raise ValueError(
-                f"file_version_id '{resolved_file_version_id}' is already bound to file_id '{existing_version.get('file_id')}'"
-            )
-        file_versions_col.update_one(
-            {"_id": resolved_file_version_id},
-            {
-                "$set": {
-                    "file_name": file_name,
-                    "normalized_file_name": normalized_file_name,
-                    "version_no": int(existing_version.get("version_no") or version_no),
-                    "status": "processing",
-                    "is_active": False,
-                    "source": source,
-                    "metadata": metadata or {},
-                    "updated_at": now,
-                }
-            },
-        )
-        return get_file_version(resolved_file_version_id) or {}
-
-    doc = {
-        "_id": resolved_file_version_id,
-        "file_version_id": resolved_file_version_id,
-        "file_id": normalized_file_id,
-        "file_name": file_name,
-        "normalized_file_name": normalized_file_name,
-        "version_no": version_no,
-        "status": "processing",
-        "is_active": False,
-        "source": source,
-        "metadata": metadata or {},
-        "created_at": now,
-        "updated_at": now,
-    }
-    file_versions_col.insert_one(doc)
-    return _strip_mongo_id(doc)
-
-
-def mark_file_version_import_failed(file_version_id: str, error: str) -> None:
-    now = _now()
-    file_version = file_versions_col.find_one({"file_version_id": file_version_id})
-    if not file_version:
-        return
-    file_versions_col.update_one(
-        {"file_version_id": file_version_id},
-        {"$set": {"status": "failed", "is_active": False, "error": error, "updated_at": now}},
-    )
-    files_col.update_one(
-        {"_id": file_version["file_id"]},
-        {"$set": {"status": "failed", "updated_at": now, "last_error": error}},
-    )
-
-
-def _set_neo4j_file_version_active_state(file_id: str, file_version_id: str) -> None:
-    driver = _get_neo4j_driver()
-    if driver is None:
-        return
-
-    with driver.session(database=NEO4J_DATABASE) as session:
-        session.run(
-            """
-            MATCH (n)
-            WHERE coalesce(n.file_id, '') = $file_id
-            SET n.is_active = CASE WHEN coalesce(n.file_version_id, '') = $file_version_id THEN true ELSE false END,
-                n.updated_at = datetime()
-            """,
-            file_id=file_id,
-            file_version_id=file_version_id,
-        ).consume()
-        session.run(
-            """
-            MATCH ()-[r:RELATION]->()
-            WHERE coalesce(r.file_id, '') = $file_id
-            SET r.is_active = CASE WHEN coalesce(r.file_version_id, '') = $file_version_id THEN true ELSE false END,
-                r.updated_at = datetime()
-            """,
-            file_id=file_id,
-            file_version_id=file_version_id,
-        ).consume()
-        session.run(
-            """
-            MATCH ()-[r:MENTIONED_IN]->()
-            WHERE coalesce(r.file_version_id, '') <> ''
-              AND coalesce(startNode(r).file_id, endNode(r).file_id, '') = $file_id
-            SET r.is_active = CASE WHEN coalesce(r.file_version_id, '') = $file_version_id THEN true ELSE false END,
-                r.updated_at = datetime()
-            """,
-            file_id=file_id,
-            file_version_id=file_version_id,
-        ).consume()
-
-
-def activate_file_version(file_id: str, file_version_id: str) -> Dict[str, Any]:
-    normalized_file_id = _normalize_identifier(file_id)
-    normalized_file_version_id = _normalize_identifier(file_version_id)
-    if not normalized_file_id or not normalized_file_version_id:
-        raise ValueError("file_id and file_version_id are required")
-    version_doc = get_file_version(normalized_file_version_id)
-    if not version_doc or version_doc.get("file_id") != normalized_file_id:
-        raise ValueError(f"Unknown file version '{normalized_file_version_id}' for file '{normalized_file_id}'")
-
-    now = _now()
-    file_versions_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": {"$ne": normalized_file_version_id}},
-        {"$set": {"is_active": False, "status": "inactive", "updated_at": now}},
-    )
-    file_versions_col.update_one(
-        {"file_id": normalized_file_id, "file_version_id": normalized_file_version_id},
-        {"$set": {"is_active": True, "status": "active", "updated_at": now}},
-    )
-    files_col.update_one(
-        {"_id": normalized_file_id},
-        {
-            "$set": {
-                "status": "active",
-                "current_file_version_id": normalized_file_version_id,
-                "updated_at": now,
-            },
-            "$max": {"latest_version_no": int(version_doc.get("version_no") or 0)},
-        },
-    )
-    chunks_col.update_many(
-        {"file_id": normalized_file_id},
-        {
-            "$set": {
-                "updated_at": now,
-            }
-        },
-    )
-    chunks_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": {"$ne": normalized_file_version_id}},
-        {"$set": {"is_active": False, "updated_at": now}},
-    )
-    chunks_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": normalized_file_version_id},
-        {"$set": {"is_active": True, "updated_at": now}},
-    )
-    work_orders_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": {"$ne": normalized_file_version_id}},
-        {"$set": {"is_active": False, "updated_at": now}},
-    )
-    work_orders_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": normalized_file_version_id},
-        {"$set": {"is_active": True, "updated_at": now}},
-    )
-    maintenance_cases_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": {"$ne": normalized_file_version_id}},
-        {"$set": {"is_active": False, "updated_at": now}},
-    )
-    maintenance_cases_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": normalized_file_version_id},
-        {"$set": {"is_active": True, "updated_at": now}},
-    )
-    top_event_catalog_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": {"$ne": normalized_file_version_id}},
-        {"$set": {"is_active": False, "updated_at": now}},
-    )
-    top_event_catalog_col.update_many(
-        {"file_id": normalized_file_id, "file_version_id": normalized_file_version_id},
-        {"$set": {"is_active": True, "updated_at": now}},
-    )
-    _set_neo4j_file_version_active_state(normalized_file_id, normalized_file_version_id)
-    return get_file_version(normalized_file_version_id) or {}
-
-
-def archive_file(file_id: str, *, status: str = "archived") -> Optional[Dict[str, Any]]:
-    normalized_file_id = _normalize_identifier(file_id)
-    if not normalized_file_id:
-        raise ValueError("file_id is required")
-
-    now = _now()
-    files_col.update_one(
-        {"_id": normalized_file_id},
-        {
-            "$set": {
-                "status": status,
-                "updated_at": now,
-            }
-        },
-    )
-    file_versions_col.update_many(
-        {"file_id": normalized_file_id},
-        {"$set": {"is_active": False, "status": status, "updated_at": now}},
-    )
-    chunks_col.update_many(
-        {"file_id": normalized_file_id},
-        {"$set": {"is_active": False, "updated_at": now}},
-    )
-    work_orders_col.update_many(
-        {"file_id": normalized_file_id},
-        {"$set": {"is_active": False, "updated_at": now}},
-    )
-    maintenance_cases_col.update_many(
-        {"file_id": normalized_file_id},
-        {"$set": {"is_active": False, "updated_at": now}},
-    )
-    top_event_catalog_col.update_many(
-        {"file_id": normalized_file_id},
-        {"$set": {"is_active": False, "updated_at": now}},
-    )
-
-    driver = _get_neo4j_driver()
-    if driver is not None:
-        with driver.session(database=NEO4J_DATABASE) as session:
-            session.run(
-                """
-                MATCH (n)
-                WHERE coalesce(n.file_id, '') = $file_id
-                SET n.is_active = false,
-                    n.updated_at = datetime()
-                """,
-                file_id=normalized_file_id,
-            ).consume()
-            session.run(
-                """
-                MATCH ()-[r]->()
-                WHERE coalesce(r.file_id, '') = $file_id
-                   OR coalesce(r.file_version_id, '') IN $file_version_ids
-                SET r.is_active = false,
-                    r.updated_at = datetime()
-                """,
-                file_id=normalized_file_id,
-                file_version_ids=file_versions_col.distinct("file_version_id", {"file_id": normalized_file_id}),
-            ).consume()
-
-    return get_file(normalized_file_id)
 
 
 def create_tree(
@@ -2725,101 +1850,6 @@ def _fault_like_name_heuristic(name: str) -> bool:
     return any(k in text for k in _FAULT_LIKE_KEYWORDS)
 
 
-def _normalize_candidate_label_from_text(text: str) -> str:
-    value = str(text or "").strip()
-    if not value:
-        return ""
-    value = value.replace("（", "(").replace("）", ")")
-    value = re.sub(r"\s+", " ", value).strip()
-    value = value.strip("\"'[]{}<>")
-    # 取第一行 / 首段，避免整段正文进入目录名
-    line = value.split("\n", 1)[0].strip()
-    if len(line) > 120:
-        line = line[:120].rsplit(" ", 1)[0] if " " in line else line[:120]
-    return line
-
-
-def _top_event_candidates_from_entity_reverse_index(file_id: str, file_version_id: str, limit: int = 400) -> List[Dict[str, Any]]:
-    """当 Neo4j 中尚无可用实体时，从 Mongo entity_reverse_index 推导顶事件候选（与 generator.discover_top_events_from_entity_index 对齐思路）。"""
-    entries = list_entity_reverse_index(selected_file_version_ids=[file_version_id])
-    out: List[Dict[str, Any]] = []
-    seen: set = set()
-    for entry in entries or []:
-        raw = str(entry.get("entity_name") or entry.get("name") or "").strip()
-        name = _normalize_candidate_label_from_text(raw)
-        if not _fault_like_name_heuristic(name):
-            continue
-        nn = _normalize_text(name)
-        if not nn or nn in seen:
-            continue
-        seen.add(nn)
-        chunk_ids = entry.get("chunk_ids") or []
-        out.append(
-            {
-                "graph_node_id": None,
-                "name": name,
-                "normalized_name": nn,
-                "file_id": file_id,
-                "file_version_id": file_version_id,
-                "support_count": int(entry.get("count") or len(chunk_ids) or 0),
-                "source_chunk_ids": list(chunk_ids)[:80],
-                "source_chunk_refs": [],
-                "documents": [],
-            }
-        )
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _top_event_candidates_from_chunks_fallback(file_id: str, file_version_id: str, limit: int = 40) -> List[Dict[str, Any]]:
-    """最后手段：从已导入的 chunks 标题/章节路径中提取短标签作为候选（图为空且实体索引极少时）。"""
-    fv = _normalize_identifier(file_version_id)
-    if not fv:
-        return []
-    q: Dict[str, Any] = {"file_version_id": fv}
-    docs = list(
-        chunks_col.find(
-            q,
-            {"_id": 0, "chunk_id": 1, "id": 1, "section_path": 1, "chunk_name": 1, "text": 1, "content": 1},
-        ).limit(400),
-    )
-    out: List[Dict[str, Any]] = []
-    seen: set = set()
-    for doc in docs or []:
-        chunk_id = doc.get("chunk_id") if doc.get("chunk_id") not in (None, "") else doc.get("id")
-        sp = str(doc.get("section_path") or "").strip()
-        cn = str(doc.get("chunk_name") or "").strip()
-        blob = str(doc.get("text") or doc.get("content") or "").strip()
-        label = cn or (sp.split("/")[-1].strip() if sp else "") or _normalize_candidate_label_from_text(blob)
-        if not label:
-            continue
-        if not _fault_like_name_heuristic(label):
-            continue
-        name = label if len(label) <= 120 else label[:120]
-        nn = _normalize_text(name)
-        if not nn or nn in seen:
-            continue
-        seen.add(nn)
-        scid = chunk_id if chunk_id not in (None, "") else None
-        out.append(
-            {
-                "graph_node_id": None,
-                "name": name,
-                "normalized_name": nn,
-                "file_id": file_id,
-                "file_version_id": file_version_id,
-                "support_count": 1,
-                "source_chunk_ids": [scid] if scid is not None else [],
-                "source_chunk_refs": [_make_chunk_ref(fv, scid)] if scid is not None else [],
-                "documents": [],
-            }
-        )
-        if len(out) >= limit:
-            break
-    return out
-
-
 def rebuild_top_event_catalog_for_file_version(file_version_id: str) -> List[Dict[str, Any]]:
     file_version = get_file_version(file_version_id)
     if not file_version:
@@ -2827,16 +1857,6 @@ def rebuild_top_event_catalog_for_file_version(file_version_id: str) -> List[Dic
 
     top_event_catalog_col.delete_many({"file_version_id": file_version_id})
     candidates = list_graph_top_event_candidates(selected_file_version_ids=[file_version_id])
-    if not candidates:
-        candidates = _top_event_candidates_from_entity_reverse_index(
-            str(file_version.get("file_id") or ""),
-            file_version_id,
-        )
-    if not candidates:
-        candidates = _top_event_candidates_from_chunks_fallback(
-            str(file_version.get("file_id") or ""),
-            file_version_id,
-        )
     created = []
     for item in candidates:
         name = _normalize_text(item.get("name"))

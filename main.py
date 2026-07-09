@@ -18,16 +18,10 @@ from pydantic import BaseModel, ConfigDict
 
 from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
 from database import (
-    activate_file_version,
     fail_orphan_running_generation_items_after_restart,
-    archive_file,
     append_generation_job_item_event,
-    assert_chunk_artifacts_align_with_file_version,
-    assert_source_record_artifacts_align_with_file_version,
-    assert_relation_artifacts_align_with_file_version,
     claim_generation_job_item,
     collect_subgraph_chunks,
-    create_file_version_record,
     create_generation_job,
     create_generation_job_item,
     create_tree,
@@ -40,23 +34,14 @@ from database import (
     find_tree_by_top_event,
     get_top_event_catalog_by_graph_node_id,
     get_chunks_by_ids,
-    import_chunks as import_chunks_to_db,
-    import_entity_reverse_index as import_entity_reverse_index_to_db,
-    import_maintenance_cases as import_maintenance_cases_to_db,
-    import_work_orders as import_work_orders_to_db,
-    get_chunk_by_id,
-    list_all_chunks,
     get_generation_job,
     get_generation_job_item,
     get_tree_meta,
     get_version,
     get_version_list,
-    list_all_chunks,
     list_graph_top_event_candidates,
-    list_entity_reverse_index,
     list_generation_job_items,
     list_top_event_catalog,
-    mark_file_version_import_failed,
     match_top_event_from_graph,
     rebuild_top_event_catalog_for_file_version,
     refresh_generation_job,
@@ -77,15 +62,14 @@ from database import (
 from diff_analyzer import analyze_and_store, corrections_col, generate_change_description
 from generator import (
     build_top_event_normalized_candidates,
-    discover_top_events,
-    discover_top_events_from_entity_index,
     generate_fault_tree_with_progress,
     normalize_top_event_name,
     parse_user_prompt,
 )
-from import_chunks import _load_chunks
-from import_entity_index import _load_entries
-from import_relations_to_neo4j import GraphDatabase, clear_graph, ensure_constraints, import_rows, load_json
+try:
+    from neo4j import GraphDatabase
+except ImportError:
+    GraphDatabase = None
 from validator import validate_full, validate_semantics
 
 MAX_GENERATION_WORKERS = max(1, int(os.getenv("MAX_GENERATION_WORKERS", "2")))
@@ -1615,21 +1599,6 @@ class ContinueBatchJobRequest(BaseModel):
     stale_after_seconds: int = 300
 
 
-class KnowledgeArtifactsImportRequest(BaseModel):
-    chunks_file: str
-    entities_file: Optional[str] = None
-    relations_file: Optional[str] = None
-    work_orders_file: Optional[str] = None
-    maintenance_cases_file: Optional[str] = None
-    file_id: Optional[str] = None
-    file_name: Optional[str] = None
-    file_version_id: Optional[str] = None
-    chunks_import_mode: str = "replace"
-    clear_graph: bool = False
-    import_relations: bool = True
-    source: str = "knowledge_base_construction"
-
-
 class SaveRequest(BaseModel):
     tree_data: dict
     editor: str = "专家"
@@ -1737,144 +1706,6 @@ def _resolve_selected_scope(selected_file_version_ids: Optional[List[str]]) -> L
     )
 
 
-def _derive_file_name_from_artifacts(
-    *,
-    explicit_file_name: Optional[str],
-    chunks: Optional[List[Dict[str, Any]]] = None,
-    chunks_path: Optional[Path] = None,
-    relations_path: Optional[Path] = None,
-) -> str:
-    if explicit_file_name:
-        return explicit_file_name
-
-    first_chunk = (chunks or [{}])[0] if chunks else {}
-    chunk_file = str(first_chunk.get("file") or "").strip()
-    if chunk_file:
-        return chunk_file
-
-    if relations_path:
-        relation_name = relations_path.name
-        if relation_name.endswith("_relations.jsonl"):
-            return relation_name.replace("_relations.jsonl", "_cleaned.md")
-        if relation_name.endswith("_relations.json"):
-            return relation_name.replace("_relations.json", "_cleaned.md")
-
-    if chunks_path:
-        return chunks_path.stem + ".md"
-
-    raise ValueError("无法推断 file_name，请显式传入 file_name")
-
-
-def _derive_file_identity_from_chunks(
-    chunks: Optional[List[Dict[str, Any]]],
-    *,
-    explicit_file_id: Optional[str],
-    explicit_file_version_id: Optional[str],
-) -> tuple[Optional[str], Optional[str]]:
-    if explicit_file_id and explicit_file_version_id:
-        return explicit_file_id, explicit_file_version_id
-
-    first_chunk = (chunks or [{}])[0] if chunks else {}
-    chunk_file_id = str(first_chunk.get("file_id") or "").strip() or None
-    chunk_file_version_id = str(first_chunk.get("file_version_id") or "").strip() or None
-
-    return explicit_file_id or chunk_file_id, explicit_file_version_id or chunk_file_version_id
-
-
-def _load_json_documents(file_path: Path) -> List[Dict[str, Any]]:
-    with file_path.open("r", encoding="utf-8") as f:
-        loaded = json.load(f)
-    if isinstance(loaded, list):
-        return [item for item in loaded if isinstance(item, dict)]
-    if isinstance(loaded, dict):
-        return [loaded]
-    raise ValueError(f"Unsupported JSON root type in {file_path}")
-
-
-def _discover_sidecar_record_file(
-    chunks_path: Path,
-    chunks: List[Dict[str, Any]],
-    *,
-    explicit_path: Optional[Path],
-    source_type: str,
-) -> Optional[Path]:
-    if explicit_path:
-        return explicit_path if explicit_path.exists() else None
-
-    normalized_source_type = str(source_type or "").strip()
-    suffix_by_source_type = {
-        "work_order": "_work_orders.json",
-        "maintenance_record": "_maintenance_cases.json",
-    }
-    suffix = suffix_by_source_type.get(normalized_source_type)
-    if not suffix:
-        return None
-
-    first_chunk = (chunks or [{}])[0] if chunks else {}
-    file_id = str(first_chunk.get("file_id") or "").strip()
-    if not file_id:
-        stem = chunks_path.stem
-        if stem.endswith("_chunks"):
-            file_id = stem[: -len("_chunks")]
-    if not file_id:
-        return None
-
-    candidate = chunks_path.with_name(f"{file_id}{suffix}")
-    return candidate if candidate.exists() else None
-
-
-def _import_relations_from_file(
-    relations_file: Path,
-    clear_existing_graph: bool,
-    *,
-    file_id: str,
-    file_version_id: str,
-    file_name: str,
-) -> Dict[str, object]:
-    if not relations_file.exists():
-        raise ValueError(f"relations_file 不存在: {relations_file}")
-    if not NEO4J_PASSWORD:
-        raise ValueError("未配置 NEO4J_PASSWORD，无法导入图谱关系")
-
-    raw_rows = load_json(relations_file, is_active=True)
-    assert_relation_artifacts_align_with_file_version(
-        raw_rows,
-        file_id=file_id,
-        file_version_id=file_version_id,
-    )
-    rows = load_json(
-        relations_file,
-        file_id=file_id,
-        file_version_id=file_version_id,
-        file_name=file_name,
-        is_active=True,
-    )
-    if not rows:
-        return {
-            "rows": 0,
-            "relations": 0,
-            "database": NEO4J_DATABASE,
-            "cleared": clear_existing_graph,
-        }
-
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        driver.verify_connectivity()
-        ensure_constraints(driver, NEO4J_DATABASE)
-        if clear_existing_graph:
-            clear_graph(driver, NEO4J_DATABASE)
-        relation_count = import_rows(driver, NEO4J_DATABASE, rows, batch_size=200)
-    finally:
-        driver.close()
-
-    return {
-        "rows": len(rows),
-        "relations": relation_count,
-        "database": NEO4J_DATABASE,
-        "cleared": clear_existing_graph,
-    }
-
-
 @app.post("/api/tree/resolve-top-event")
 def api_resolve_top_event(req: ResolveTopEventRequest):
     try:
@@ -1973,186 +1804,6 @@ def api_generate(req: GenerateRequest):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Queue generation failed: {exc}")
-
-
-@app.post("/api/integration/import-knowledge-artifacts")
-def api_import_knowledge_artifacts(req: KnowledgeArtifactsImportRequest):
-    chunks_path = Path(req.chunks_file).expanduser().resolve()
-    entities_path = Path(req.entities_file).expanduser().resolve() if req.entities_file else None
-    relations_path = Path(req.relations_file).expanduser().resolve() if req.relations_file else None
-    work_orders_path = Path(req.work_orders_file).expanduser().resolve() if req.work_orders_file else None
-    maintenance_cases_path = Path(req.maintenance_cases_file).expanduser().resolve() if req.maintenance_cases_file else None
-
-    if not chunks_path.exists():
-        raise HTTPException(status_code=400, detail=f"chunks_file 不存在: {chunks_path}")
-    if entities_path and not entities_path.exists():
-        raise HTTPException(status_code=400, detail=f"entities_file 不存在: {entities_path}")
-    if req.import_relations and relations_path and not relations_path.exists():
-        raise HTTPException(status_code=400, detail=f"relations_file 不存在: {relations_path}")
-    if work_orders_path and not work_orders_path.exists():
-        raise HTTPException(status_code=400, detail=f"work_orders_file 不存在: {work_orders_path}")
-    if maintenance_cases_path and not maintenance_cases_path.exists():
-        raise HTTPException(status_code=400, detail=f"maintenance_cases_file 不存在: {maintenance_cases_path}")
-    if req.clear_graph:
-        raise HTTPException(status_code=400, detail="版本化知识库模式下禁止 clear_graph，请通过 file_version 失活旧版本。")
-
-    chunks_import_mode = str(req.chunks_import_mode or "replace").strip().lower()
-    if chunks_import_mode not in {"replace", "append"}:
-        raise HTTPException(status_code=400, detail="chunks_import_mode 必须是 replace 或 append")
-
-    file_version = None
-    try:
-        chunks = _load_chunks(str(chunks_path))
-        file_name = _derive_file_name_from_artifacts(
-            explicit_file_name=req.file_name,
-            chunks=chunks,
-            chunks_path=chunks_path,
-            relations_path=relations_path,
-        )
-        resolved_file_id, resolved_file_version_id = _derive_file_identity_from_chunks(
-            chunks,
-            explicit_file_id=req.file_id,
-            explicit_file_version_id=req.file_version_id,
-        )
-        chunk_source_types = {
-            str(item.get("source_type") or "").strip()
-            for item in (chunks or [])
-            if isinstance(item, dict) and str(item.get("source_type") or "").strip()
-        }
-        auto_work_orders_path = _discover_sidecar_record_file(
-            chunks_path,
-            chunks,
-            explicit_path=work_orders_path,
-            source_type="work_order",
-        )
-        auto_maintenance_cases_path = _discover_sidecar_record_file(
-            chunks_path,
-            chunks,
-            explicit_path=maintenance_cases_path,
-            source_type="maintenance_record",
-        )
-        file_version = create_file_version_record(
-            file_name=file_name,
-            file_id=resolved_file_id,
-            file_version_id=resolved_file_version_id,
-            source=req.source,
-            metadata={
-                "chunks_file": str(chunks_path),
-                "entities_file": str(entities_path) if entities_path else None,
-                "relations_file": str(relations_path) if relations_path else None,
-                "work_orders_file": str(auto_work_orders_path) if auto_work_orders_path else None,
-                "maintenance_cases_file": str(auto_maintenance_cases_path) if auto_maintenance_cases_path else None,
-            },
-        )
-        assert_chunk_artifacts_align_with_file_version(
-            chunks,
-            file_id=file_version["file_id"],
-            file_version_id=file_version["file_version_id"],
-        )
-
-        chunk_import_result = import_chunks_to_db(
-            chunks,
-            mode=chunks_import_mode,
-            file_id=file_version["file_id"],
-            file_version_id=file_version["file_version_id"],
-            is_active=True,
-        )
-
-        work_order_result = None
-        if auto_work_orders_path and "work_order" in chunk_source_types:
-            work_orders = _load_json_documents(auto_work_orders_path)
-            assert_source_record_artifacts_align_with_file_version(
-                work_orders,
-                file_id=file_version["file_id"],
-                file_version_id=file_version["file_version_id"],
-                expected_source_record_type="work_order",
-            )
-            work_order_result = import_work_orders_to_db(
-                work_orders,
-                file_id=file_version["file_id"],
-                file_version_id=file_version["file_version_id"],
-                is_active=True,
-            )
-
-        maintenance_case_result = None
-        if auto_maintenance_cases_path and "maintenance_record" in chunk_source_types:
-            maintenance_cases = _load_json_documents(auto_maintenance_cases_path)
-            assert_source_record_artifacts_align_with_file_version(
-                maintenance_cases,
-                file_id=file_version["file_id"],
-                file_version_id=file_version["file_version_id"],
-                expected_source_record_type="maintenance_case",
-            )
-            maintenance_case_result = import_maintenance_cases_to_db(
-                maintenance_cases,
-                file_id=file_version["file_id"],
-                file_version_id=file_version["file_version_id"],
-                is_active=True,
-            )
-
-        entity_count = 0
-        if entities_path:
-            entries = _load_entries(str(entities_path))
-            import_entity_reverse_index_to_db(
-                entries,
-                file_id=file_version["file_id"],
-                file_version_id=file_version["file_version_id"],
-                is_active=True,
-            )
-            entity_count = len(entries)
-
-        relation_result = None
-        if req.import_relations and relations_path:
-            relation_result = _import_relations_from_file(
-                relations_path,
-                clear_existing_graph=req.clear_graph,
-                file_id=file_version["file_id"],
-                file_version_id=file_version["file_version_id"],
-                file_name=file_version["file_name"],
-            )
-
-        catalog_entries = rebuild_top_event_catalog_for_file_version(file_version["file_version_id"])
-        activate_file_version(file_version["file_id"], file_version["file_version_id"])
-
-        return {
-            "status": "success",
-            "source": req.source,
-            "file": {
-                "file_id": file_version["file_id"],
-                "file_name": file_version["file_name"],
-                "file_version_id": file_version["file_version_id"],
-                "version_no": file_version["version_no"],
-                "is_active": True,
-            },
-            "imported": {
-                "chunks": chunk_import_result,
-                "work_orders": work_order_result,
-                "maintenance_cases": maintenance_case_result,
-                "entity_reverse_index": entity_count,
-                "relations": relation_result,
-                "top_event_catalog": len(catalog_entries),
-            },
-            "files": {
-                "chunks_file": str(chunks_path),
-                "entities_file": str(entities_path) if entities_path else None,
-                "relations_file": str(relations_path) if relations_path else None,
-                "work_orders_file": str(auto_work_orders_path) if auto_work_orders_path else None,
-                "maintenance_cases_file": str(auto_maintenance_cases_path) if auto_maintenance_cases_path else None,
-            },
-            "next_steps": {
-                "resolve_top_event": "/api/tree/resolve-top-event",
-                "preview_top_events": "/api/batch/preview-top-events",
-                "generate_all": "/api/batch/generate-all",
-            },
-        }
-    except ValueError as exc:
-        if file_version:
-            mark_file_version_import_failed(file_version["file_version_id"], str(exc))
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        if file_version:
-            mark_file_version_import_failed(file_version["file_version_id"], str(exc))
-        raise HTTPException(status_code=500, detail=f"导入知识库产物失败: {exc}")
 
 
 @app.post("/api/debug/graph-recall")
@@ -2644,81 +2295,10 @@ def api_validate_semantic(req: SemanticValidateRequest):
     }
 
 
-@app.get("/api/chunk/{chunk_id}")
-def api_get_chunk(chunk_id: str):
-    chunk = get_chunk_by_id(chunk_id)
-    if not chunk:
-        raise HTTPException(status_code=404, detail=f"chunk {chunk_id} 不存在")
-    chunk.pop("_id", None)
-    return chunk
-
-
-@app.get("/api/chunks")
-def api_list_chunks(
-    file_names: Optional[List[str]] = None,
-    file_version_ids: Optional[List[str]] = None,
-    all: bool = False,
-    limit: int = 200,
-):
-    """
-    供前端「按文件名预览 chunks」使用：
-    - file_names 可重复传参（?file_names=a.pdf&file_names=b.txt）
-    - 后端按 chunk 的 file/source/path/doc_name 等字段做 basename 子串匹配
-    """
-    safe_limit = max(1, min(int(limit or 200), 1000))
-    names = [str(n or "").strip() for n in (file_names or []) if str(n or "").strip()]
-    fvs = [str(v or "").strip() for v in (file_version_ids or []) if str(v or "").strip()]
-
-    # 临时支持：拉取全库 chunks（用于前端“预览全部 chunks”）
-    if bool(all):
-        chunks = list_all_chunks(selected_file_version_ids=None)
-        return {"chunks": chunks[:safe_limit], "total": len(chunks)}
-        
-    # 防止误返回“全库 chunks”：必须给出过滤条件（文件名或 file_version_id）
-    if not names and not fvs:
-        return {"chunks": [], "total": 0}
-
-    chunks = list_all_chunks(selected_file_version_ids=fvs or None)
-    if not names:
-        return {"chunks": chunks[:safe_limit], "total": len(chunks)}
-
-    lowered = []
-    for n in names:
-        base = n.replace("\\\\", "/").split("/")[-1].lower()
-        lowered.append(base)
-
-    def _hit(doc: Dict[str, Any]) -> bool:
-        blob = " ".join(
-            [
-                str(doc.get("file") or ""),
-                str(doc.get("source") or ""),
-                str(doc.get("path") or ""),
-                str(doc.get("doc_name") or ""),
-                str(doc.get("chunk_name") or ""),
-                str(doc.get("section_path") or ""),
-            ]
-        ).lower()
-        return any(b and b in blob for b in lowered)
-
-    filtered = [c for c in chunks if _hit(c)]
-    return {"chunks": filtered[:safe_limit], "total": len(filtered)}
-
-
 @app.get("/api/corrections/{tree_id}")
 def api_get_corrections(tree_id: str):
     docs = list(corrections_col.find({"tree_id": tree_id}, {"_id": 0}).sort("created_at", -1))
     return docs
-
-
-@app.post("/api/files/{file_id}/archive")
-def api_archive_file(file_id: str):
-    try:
-        doc = archive_file(file_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    if not doc:
-        raise HTTPException(status_code=404, detail="文件不存在")
-    return {"success": True, "file": doc}
 
 
 @app.get("/api/catalog/top-events")
@@ -2766,5 +2346,4 @@ def root():
         "docs": "/docs",
         "generate_input_example": {"prompt": "请分析控制单元过热，并生成故障树"},
         "batch_endpoint": "/api/batch/generate-all",
-        "integration_endpoint": "/api/integration/import-knowledge-artifacts",
     }
