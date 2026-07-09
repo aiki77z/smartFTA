@@ -5,7 +5,7 @@
 1. 将 PDF / Markdown 文档转换为结构化 chunks
 2. 提取实体与关系
 3. 产出可供 `generate-fta` 分支消费的标准文件
-4. 可选地把关系导入 Neo4j，供故障树召回与图谱约束使用
+4. 将实体和关系导入 Neo4j，供顶事件候选、故障树召回与图谱约束使用
 
 和其他 worktree 的关系如下：
 
@@ -18,11 +18,9 @@
 本模块输出以下标准产物，供 `generate-fta` 分支导入：
 
 - `{pdf_stem}_chunks.json`  
-  由 `generate-fta` 分支执行 `python import_chunks.py --file <chunks_json>` 导入 MongoDB `chunks`
-- `{pdf_stem}_entities_merged.json`  
-  由 `generate-fta` 分支执行 `python import_entity_index.py --file <entities_merged_json>` 导入 `entity_reverse_index`
-- `{pdf_stem}_relations.jsonl`  
-  由 `generate-fta` 分支执行 `python import_relations_to_neo4j.py --file <relations_jsonl> ...` 导入 Neo4j 图谱
+  由 `kb-v2` 服务写入 MongoDB `chunks`
+- `{pdf_stem}_entities_merged.json` 与 `{pdf_stem}_relations.jsonl`  
+  由 `kb-v2` 服务直接写入 Neo4j 图谱
 
 因此，这个分支和 `generate-fta` 分支通过“标准产物文件 + 导入脚本”衔接，而不是在同一个工作目录里重复维护两套代码。
 

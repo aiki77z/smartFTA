@@ -124,7 +124,13 @@ def _find_markdown_file(version_dir: Path, file_id: str) -> Path:
     raise FileNotFoundError(f"未在 {version_dir} 中找到 Markdown 文件")
 
 
-def _convert_pdf_to_markdown(input_path: Path, output_root: Path) -> tuple[Path, Path]:
+def _convert_pdf_to_markdown(
+    input_path: Path,
+    output_root: Path,
+    *,
+    file_id: Optional[str] = None,
+    version_no: Optional[int] = None,
+) -> tuple[Path, Path]:
     script_path = Path(__file__).with_name("trans_file_to_md.py")
     cmd = [
         sys.executable,
@@ -138,6 +144,10 @@ def _convert_pdf_to_markdown(input_path: Path, output_root: Path) -> tuple[Path,
         "-m",
         "ocr",
     ]
+    if file_id:
+        cmd.extend(["--file-id", file_id])
+    if version_no is not None:
+        cmd.extend(["--version-no", str(version_no)])
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -359,6 +369,9 @@ def import_maintenance_cases(
     skip_entity: bool = False,
     skip_relation: bool = False,
     print_raw_text: bool = False,
+    file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    file_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     source_path = Path(input_path).expanduser().resolve()
     if not source_path.exists():
@@ -368,13 +381,27 @@ def import_maintenance_cases(
     output_root = Path(output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
+    resolved_file_id = str(file_id or source_path.stem).strip()
+    display_file_name = str(file_name or source_path.name).strip()
+    version_no = None
+    if file_version_id:
+        match = re.fullmatch(rf"{re.escape(resolved_file_id)}_v(\d+)", file_version_id)
+        if not match:
+            raise ValueError("file_version_id does not belong to file_id")
+        version_no = int(match.group(1))
+
     if file_format == "pdf":
-        version_dir, text_source_path = _convert_pdf_to_markdown(source_path, output_root)
+        version_dir, text_source_path = _convert_pdf_to_markdown(
+            source_path,
+            output_root,
+            file_id=resolved_file_id,
+            version_no=version_no,
+        )
         extracted_text = _read_text_file(text_source_path)
-        file_id = source_path.stem
     else:
-        file_id = source_path.stem
-        version_dir = _next_version_dir(output_root, file_id)
+        version_dir = output_root / resolved_file_id / file_version_id if file_version_id else _next_version_dir(output_root, resolved_file_id)
+        if file_version_id:
+            version_dir.mkdir(parents=True, exist_ok=False)
         if file_format in {"md", "txt"}:
             extracted_text = _read_text_file(source_path)
         elif file_format == "docx":
@@ -383,10 +410,11 @@ def import_maintenance_cases(
             extracted_text = ""
         else:
             raise ValueError(f"暂不支持的维修记录格式: {file_format}")
-        text_source_path = version_dir / f"{file_id}_source.txt"
+        text_source_path = version_dir / f"{resolved_file_id}_source.txt"
         if file_format != "csv":
             text_source_path.write_text(extracted_text, encoding="utf-8")
 
+    file_id = resolved_file_id
     file_version_id = version_dir.name
     sections: List[Dict[str, Any]]
     if file_format == "csv":
@@ -430,7 +458,7 @@ def import_maintenance_cases(
             "root_cause": fields.get("root_cause") or "",
             "repair_action": fields.get("repair_action") or "",
             "verification_result": fields.get("verification_result") or "",
-            "file": source_path.name,
+            "file": display_file_name,
             "file_id": file_id,
             "file_version_id": file_version_id,
             "is_active": True,
@@ -452,7 +480,7 @@ def import_maintenance_cases(
             "subsection": "",
             "section_path": "",
             "source": idx,
-            "file": source_path.name,
+            "file": display_file_name,
             "file_id": file_id,
             "file_version_id": file_version_id,
             "is_active": True,
@@ -526,7 +554,7 @@ def import_maintenance_cases(
     return {
         "file": {
             "file_id": file_id,
-            "file_name": source_path.name,
+            "file_name": display_file_name,
             "file_version_id": file_version_id,
             "file_format": file_format,
         },

@@ -192,6 +192,7 @@ def main():
         "--pdf-stem",
         help="显式指定产物前缀（pdf_stem）。导入模式下用于定位 *_chunks.json；生成模式下可用于兼容上层服务参数契约。"
     )
+    parser.add_argument("--file-version-id", help="Database-reserved version ID in <file_id>_vN format")
     parser.add_argument("--output-dir", "-o", default="./output", help="输出根目录（默认 ./output）")
     parser.add_argument("--chunk-size", "-s", type=int, default=800, help="分块大小（字符数），默认 800")
     parser.add_argument("--skip-mineru", action="store_true", help="跳过 MinerU 转换步骤（假设已有 MD 文件）")
@@ -236,7 +237,8 @@ def main():
     output_root = Path(args.output_dir).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    pdf_stem = pdf_path.stem
+    source_stem = pdf_path.stem
+    pdf_stem = args.pdf_stem or source_stem
     file_format = (args.file_format or infer_file_format(pdf_path)).strip().lower()
 
     # === 整个流水线开始时间 ===
@@ -261,7 +263,15 @@ def main():
             "pipeline",
             "-m",
             "ocr",
+            "--file-id",
+            pdf_stem,
         ]
+        if args.file_version_id:
+            match = re.fullmatch(rf"{re.escape(pdf_stem)}_v(\d+)", args.file_version_id)
+            if not match:
+                print(f"Error: file_version_id does not match file_id: {args.file_version_id} / {pdf_stem}")
+                sys.exit(1)
+            cmd.extend(["--version-no", match.group(1)])
         result = run_command(cmd, "MinerU 转换")
 
         # 从输出中解析 VERSION_DIR
@@ -281,7 +291,7 @@ def main():
                 sys.exit(1)
 
         try:
-            md_file = find_md_file(version_dir, pdf_stem)
+            md_file = find_md_file(version_dir, source_stem)
             print(f"找到 Markdown 文件: {md_file} (大小: {md_file.stat().st_size} 字节)")
         except (FileNotFoundError, RuntimeError) as exc:
             print(f"错误: {exc}")
@@ -293,7 +303,9 @@ def main():
         else:
             file_id = pdf_stem
         try:
-            version_dir = ensure_skip_mineru_version_dir(output_root, file_id)
+            version_dir = output_root / file_id / args.file_version_id if args.file_version_id else ensure_skip_mineru_version_dir(output_root, file_id)
+            if not version_dir.exists():
+                raise FileNotFoundError(f"Reserved version directory not found: {version_dir}")
             print(f"使用最新版本目录: {version_dir}")
             print(f"VERSION_DIR={version_dir}")
         except FileNotFoundError as e:
@@ -301,7 +313,7 @@ def main():
             sys.exit(1)
 
         try:
-            md_file = find_md_file(version_dir, pdf_stem)
+            md_file = find_md_file(version_dir, file_id)
             print(f"使用现有 Markdown 文件: {md_file}")
         except (FileNotFoundError, RuntimeError) as exc:
             print(f"错误: 找不到有效的 MD 文件 - {exc}")
@@ -310,6 +322,9 @@ def main():
     # 版本化知识库：file_version_id 必须是「整份文件版本」的稳定 ID（与 Mongo/Neo4j schema 一致），
     # 即版本目录名，例如 {pdf_stem}_v1。不能只用 "v1"，否则 chunk_uid、图谱 Entity 无法按版本过滤。
     file_version_id = version_dir.name
+    if args.file_version_id and file_version_id != args.file_version_id:
+        print(f"Error: actual version {file_version_id} does not match reserved version {args.file_version_id}")
+        sys.exit(1)
 
     # 后续所有产物都保存在版本目录中
     result_dir = version_dir

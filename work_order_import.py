@@ -711,6 +711,8 @@ def import_work_order_file(
     *,
     output_dir: str = "./output",
     file_id: Optional[str] = None,
+    file_version_id: Optional[str] = None,
+    file_name: Optional[str] = None,
     field_mapping: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     file_path = file_path.expanduser().resolve()
@@ -719,9 +721,13 @@ def import_work_order_file(
 
     file_format, headers, rows = load_tabular_rows(file_path)
     resolved_file_id = sanitize_file_id(file_id or file_path.stem)
-    version_dir = next_version_dir(output_root, resolved_file_id)
-    version_dir.mkdir(parents=True, exist_ok=True)
-    file_version_id = version_dir.name
+    display_file_name = str(file_name or file_path.name).strip()
+    if file_version_id:
+        version_dir = output_root / resolved_file_id / file_version_id
+        version_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        version_dir = next_version_dir(output_root, resolved_file_id)
+    resolved_file_version_id = version_dir.name
 
     merged_mapping = merge_field_mapping(headers, field_mapping)
     profile = build_profile(file_path, headers, rows, merged_mapping, file_format)
@@ -735,8 +741,8 @@ def import_work_order_file(
             row_index,
             merged_mapping,
             file_id=resolved_file_id,
-            file_version_id=file_version_id,
-            file_name=file_path.name,
+            file_version_id=resolved_file_version_id,
+            file_name=display_file_name,
             file_format=file_format,
         )
         if not is_meaningful_work_order(record):
@@ -776,8 +782,8 @@ def import_work_order_file(
         "source_type": "work_order",
         "file": {
             "file_id": resolved_file_id,
-            "file_version_id": file_version_id,
-            "file_name": file_path.name,
+            "file_version_id": resolved_file_version_id,
+            "file_name": display_file_name,
             "file_format": file_format,
         },
         "profiling": profile,

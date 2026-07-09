@@ -6,7 +6,7 @@ from openai import OpenAI
 
 from env_loader import load_local_env
 
-load_local_env()
+load_local_env(override=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
@@ -69,7 +69,7 @@ def call_openai(prompt, context):
         except Exception as e:
             print(f"OpenAI 调用失败（尝试 {attempt + 1}/3）: {e}")
             if attempt == 2:
-                return f"Error: {e}"
+                raise
             time.sleep(2)
 
 def call_llm(prompt, context, mode="entity"):

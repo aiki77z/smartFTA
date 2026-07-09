@@ -11,6 +11,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="运行 MinerU 命令并自动管理文档版本")
     parser.add_argument("-i", "--input", required=True, help="输入的 PDF 文件路径")
     parser.add_argument("-o", "--output", default="./output", help="输出根目录（默认: ./output）")
+    parser.add_argument("--file-id", help="Logical file ID; defaults to the input file stem")
+    parser.add_argument("--version-no", type=int, help="Database-reserved version number")
     parser.add_argument("-b", "--backend", default="pipeline", help="后端模式（默认: pipeline）")
     parser.add_argument("-m", "--mode", default="ocr", help="运行模式（默认: ocr）")
     return parser.parse_args()
@@ -98,18 +100,29 @@ def main():
     if not input_path.exists():
         print(f"错误: 输入文件不存在: {args.input}")
         sys.exit(1)
-    file_id = input_path.stem
+    source_file_id = input_path.stem
+    file_id = str(args.file_id or source_file_id).strip()
+    if not file_id:
+        print("Error: file_id is required")
+        sys.exit(1)
 
     output_root = Path(args.output)
     output_root.mkdir(parents=True, exist_ok=True)
 
     # 确定版本号
-    version = get_next_version(output_root, file_id)
+    version = args.version_no if args.version_no is not None else get_next_version(output_root, file_id)
+    if version <= 0:
+        print("Error: version_no must be greater than zero")
+        sys.exit(1)
     version_dir = output_root / file_id / f"{file_id}_v{version}"
     print(f"文档标识: {file_id}, 新版本: v{version}")
     print(f"版本目录: {version_dir}")
 
     # 创建临时输出目录（位于同一文件系统，便于快速移动）
+    if version_dir.exists() and any(version_dir.iterdir()):
+        print(f"Error: version directory already exists and is not empty: {version_dir}")
+        sys.exit(1)
+
     with tempfile.TemporaryDirectory(dir=output_root, prefix=f".tmp_{file_id}_") as temp_dir:
         temp_output_dir = Path(temp_dir)
         print(f"使用临时目录: {temp_output_dir}")
@@ -120,7 +133,7 @@ def main():
             sys.exit(1)
 
         # 移动生成的内容到版本目录
-        if not move_mineru_output_to_version(temp_output_dir, file_id, version_dir):
+        if not move_mineru_output_to_version(temp_output_dir, source_file_id, version_dir):
             print("移动文件失败")
             sys.exit(1)
 

@@ -25,7 +25,6 @@ collections：
 - `files`
 - `file_versions`
 - `chunks`
-- `entity_reverse_index`
 - `top_event_catalog`
 - `fault_trees`
 - `fault_tree_versions`
@@ -118,30 +117,7 @@ collections：
 - 当前系统会优先使用 `chunk_uid`
 - 这样可以避免不同文件版本中 `chunk_id` 重号导致混用
 
-### 2.4 entity_reverse_index
-
-用途：
-
-- 保存实体到 chunk 的反向索引
-- 用于按实体名快速召回 chunk
-
-主要字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `entity_name` | string | 实体名 |
-| `chunk_ids` | array | 命中的 chunk 列表 |
-| `count` | int | 出现次数 |
-| `file_id` | string | 文件 ID |
-| `file_version_id` | string | 文件版本 ID |
-| `is_active` | bool | 是否激活 |
-
-说明：
-
-- 这个集合也已经加上了版本边界
-- 查询时会叠加 `selected_file_version_ids`
-
-### 2.5 top_event_catalog
+### 2.4 top_event_catalog
 
 用途：
 

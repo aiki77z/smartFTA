@@ -62,7 +62,8 @@ def save_json(data, file_path):
 
 def parse_entities(text: str, chunk: Dict) -> List[Dict]:
     try:
-        data = json.loads(text)
+        cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip(), flags=re.IGNORECASE)
+        data = json.loads(cleaned)
         entities_data = data.get("entities", [])
     except json.JSONDecodeError:
         print("警告: LLM输出不是有效JSON，尝试按行解析")
@@ -176,7 +177,7 @@ def process_single_chunk(chunk: Dict, print_raw_text: bool, write_lock, output_f
     for attempt in range(1, max_retries + 1):
         try:
             entity_prompt, entity_context = generate_entity_prompt_and_context(chunk_name, enriched_content)
-            entity_text = call_llm(entity_context, entity_prompt)
+            entity_text = call_llm(entity_prompt, entity_context)
             if print_raw_text:
                 print(f"LLM output for chunk {chunk_id} (attempt {attempt}):\n{entity_text}")
 
@@ -284,7 +285,7 @@ def llm_judge_equivalent_names(name_list: List[str]) -> tuple:
 """
     context = "你是一个技术文档实体对齐专家。"
     try:
-        response = call_llm(context, prompt)
+        response = call_llm(prompt, context)
         json_match = re.search(r'\{.*\}', response, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group(0))
@@ -343,7 +344,7 @@ def merge_entities_with_llm(instances: List[Dict]) -> Dict:
     max_retries = 2
     for attempt in range(1, max_retries + 1):
         try:
-            response_text = call_llm(context, merge_prompt)
+            response_text = call_llm(merge_prompt, context)
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 merged = json.loads(json_match.group(0))
@@ -557,6 +558,8 @@ def main():
 
     with open(args.output_merged, "r", encoding="utf-8") as f:
         merged_entities = json.load(f)
+    if not merged_entities:
+        raise RuntimeError("Entity extraction produced no valid entities")
 
     # === 新增：打印耗时和 token 统计 ===
     elapsed = time.time() - start_time
