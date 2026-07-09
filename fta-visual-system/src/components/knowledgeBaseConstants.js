@@ -1,10 +1,10 @@
-/**
- * 知识库构建阶段（对齐 FTA-KB + 下游同步到 FTA-GNR 的真实流程）：
+﻿/**
+ * 知识库构建阶段：FTA-KB 独立完成入库，GNR 只消费已入库的版本化知识。
  * - Parse: 解析文件（PDF->MD + 清理 MD 标题层级）
  * - Chunk: 文本分块
- * - Entity: 实体提取（可跳过）
- * - Relation: 关系提取（可跳过）
- * - Sync: 调用 FTA-GNR /api/integration/import-knowledge-artifacts 导入到 Mongo/Neo4j
+ * - Entity: 实体抽取（可跳过）
+ * - Relation: 关系抽取（可跳过）
+ * - Sync: FTA-KB 写入 MongoDB/Neo4j 和版本化 catalog
  */
 export const KB_BUILD_STAGES = [
   { id: 'parse', label: '解析文件' },
@@ -95,12 +95,6 @@ export function computeKbTimelineState(job, phase) {
 
 const FILE_VERSION_SUFFIX_RE = /_v\d+$/i
 
-/**
- * chunks 表按 file_version_id 存储（常见形如 `{file_id}_v1`），而 KB 同步字段偶发只回填 `file_id`。
- * 展开候选 ID，避免仅用 file_id 查询时无法命中分块。
- * @param {Array<{ fileVersionId?: string, fileId?: string }>} files
- * @returns {string[]}
- */
 export function expandFileVersionIdsForChunkQuery(files) {
   const seen = new Set()
   const out = []
@@ -108,8 +102,7 @@ export function expandFileVersionIdsForChunkQuery(files) {
     if (!f || typeof f !== 'object') continue
     const fv = String(f.fileVersionId || '').trim()
     const fid = String(f.fileId || '').trim()
-    /** @type {Set<string>} */
-    const cands = new Set()
+        const cands = new Set()
     if (fv) cands.add(fv)
     if (fid) cands.add(fid)
     if (fid && !FILE_VERSION_SUFFIX_RE.test(fid)) cands.add(`${fid}_v1`)
@@ -125,7 +118,6 @@ export function expandFileVersionIdsForChunkQuery(files) {
   return out
 }
 
-/** 合并两次 chunks 查询结果，按 chunk_uid / id 去重 */
 export function mergeKbChunksByIdentity(a, b) {
   const map = new Map()
   for (const c of [...(a || []), ...(b || [])]) {
@@ -140,7 +132,6 @@ export function mergeKbChunksByIdentity(a, b) {
   return [...map.values()]
 }
 
-/** 从 chunk 文档取展示文本 */
 export function getChunkBodyText(chunk) {
   if (!chunk || typeof chunk !== 'object') return ''
   const t =
@@ -153,7 +144,6 @@ export function getChunkBodyText(chunk) {
   return typeof t === 'string' ? t : String(t || '')
 }
 
-/** 标明 chunk 更可能属于哪个勾选文件名（子串匹配） */
 export function matchChunkToFileName(chunk, fileNames) {
   const parts = []
   for (const key of ['source', 'chunk_name', 'file', 'doc_name', 'path']) {
@@ -173,11 +163,6 @@ export function matchChunkToFileName(chunk, fileNames) {
   return fileNames?.[0] || '—'
 }
 
-/**
- * 优先用 file_version_id / file_id 与本地文件记录对齐，其次再用文件名子串匹配。
- * @param {object} chunk
- * @param {Array<{ id: string, name?: string, fileVersionId?: string, fileId?: string }>} files
- */
 export function matchChunkToKbFile(chunk, files) {
   const fv = chunk?.file_version_id != null ? String(chunk.file_version_id) : ''
   const fid = chunk?.file_id != null ? String(chunk.file_id) : ''
@@ -194,11 +179,6 @@ export function matchChunkToKbFile(chunk, files) {
   return matchChunkToFileName(chunk, names)
 }
 
-/**
- * 判断 chunk 是否属于指定本地文件（用于按选中文件过滤列表；无匹配则 false，不默认归到首个文件）。
- * @param {object} chunk
- * @param {{ name?: string, fileVersionId?: string, fileId?: string }} file
- */
 export function chunkBelongsToKbFile(chunk, file) {
   if (!chunk || typeof chunk !== 'object' || !file) return false
   const fv = chunk.file_version_id != null ? String(chunk.file_version_id) : ''

@@ -3,7 +3,6 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -15,7 +14,6 @@ except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore
 
 
-load_dotenv()
 
 
 class SelectedFile(BaseModel):

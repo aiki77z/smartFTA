@@ -113,7 +113,6 @@ export function profileKnowledgeFile({ file, outputDir = './output', signal } = 
 export function importWorkOrders({
   file,
   outputDir = './output',
-  fileId,
   fieldMapping,
   syncToGenerateFta = true,
   generateFtaBaseUrl,
@@ -124,7 +123,6 @@ export function importWorkOrders({
   const form = new FormData()
   form.append('file', file)
   form.append('output_dir', outputDir)
-  appendIfPresent(form, 'file_id', fileId)
   if (fieldMapping && typeof fieldMapping === 'object' && !Array.isArray(fieldMapping)) {
     form.append('field_mapping_json', JSON.stringify(fieldMapping))
   }
@@ -206,3 +204,30 @@ export async function pollKbJob({ jobId, signal, onUpdate, intervalMs = 900 } = 
   }
 }
 
+
+export function getChunk({ chunkId, signal } = {}) {
+  return requestJson(`/api/chunk/${encodeURIComponent(chunkId)}`, { signal })
+}
+
+export function listChunksByFileNames({ fileNames, signal } = {}) {
+  const names = Array.isArray(fileNames) ? fileNames.map((n) => String(n || '').trim()).filter(Boolean) : []
+  if (!names.length) return Promise.resolve({ chunks: [], total: 0 })
+  const params = new URLSearchParams()
+  for (const n of names) params.append('file_names', n)
+  return requestJson(`/api/chunks?${params.toString()}`, { signal })
+}
+
+export function listChunksByFileVersionIds({ fileVersionIds, signal } = {}) {
+  const ids = Array.isArray(fileVersionIds) ? fileVersionIds.map((n) => String(n || '').trim()).filter(Boolean) : []
+  if (!ids.length) return Promise.resolve({ chunks: [], total: 0 })
+  const params = new URLSearchParams()
+  for (const id of ids) params.append('file_version_ids', id)
+  return requestJson(`/api/chunks?${params.toString()}`, { signal })
+}
+
+export function listAllChunks({ limit = 800, signal } = {}) {
+  const params = new URLSearchParams()
+  params.set('all', '1')
+  if (Number.isFinite(Number(limit))) params.set('limit', String(Math.max(1, Math.min(1000, Number(limit)))))
+  return requestJson(`/api/chunks?${params.toString()}`, { signal })
+}

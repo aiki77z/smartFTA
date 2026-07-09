@@ -22,8 +22,8 @@ import {
   deleteTree,
   validateFaultTreeGraph,
   validateTreeSemantic,
-  getChunk,
 } from '../api/ftaBackend.js'
+import { getChunk } from '../api/kbBackend.js'
 import { editFaultTreeWithAi, sendAssistantAgentMessage, truncateAssistantSession } from '../api/ftaAiEditor.js'
 import {
   parseRawFtaJson,
@@ -1473,10 +1473,12 @@ function FaultTreePage() {
   }, [projectIdFromQuery])
 
   const assistantEligibleFiles = useMemo(() => {
-    if (kbAllowList === null) return projectFiles
+    const isVersionedReadyFile = (f) =>
+      Boolean(f && String(f.fileVersionId || '').trim() && (f.kbImportComplete || f.status === 'done'))
+    if (kbAllowList === null) return projectFiles.filter(isVersionedReadyFile)
     if (kbAllowList.length === 0) return []
     const allow = new Set(kbAllowList.map(String))
-    return projectFiles.filter((f) => allow.has(String(f.id)))
+    return projectFiles.filter((f) => allow.has(String(f.id)) && isVersionedReadyFile(f))
   }, [projectFiles, kbAllowList])
 
   const selectedFileVersionIdsForAssistant = useMemo(() => {
@@ -2052,7 +2054,7 @@ function FaultTreePage() {
         const f =
           assistantEligibleFiles.find((x) => String(x.id) === String(id)) ||
           projectFiles.find((x) => String(x.id) === String(id))
-        return { id, name: f?.name || id, file_version_id: f?.fileVersionId || f?.file_version_id || '' }
+        return { id, name: f?.name || id, file_version_id: f?.fileVersionId || '' }
       })
       const baselineFileVersionIdsForAgent = baselineFvSig
         ? baselineFvSig.split('|').map((s) => String(s || '').trim()).filter(Boolean)

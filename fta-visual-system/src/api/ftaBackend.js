@@ -244,49 +244,6 @@ export function validateFaultTreeGraph({ graph, signal } = {}) {
   return requestJson('/validate-fault-tree', { method: 'POST', body: { graph }, signal })
 }
 
-export function getChunk({ chunkId, signal } = {}) {
-  return requestJson(`/api/chunk/${encodeURIComponent(chunkId)}`, { signal })
-}
-
-/**
- * GET /api/chunks?file_names=a.pdf,b.txt — 按文件名（basename 子串）筛选 Mongo 中的知识分块。
- * @param {{ fileNames: string[], signal?: AbortSignal }} opts
- */
-export function listChunksByFileNames({ fileNames, signal } = {}) {
-  const names = Array.isArray(fileNames) ? fileNames.map((n) => String(n || '').trim()).filter(Boolean) : []
-  if (!names.length) {
-    return Promise.resolve({ chunks: [], total: 0 })
-  }
-  const params = new URLSearchParams()
-  for (const n of names) params.append('file_names', n)
-  return requestJson(`/api/chunks?${params.toString()}`, { signal })
-}
-
-/**
- * GET /api/chunks?file_version_ids=... — 按 file_version_id 精确筛选知识分块（版本化 KB）。
- * @param {{ fileVersionIds: string[], signal?: AbortSignal }} opts
- */
-export function listChunksByFileVersionIds({ fileVersionIds, signal } = {}) {
-  const ids = Array.isArray(fileVersionIds) ? fileVersionIds.map((n) => String(n || '').trim()).filter(Boolean) : []
-  if (!ids.length) {
-    return Promise.resolve({ chunks: [], total: 0 })
-  }
-  const params = new URLSearchParams()
-  for (const id of ids) params.append('file_version_ids', id)
-  return requestJson(`/api/chunks?${params.toString()}`, { signal })
-}
-
-/**
- * GET /api/chunks?all=1 — 临时：拉取全库 chunks（后端仍会做 safe_limit 截断）。
- * @param {{ limit?: number, signal?: AbortSignal }} opts
- */
-export function listAllChunks({ limit = 800, signal } = {}) {
-  const params = new URLSearchParams()
-  params.set('all', '1')
-  if (Number.isFinite(Number(limit))) params.set('limit', String(Math.max(1, Math.min(1000, Number(limit)))))
-  return requestJson(`/api/chunks?${params.toString()}`, { signal })
-}
-
 export function getCorrections({ treeId, signal } = {}) {
   return requestJson(`/api/corrections/${encodeURIComponent(treeId)}`, { signal })
 }

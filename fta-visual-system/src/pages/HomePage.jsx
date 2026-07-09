@@ -1,16 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
   generateAllTrees,
   getTree,
   getTreeVersion,
-  listAllChunks,
   pollBatchJob,
 } from '../api/ftaBackend.js'
 import {
   downloadKbJobUploadedFile,
   importMaintenanceCases,
   importWorkOrders,
+  listAllChunks,
   pollKbJob,
   profileKnowledgeFile,
   startKbJobUpload,
@@ -453,7 +453,7 @@ function HomePage() {
     ) {
       return 'done'
     }
-    if (st === 'completed_with_sync_error') return 'done'
+    if (st === 'completed_with_sync_error') return 'failed'
     if (st === 'failed' || st === 'error') return 'failed'
     return 'processing'
   }, [])
@@ -461,9 +461,19 @@ function HomePage() {
   const updateKbFileAfterDirectImport = useCallback((fileId, payload, category) => {
     const fileMeta = payload?.file || {}
     const counts = payload?.imported || payload?.counts || {}
-    setFiles((prevFiles) =>
-      prevFiles.map((f) => {
-        if (f.id !== fileId) return f
+    const logicalFileId = fileMeta?.file_id || ''
+    setFiles((prevFiles) => {
+      const relatedIds = prevFiles.filter((f) => logicalFileId && f.fileId === logicalFileId).map((f) => f.id)
+      setKbChunkIncludeById((prev) => {
+        const next = { ...prev }
+        relatedIds.forEach((id) => { next[id] = id === fileId })
+        next[fileId] = true
+        return next
+      })
+      return prevFiles.map((f) => {
+        if (f.id !== fileId) {
+          return logicalFileId && f.fileId === logicalFileId ? { ...f, isActive: false } : f
+        }
         return {
           ...f,
           status: 'done',
@@ -473,12 +483,14 @@ function HomePage() {
           kbCategoryLabel: kbCategoryLabel(category),
           sourceType: payload?.source_type || inferSourceTypeFromCategory(category),
           fileVersionId: fileMeta?.file_version_id || f.fileVersionId || '',
-          fileId: fileMeta?.file_id || f.fileId || '',
+          fileId: logicalFileId || f.fileId || '',
+          versionNo: fileMeta?.version_no || f.versionNo || null,
+          isActive: true,
           importedFileName: fileMeta?.file_name || f.importedFileName || '',
           resultSummary: counts,
         }
-      }),
-    )
+      })
+    })
   }, [])
 
   const markKbFileImportFailed = useCallback((fileId, category, error) => {
@@ -517,24 +529,40 @@ function HomePage() {
           }
           const pct = kbProgressFromJob(job)
           const importedFile = job?.sync_response?.file
-          const importedFileVersionId = importedFile?.file_version_id || ''
-          const importedFileId = importedFile?.file_id || ''
-          const importedFileName = importedFile?.file_name || ''
-          setFiles((prevFiles) =>
-            prevFiles.map((f) => {
-              if (f.id !== fileId) return f
+          const importedFileVersionId = importedFile?.file_version_id || job?.file_version_id || ''
+          const importedFileId = importedFile?.file_id || job?.file_id || ''
+          const importedFileName = importedFile?.file_name || job?.uploaded_file_name || ''
+          const terminalStatus = kbStatusFromJob(job)
+          setFiles((prevFiles) => {
+            const relatedIds = prevFiles.filter((f) => importedFileId && f.fileId === importedFileId).map((f) => f.id)
+            if (terminalStatus === 'done') {
+              setKbChunkIncludeById((prev) => {
+                const next = { ...prev }
+                relatedIds.forEach((id) => { next[id] = id === fileId })
+                next[fileId] = true
+                return next
+              })
+            }
+            return prevFiles.map((f) => {
+              if (f.id !== fileId) {
+                return terminalStatus === 'done' && importedFileId && f.fileId === importedFileId
+                  ? { ...f, isActive: false }
+                  : f
+              }
               const next = {
                 ...f,
                 kbJobId: jobId,
                 fileVersionId: importedFileVersionId || f.fileVersionId || '',
                 fileId: importedFileId || f.fileId || '',
                 importedFileName: importedFileName || f.importedFileName || '',
+                versionNo: importedFile?.version_no || job?.version_no || f.versionNo || null,
+                isActive: terminalStatus === 'done' ? true : f.isActive,
                 parseProgress: Math.max(f.parseProgress || 0, pct),
                 status: kbStatusFromJob(job),
               }
               return withKbImportCompleteIfDone(next, job)
-            }),
-          )
+            })
+          })
         },
         intervalMs: 2000,
       }).catch((e) => {
@@ -729,21 +757,9 @@ function HomePage() {
         }
       })
 
-      let base = [...files]
-      const removedIds = []
-      for (const inc of incoming) {
-        const di = base.findIndex((f) => f.name === inc.name)
-        if (di >= 0) {
-          removedIds.push(base[di].id)
-          fileObjectStoreRef.current.delete(base[di].id)
-          base.splice(di, 1)
-        }
-      }
-
-      setFiles([...incoming, ...base])
+      setFiles([...incoming, ...files])
       setKbChunkIncludeById((prev) => {
         const next = { ...prev }
-        for (const rid of removedIds) delete next[rid]
         for (const inc of incoming) next[inc.id] = true
         return next
       })
@@ -889,7 +905,7 @@ function HomePage() {
     setKbChunkIncludeById((prev) => {
       const next = { ...prev }
       for (const f of files) {
-        if (!(f.id in next)) next[f.id] = true
+        if (!(f.id in next)) next[f.id] = f.isActive !== false
       }
       return next
     })
@@ -1114,10 +1130,27 @@ function HomePage() {
     setKbDatasetEpoch((e) => (Number.isFinite(e) ? e + 1 : 1))
   }, [])
 
+  const fileDisplayItems = useMemo(() => {
+    const normalizedName = (name) => String(name || '').trim().toLocaleLowerCase()
+    const sorted = [...files].sort((a, b) => {
+      const groupA = a.fileId || `pending:${normalizedName(a.name)}`
+      const groupB = b.fileId || `pending:${normalizedName(b.name)}`
+      if (groupA !== groupB) return groupA.localeCompare(groupB)
+      return Number(b.versionNo || 0) - Number(a.versionNo || 0)
+    })
+    let previousGroup = ''
+    return sorted.map((file) => {
+      const groupKey = file.fileId || `pending:${normalizedName(file.name)}`
+      const startsGroup = groupKey !== previousGroup
+      previousGroup = groupKey
+      return { file, startsGroup, groupKey }
+    })
+  }, [files])
+
   const batchScopeFileVersionIds = useMemo(() => {
     // 仅使用“已完成”且具备 fileVersionId 的文件作为选源范围
     const ids = files
-      .filter((f) => f.status === 'done')
+      .filter((f) => f.status === 'done' && kbChunkIncludeById[f.id] !== false)
       .map((f) => String(f.fileVersionId || '').trim())
       .filter(Boolean)
     // 去重保持顺序
@@ -1129,7 +1162,7 @@ function HomePage() {
       uniq.push(id)
     }
     return uniq
-  }, [files])
+  }, [files, kbChunkIncludeById])
 
   const startBatchGenerate = useCallback(() => {
     if (!batchScopeFileVersionIds.length) {
@@ -1392,7 +1425,7 @@ function HomePage() {
           <h2 className="home-panel-title">知识库构建</h2>
           <p className="home-panel-desc">
             上传设备手册、维修记录等资料，完成解析与知识抽取后可作为故障树生成的依据。分块预览来自 FTA
-            后端（localhost:8000）数据库中与勾选文件匹配的 chunks。
+            KB 后端（localhost:8010）数据库中与勾选文件匹配的 chunks。
           </p>
 
           <div className="home-panel-scroll">
@@ -1423,9 +1456,15 @@ function HomePage() {
               {files.length === 0 && (
                 <div className="home-empty">暂无文件。请先上传设备资料。</div>
               )}
-              {files.map((file) => (
+              {fileDisplayItems.map(({ file, startsGroup, groupKey }) => (
+                <Fragment key={file.id}>
+                  {startsGroup ? (
+                    <div className="home-file-version-group" title={groupKey}>
+                      <span>{file.name}</span>
+                      <span>{file.fileId ? '\u7248\u672c\u8bb0\u5f55' : '\u5f85\u5206\u914d\u7248\u672c'}</span>
+                    </div>
+                  ) : null}
                 <div
-                  key={file.id}
                   className={`home-file-row${
                     file.id === selectedFileId ? ' home-file-row--selected' : ''
                   }${linkedKbFileIds.includes(file.id) ? ' home-file-row--linked' : ''}${
@@ -1535,6 +1574,7 @@ function HomePage() {
                     ×
                   </button>
                 </div>
+                </Fragment>
               ))}
             </div>
 
