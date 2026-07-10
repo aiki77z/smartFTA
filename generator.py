@@ -349,7 +349,10 @@ def build_fault_tree_from_subgraph_and_chunks(
 4. 顶事件节点 type=top_event，event 必须为 null。
 5. intermediate_event 和 basic_event 必须有完整 event 字段。
 6. event 中优先使用 graph_props 里的字段，chunks 只用于补充和润色。
-7. documents 必须输出完整结构：chunk_id、chunk_name、section_path、source_page。
+7. documents 只能输出轻量溯源引用字段，且每个节点最多 1-3 条：
+   chunk_id、chunk_name、section_path、source_page、file_id、file_version_id。
+   严禁在 documents 中输出 content、text、raw_text、page_content、file、chunk_uid 等正文或额外字段。
+   chunk 正文由前端在节点详情展开时，按 file_version_id + chunk_id 从后端动态查询，不要写入故障树 JSON。
 8. 每个节点都保留 graphNodeId 和 kg_key，值与输入骨架一致。
 9. rules 使用数组；如果只有单条 rule 字符串，也请把它转成一条规则对象或留空数组。不要输出未定义字段。
 10. 只输出 JSON，不要输出 markdown。{physical_ref_block}
@@ -507,6 +510,41 @@ def apply_physical_refs_to_fault_tree_data(
     return out
 
 
+_ALLOWED_DOCUMENT_FIELDS = (
+    "chunk_id",
+    "chunk_name",
+    "section_path",
+    "source_page",
+    "file_id",
+    "file_version_id",
+)
+
+
+def _sanitize_fault_tree_documents(tree: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep fault-tree evidence references lightweight; chunk content is loaded on demand."""
+    if not isinstance(tree, dict):
+        return tree
+    out = dict(tree)
+    sanitized_nodes: List[Dict[str, Any]] = []
+    for node in out.get("nodeList") or []:
+        if not isinstance(node, dict):
+            sanitized_nodes.append(node)
+            continue
+        next_node = dict(node)
+        event = next_node.get("event")
+        if isinstance(event, dict):
+            next_event = dict(event)
+            docs = []
+            for doc in next_event.get("documents") or []:
+                if isinstance(doc, dict):
+                    docs.append({field: doc.get(field, "") for field in _ALLOWED_DOCUMENT_FIELDS})
+            next_event["documents"] = docs
+            next_node["event"] = next_event
+        sanitized_nodes.append(next_node)
+    out["nodeList"] = sanitized_nodes
+    return out
+
+
 def _post_process_generated_tree(
     tree: Dict[str, Any],
     skeleton: Dict[str, Any],
@@ -514,19 +552,23 @@ def _post_process_generated_tree(
 ) -> Dict[str, Any]:
     skeleton_nodes = {node["id"]: node for node in skeleton["nodes"]}
     graph_to_node = {node["graphNodeId"]: node for node in skeleton["nodes"]}
-    evidence_doc_map = {
-        str(chunk.get("chunk_uid") or chunk.get("chunk_id")): {
+    evidence_doc_map: Dict[str, Dict[str, Any]] = {}
+    for chunk in evidence_chunks:
+        doc_ref = {
             "chunk_id": chunk.get("chunk_id"),
-            "chunk_uid": chunk.get("chunk_uid"),
             "chunk_name": chunk.get("chunk_name", ""),
             "section_path": chunk.get("section_path", ""),
             "source_page": chunk.get("source_page", ""),
             "file_id": chunk.get("file_id", ""),
             "file_version_id": chunk.get("file_version_id", ""),
-            "file": chunk.get("file", ""),
         }
-        for chunk in evidence_chunks
-    }
+        for key in (
+            chunk.get("chunk_uid"),
+            chunk.get("chunk_id"),
+            f"{chunk.get('file_version_id')}::{chunk.get('chunk_id')}" if chunk.get("file_version_id") and chunk.get("chunk_id") not in (None, "") else None,
+        ):
+            if key not in (None, ""):
+                evidence_doc_map[str(key)] = doc_ref
 
     node_list = tree.get("nodeList") or []
     if not node_list:
@@ -579,6 +621,18 @@ def _post_process_generated_tree(
                 event.get("investigateMethod") or graph_props.get("investigateMethod") or f"检查{name}相关状态与报警记录"
             )
             chunk_ids = []
+            for chunk_id in (skeleton_node or {}).get("source_chunk_refs") or []:
+                if chunk_id not in (None, ""):
+                    chunk_ids.append(chunk_id)
+            for chunk_id in (skeleton_node or {}).get("source_chunk_ids") or []:
+                if chunk_id not in (None, ""):
+                    chunk_ids.append(chunk_id)
+            for chunk_id in node.get("source_chunk_refs") or []:
+                if chunk_id not in (None, ""):
+                    chunk_ids.append(chunk_id)
+            for chunk_id in node.get("source_chunk_ids") or []:
+                if chunk_id not in (None, ""):
+                    chunk_ids.append(chunk_id)
             for doc in (skeleton_node or {}).get("documents_seed") or []:
                 if doc.get("chunk_id") not in (None, ""):
                     chunk_ids.append(doc.get("chunk_id"))
@@ -588,12 +642,14 @@ def _post_process_generated_tree(
             documents = []
             for chunk_id in dict.fromkeys(chunk_ids):
                 chunk_ref = str(chunk_id)
-                if file_version_id:
+                if file_version_id and "::" not in chunk_ref:
                     chunk_ref = f"{file_version_id}::{chunk_id}"
                 if chunk_ref in evidence_doc_map:
                     documents.append(evidence_doc_map[chunk_ref])
                 elif str(chunk_id) in evidence_doc_map:
                     documents.append(evidence_doc_map[str(chunk_id)])
+            if not documents:
+                documents = _match_documents_for_event(name, evidence_chunks, limit=2)
             merged["documents"] = documents
             event = merged
 
@@ -633,7 +689,7 @@ def _post_process_generated_tree(
             }
         )
 
-    return {"nodeList": normalized_nodes, "linkList": link_list}
+    return _sanitize_fault_tree_documents({"nodeList": normalized_nodes, "linkList": link_list})
 
 
 def repair_fault_tree(
@@ -669,7 +725,7 @@ def repair_fault_tree(
         temperature=0.1,
         max_tokens=LLM_REPAIR_MAX_TOKENS,
     )
-    repaired = _parse_json(response.choices[0].message.content)
+    repaired = _sanitize_fault_tree_documents(_parse_json(response.choices[0].message.content))
     if include_meta:
         return {
             "tree": repaired,
@@ -1120,7 +1176,10 @@ def build_fault_tree_from_chunk_elements(
 4. 中间事件和底事件必须填完整event对象
 5. errorLevel必须填写：高/中/低
 6. rules尽量从手册提取触发条件；无量化数据则填[]
-7. documents只能从给定chunk列表中选择，每个节点最多2条
+7. documents只能从给定chunk列表中选择，每个节点最多2条，且每条只允许包含：
+   chunk_id、chunk_name、section_path、source_page、file_id、file_version_id。
+   严禁输出 content、text、raw_text、page_content、file、chunk_uid 等正文或额外字段。
+   chunk正文由前端点击节点详情时按 file_version_id + chunk_id 动态查询，不要写入故障树JSON。
 8. investigateMethod尽量控制在40字以内
 9. description尽量控制在60字以内
 10. linkList的sourceId是子节点（原因方），targetId是父节点（结果方）
@@ -1140,7 +1199,7 @@ def build_fault_tree_from_chunk_elements(
         temperature=0.2,
         max_tokens=LLM_GENERATION_MAX_TOKENS,
     )
-    return _parse_json(response.choices[0].message.content)
+    return _sanitize_fault_tree_documents(_parse_json(response.choices[0].message.content))
 
 
 def _normalize_token_usage(usage: Any) -> Dict[str, Optional[int]]:
@@ -2143,13 +2202,11 @@ def _match_documents_for_event(name: str, chunks: List[Dict[str, Any]], *, limit
         matched.append(
             {
                 "chunk_id": chunk.get("chunk_id", chunk.get("id")),
-                "chunk_uid": chunk.get("chunk_uid"),
                 "chunk_name": chunk.get("chunk_name", ""),
                 "section_path": chunk.get("section_path", ""),
                 "source_page": chunk.get("source", chunk.get("source_page", "")),
                 "file_id": chunk.get("file_id", ""),
                 "file_version_id": chunk.get("file_version_id", ""),
-                "file": chunk.get("file", ""),
             }
         )
         return len(matched) >= limit
@@ -2343,7 +2400,7 @@ def _post_process_chunk_generated_tree(
         if source_id in valid_ids and target_id in valid_ids
     ]
 
-    return {"nodeList": normalized_nodes, "linkList": normalized_links}
+    return _sanitize_fault_tree_documents({"nodeList": normalized_nodes, "linkList": normalized_links})
 
 
 def build_fault_tree_from_subgraph_and_chunks(
@@ -2406,7 +2463,10 @@ Skeleton constraints:
 5. The top event node must stay `type=top_event` and `event=null`.
 6. Every non-top node must have a complete `event` object.
 7. Keep `graphNodeId` and `kg_key` identical to the input skeleton.
-8. `documents` should be filled from the recalled evidence chunks.
+8. `documents` must be filled from the recalled evidence chunks, but each document object may contain only:
+   `chunk_id`, `chunk_name`, `section_path`, `source_page`, `file_id`, `file_version_id`.
+   Never output chunk body fields such as `content`, `text`, `raw_text`, `page_content`, `file`, or `chunk_uid`.
+   The frontend will load chunk content dynamically by `file_version_id + chunk_id` when a node detail panel is opened.
 9. Return JSON only. 事件节点名称需要是中文的故障现象。
 
 Graph skeleton:
@@ -2578,6 +2638,10 @@ Output rules:
 6. Every non-top node must have a full `event` object including:
    `id`, `name`, `description`, `errorLevel`, `priority`, `probability`, `showProbability`, `rule`, `rules`, `investigateMethod`, `documents`
 7. `documents` must be selected only from the provided chunk list. Each non-top node should reference 1-3 chunks.
+   Each document object may contain only these six lightweight reference fields:
+   `chunk_id`, `chunk_name`, `section_path`, `source_page`, `file_id`, `file_version_id`.
+   Never output chunk body fields such as `content`, `text`, `raw_text`, `page_content`, `file`, or `chunk_uid`.
+   The frontend will load chunk content dynamically by `file_version_id + chunk_id` when a node detail panel is opened.
 8. `linkList.sourceId` is child and `linkList.targetId` is parent.
 9. Do not output isolated nodes. Do not output an empty tree.
 10. If evidence is limited, still produce the smallest coherent tree with meaningful hierarchy and logic gates.
