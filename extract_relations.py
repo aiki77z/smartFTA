@@ -23,6 +23,75 @@ def extract_chunk_common_fields(chunk: Dict) -> Dict:
     }
 
 
+def get_chunk_id(chunk: Dict) -> str:
+    chunk_id_val = chunk.get("chunk_id")
+    if chunk_id_val is None:
+        chunk_id_val = chunk.get("id")
+    if chunk_id_val is None:
+        return ""
+    return str(chunk_id_val)
+
+
+def get_chunk_index(chunk: Dict):
+    try:
+        return int(get_chunk_id(chunk))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_plain_text_chunk(chunk: Dict) -> bool:
+    if chunk.get("table") or chunk.get("structured_table"):
+        return False
+    chunk_type = str(chunk.get("chunk_type") or "").strip()
+    return chunk_type in ("", "document_section")
+
+
+def same_markdown_section(prev_chunk: Dict, curr_chunk: Dict) -> bool:
+    prev_path = str(prev_chunk.get("section_path") or "").strip()
+    curr_path = str(curr_chunk.get("section_path") or "").strip()
+    if prev_path or curr_path:
+        return prev_path == curr_path
+    return (
+        str(prev_chunk.get("chapter") or "").strip() == str(curr_chunk.get("chapter") or "").strip()
+        and str(prev_chunk.get("section") or "").strip() == str(curr_chunk.get("section") or "").strip()
+        and str(prev_chunk.get("subsection") or "").strip() == str(curr_chunk.get("subsection") or "").strip()
+    )
+
+
+def should_use_sliding_window(prev_chunk: Dict, curr_chunk: Dict) -> bool:
+    if not prev_chunk or not curr_chunk:
+        return False
+    if str(prev_chunk.get("file_id") or "") != str(curr_chunk.get("file_id") or ""):
+        return False
+    if str(prev_chunk.get("file_version_id") or "") != str(curr_chunk.get("file_version_id") or ""):
+        return False
+    prev_index = get_chunk_index(prev_chunk)
+    curr_index = get_chunk_index(curr_chunk)
+    if prev_index is None or curr_index is None or prev_index + 1 != curr_index:
+        return False
+    if not is_plain_text_chunk(prev_chunk) or not is_plain_text_chunk(curr_chunk):
+        return False
+    if not same_markdown_section(prev_chunk, curr_chunk):
+        return False
+    return True
+
+
+def merge_entities_with_origin(prev_entities: List[Dict], curr_entities: List[Dict]) -> List[Dict]:
+    merged = []
+    seen = set()
+    for origin, entities in (("CONTEXT", prev_entities), ("TARGET", curr_entities)):
+        for ent in entities or []:
+            name = ent.get("name") or ent.get("entity_name")
+            norm = normalize_entity_name(name)
+            if not norm or norm in seen:
+                continue
+            item = dict(ent)
+            item["origin"] = origin
+            merged.append(item)
+            seen.add(norm)
+    return merged
+
+
 def normalize_entity_name(name: str) -> str:
     if not name:
         return ""
@@ -161,6 +230,10 @@ def save_relations_to_csv_second(relations: List[Dict], output_csv_path: str) ->
         fieldnames.update(rel.keys())
     preferred_order = [
         "chunk_id",
+        "owner_chunk_id",
+        "source_chunk_ids",
+        "extraction_method",
+        "uses_context",
         "file_id",
         "file_version_id",
         "source_type",
@@ -221,16 +294,12 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
         with open(output_file, "r", encoding="utf-8") as f:
             results = [json.loads(line.strip()) for line in f]
 
-    chunk_entities_map = {res["chunk_id"]: res["entities"] for res in entities_results}
+    chunk_entities_map = {str(res["chunk_id"]): res["entities"] for res in entities_results}
+    chunk_by_id = {get_chunk_id(chunk): chunk for chunk in chunks if get_chunk_id(chunk)}
 
     pending_chunks = []
     for chunk in chunks:
-        chunk_id_val = chunk.get("chunk_id")
-        if chunk_id_val is None:
-            chunk_id_val = chunk.get("id")
-        if chunk_id_val is None:
-            chunk_id_val = ""
-        chunk_id = str(chunk_id_val)
+        chunk_id = get_chunk_id(chunk)
         if not chunk_id or chunk_id in processed_chunk_ids:
             continue
         pending_chunks.append((chunk_id, chunk))
@@ -270,10 +339,35 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
             enriched_content = content
         
         entities = chunk_entities_map.get(chunk_id, [])
+        prev_chunk = None
+        prev_chunk_id = ""
+        prev_entities = []
+        curr_index = get_chunk_index(chunk)
+        if curr_index is not None:
+            prev_chunk_id = str(curr_index - 1)
+            prev_chunk = chunk_by_id.get(prev_chunk_id)
+            prev_entities = chunk_entities_map.get(prev_chunk_id, [])
+
+        use_sliding_window = should_use_sliding_window(prev_chunk, chunk)
+        extraction_method = "SLIDING_WINDOW" if use_sliding_window else "SINGLE_CHUNK"
+
+        if use_sliding_window:
+            prev_content = prev_chunk.get("content", "")
+            enriched_content = (
+                "【前文上下文 CONTEXT】\n"
+                f"{prev_content}\n\n"
+                "【当前处理文本 TARGET】\n"
+                f"{enriched_content}"
+            )
+            relation_entities = merge_entities_with_origin(prev_entities, entities)
+            source_chunk_ids = [prev_chunk_id, chunk_id]
+        else:
+            relation_entities = merge_entities_with_origin([], entities)
+            source_chunk_ids = [chunk_id]
         
         original_entity_map = {}
         normalized_entity_map = {}
-        for ent in entities:
+        for ent in relation_entities:
             name = ent.get("name") or ent.get("entity_name")
             if name:
                 original_entity_map[name] = ent
@@ -281,12 +375,15 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
                 if norm_name not in normalized_entity_map:
                     normalized_entity_map[norm_name] = ent
         
-        print(f"处理文档关系：{chunk_name}，chunk_id: {chunk_id}，实体数: {len(entities)}")
+        print(
+            f"处理文档关系：{chunk_name}，chunk_id: {chunk_id}，"
+            f"实体数: {len(relation_entities)}，方法: {extraction_method}"
+        )
         valid_relations = []
         try:
-            if entities:
+            if relation_entities:
                 relation_prompt, relation_context = generate_relation_prompt_and_context_second(
-                    chunk_name, enriched_content, entities
+                    chunk_name, enriched_content, relation_entities
                 )
                 relation_text = call_llm_with_retry(relation_prompt, relation_context, mode="relation", max_retries=max_retries)
 
@@ -339,6 +436,10 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
                             
                             # 为每个关系添加 chunk 元数据
                             rel["chunk_id"] = chunk_id
+                            rel["owner_chunk_id"] = chunk_id
+                            rel["source_chunk_ids"] = source_chunk_ids
+                            rel["extraction_method"] = extraction_method
+                            rel["uses_context"] = use_sliding_window
                             rel["file_id"] = file_id
                             rel["file_version_id"] = file_version_id
                             rel["file_name"] = file_name
@@ -356,6 +457,8 @@ def extract_relations_incremental(chunks: List[Dict], entities_results: List[Dic
                 "file_version_id": file_version_id,
                 "file_name": file_name,
                 "is_active": is_active,
+                "extraction_method": extraction_method,
+                "source_chunk_ids": source_chunk_ids,
                 "relations": valid_relations,
             }
             result.update(common_fields)

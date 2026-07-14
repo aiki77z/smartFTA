@@ -90,9 +90,20 @@ def load_json(
                 "entity2_type": entity2_type,
                 "entity1_label": LABEL_MAP.get(entity1_type, ""),
                 "entity2_label": LABEL_MAP.get(entity2_type, ""),
+                "owner_chunk_id": str(rel.get("owner_chunk_id") or chunk_id).strip(),
+                "extraction_method": str(rel.get("extraction_method") or item.get("extraction_method") or "SINGLE_CHUNK").strip(),
+                "uses_context": bool(rel.get("uses_context", False)),
             })
         if chunk_id and cleaned:
             chunk_ref = _make_chunk_ref(file_version_id, chunk_id)
+            source_chunk_ids = [
+                str(value).strip()
+                for value in (item.get("source_chunk_ids") or [chunk_id])
+                if str(value).strip()
+            ]
+            if not source_chunk_ids:
+                source_chunk_ids = [chunk_id]
+            source_chunk_refs = [_make_chunk_ref(file_version_id, value) for value in source_chunk_ids]
             normalized.append({
                 "chunk_id": chunk_id,
                 "chunk_ref": chunk_ref,
@@ -102,12 +113,13 @@ def load_json(
                 "is_active": bool(is_active),
                 "documents_json": json.dumps(
                     [
-                        {"chunk_id": chunk_id, "chunk_uid": chunk_ref, "file_version_id": file_version_id}
-                    ] if chunk_ref else [{"chunk_id": chunk_id}],
+                        {"chunk_id": cid, "chunk_uid": cref, "file_version_id": file_version_id}
+                        for cid, cref in zip(source_chunk_ids, source_chunk_refs)
+                    ] if source_chunk_refs else [{"chunk_id": cid} for cid in source_chunk_ids],
                     ensure_ascii=False,
                 ),
-                "source_chunk_ids": [chunk_id],
-                "source_chunk_refs": [chunk_ref] if chunk_ref else [],
+                "source_chunk_ids": source_chunk_ids,
+                "source_chunk_refs": source_chunk_refs,
                 "relations": cleaned,
             })
 
@@ -251,8 +263,11 @@ FOREACH (_ IN CASE WHEN rel.entity2_label = 'Tool' THEN [1] ELSE [] END | SET e2
 MERGE (e1)-[r:RELATION {relation_type: rel.relation_type, chunk_ref: row.chunk_ref}]->(e2)
   ON CREATE SET r.created_at = datetime()
 SET r.chunk_id = row.chunk_id,
+    r.owner_chunk_id = rel.owner_chunk_id,
     r.source_chunk_ids = row.source_chunk_ids,
     r.source_chunk_refs = row.source_chunk_refs,
+    r.extraction_method = rel.extraction_method,
+    r.uses_context = rel.uses_context,
     r.file_id = row.file_id,
     r.file_version_id = row.file_version_id,
     r.is_active = row.is_active,

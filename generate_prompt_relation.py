@@ -149,7 +149,11 @@ def generate_relation_prompt_and_context_second(chunk_name, chunk_content: str, 
 - <编码器信号丢失, 触发, 引起, 控制单元报警>
 """
 
-    entity_list = '\n'.join([f"- {e.get('entity_name') or e.get('name')} ({e.get('entity_type')})" for e in entities]) or "(无实体，请直接输出空)"
+    entity_list = '\n'.join([
+        f"- {e.get('entity_name') or e.get('name')} ({e.get('entity_type')})"
+        + (f" [来源: {e.get('origin')}]" if e.get("origin") else "")
+        for e in entities
+    ]) or "(无实体，请直接输出空)"
 
     prompt = f"""请从以下<{domain}>技术文档片段中，基于提供的实体列表，**穷尽式地**提取上述三类关系（参与组合、组合导致、触发）。
 
@@ -180,6 +184,13 @@ def generate_relation_prompt_and_context_second(chunk_name, chunk_content: str, 
 5. **鼓励提取所有可能的关系**：如果文本中有多个因果链，请全部输出。特别是当多个具体故障都属于一个大类故障时，应为每个具体故障提取一条“触发”关系指向大类故障。
 6. 如果文本中没有“逻辑与”实体，则只提取“触发”关系。
 7. **不要因为关系数量多而省略。一段技术文档中往往有多个因果关系，请仔细分析每个句子，确保方向正确。**
+8. 如果待分析文本包含“【前文上下文 CONTEXT】”和“【当前处理文本 TARGET】”：
+   - CONTEXT 只用于理解 TARGET 中的指代、省略和跨 Chunk 边界的直接关系；
+   - 可以输出“CONTEXT 中实体”与“TARGET 中实体”之间、且必须结合 TARGET 才成立的直接关系；
+   - 可以输出 TARGET 内部直接支持的关系；
+   - 禁止输出只依赖 CONTEXT 就能成立的旧关系；
+   - 禁止进行多跳传递推理，例如 A 导致 B、B 导致 C 时，不得额外输出 A 导致 C；
+   - 遇到“该故障、上述现象、此问题、该部件、前述报警”等指代表达时，优先解析到实体列表中的具体实体，不要把指代表达创建为新实体。
 
 <待分析文本>
 {chunk_content}
