@@ -1,0 +1,11 @@
+reviewed_annotations.csv
+ai_annotation_draft.csv
+raw_ai_annotations.jsonl
+final_annotations.jsonl
+.env
+.venv/
+venv/
+env/
+.streamlit/
+__pycache__/
+*.pyc

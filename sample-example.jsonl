@@ -1,0 +1,139 @@
+{
+  "sample_id": "file_001_chunk_002",
+  "file_id": "file_001",
+  "chapter_id": "chapter_01",
+
+  "context_chunk_id": "chunk_001",
+  "target_chunk_id": "chunk_002",
+
+  "context_text": "编码器接头松动会造成反馈信号丢失。",
+  "text": "上述异常将使主轴无法启动。重新紧固编码器接头后可恢复运行。",
+
+  "context_entities": [
+    {
+      "id": "chunk_001_E2",
+      "mention": "反馈信号丢失",
+      "type": "故障事件",
+      "normalized_name": "反馈信号丢失",
+      "chunk_id": "chunk_001",
+      "text_field": "context_text",
+      "start": 10,
+      "end": 16,
+      "annotation_role": "cross_chunk_relation_endpoint"
+    }
+  ],
+
+  "target_entities": [
+    {
+      "id": "chunk_002_E1",
+      "mention": "主轴无法启动",
+      "type": "故障事件",
+      "normalized_name": "主轴无法启动",
+      "chunk_id": "chunk_002",
+      "text_field": "text",
+      "start": 6,
+      "end": 12
+    },
+    {
+      "id": "chunk_002_E2",
+      "mention": "重新紧固编码器接头",
+      "type": "维修方法",
+      "normalized_name": "紧固编码器接头",
+      "chunk_id": "chunk_002",
+      "text_field": "text",
+      "start": 13,
+      "end": 22
+    }
+  ],
+
+  "relations": [
+    {
+      "id": "R1",
+      "source": "chunk_001_E2",
+      "relation_type": "故障触发",
+      "target": "chunk_002_E1",
+      "cross_chunk": true,
+      "involved_chunk_ids": [
+        "chunk_001",
+        "chunk_002"
+      ],
+      "evidence": [
+        {
+          "chunk_id": "chunk_001",
+          "text_field": "context_text",
+          "text": "反馈信号丢失"
+        },
+        {
+          "chunk_id": "chunk_002",
+          "text_field": "text",
+          "text": "上述异常将使主轴无法启动"
+        }
+      ],
+      "polarity": "positive",
+      "certainty": "certain"
+    },
+    {
+      "id": "R2",
+      "source": "chunk_002_E2",
+      "relation_type": "故障处理",
+      "target": "chunk_002_E1",
+      "cross_chunk": false,
+      "involved_chunk_ids": [
+        "chunk_002"
+      ],
+      "evidence": [
+        {
+          "chunk_id": "chunk_002",
+          "text_field": "text",
+          "text": "重新紧固编码器接头后可恢复运行"
+        }
+      ],
+      "polarity": "positive",
+      "certainty": "certain"
+    }
+  ],
+
+  "logic_groups": []
+}
+{
+  "sample_id": "file_002_chunk_003",
+  "file_id": "file_002",
+  "chapter_id": "chapter_01",
+  "context_chunk_id": null,
+  "target_chunk_id": "chunk_003",
+  "context_text": "",
+  "text": "当润滑油压力过低且轴承温度过高时，主轴将触发保护停机。",
+  "entities": [
+    {
+      "id": "E1",
+      "mention": "润滑油压力过低",
+      "type": "状态与条件",
+      "chunk_id": "chunk_003"
+    },
+    {
+      "id": "E2",
+      "mention": "轴承温度过高",
+      "type": "状态与条件",
+      "chunk_id": "chunk_003"
+    },
+    {
+      "id": "E3",
+      "mention": "主轴将触发保护停机",
+      "normalized_name": "主轴保护停机",
+      "type": "故障事件",
+      "chunk_id": "chunk_003"
+    }
+  ],
+  "relations": [],
+  "logic_groups": [
+    {
+      "id": "LG1",
+      "logic_type": "AND",
+      "members": ["E1", "E2"],
+      "relation_type": "故障触发",
+      "result": "E3",
+      "involved_chunk_ids": ["chunk_003"],
+      "evidence": "润滑油压力过低且轴承温度过高时，主轴将触发保护停机"
+    }
+  ]
+}
