@@ -110,6 +110,16 @@ def _discover_sidecar_record_file(chunks_path: Path, chunks: List[Dict[str, Any]
     return candidate if candidate.exists() else None
 
 
+def _expected_source_record_type(records: List[Dict[str, Any]], fallback: str) -> str:
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        value = str(record.get("source_record_type") or "").strip()
+        if value:
+            return value
+    return fallback
+
+
 def _import_graph_artifacts(
     entities_file: Path,
     relations_file: Optional[Path],
@@ -229,6 +239,7 @@ def import_knowledge_artifacts_payload(payload: Dict[str, Any]) -> Dict[str, Any
                 work_orders,
                 file_id=file_version["file_id"],
                 file_version_id=file_version["file_version_id"],
+                expected_source_record_type=_expected_source_record_type(work_orders, "work_order"),
             )
             work_order_count = import_work_orders_to_db(
                 work_orders,
@@ -244,6 +255,7 @@ def import_knowledge_artifacts_payload(payload: Dict[str, Any]) -> Dict[str, Any
                 cases,
                 file_id=file_version["file_id"],
                 file_version_id=file_version["file_version_id"],
+                expected_source_record_type=_expected_source_record_type(cases, "maintenance_case"),
             )
             maintenance_case_count = import_maintenance_cases_to_db(
                 cases,

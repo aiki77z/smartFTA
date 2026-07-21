@@ -26,6 +26,7 @@ from import_relations_to_neo4j import (
 )
 from maintenance_cases import import_maintenance_cases
 from work_order_import import import_work_order_file, profile_work_order_file
+from pr_docx_import import import_pr_docx, profile_pr_docx_file
 from knowledge_api import import_knowledge_artifacts_payload, register_knowledge_routes
 from knowledge_store import mark_file_version_import_failed, reserve_file_version_record
 
@@ -978,8 +979,8 @@ async def profile_work_orders(
     name = (file.filename or "upload.bin").strip()
     safe_name = "".join([c for c in name if c not in '\\/:*?"<>|']) or "upload.bin"
     suffix = Path(safe_name).suffix.lower()
-    if suffix not in {".csv", ".xlsx"}:
-        raise HTTPException(status_code=400, detail="工单画像目前仅支持 csv / xlsx")
+    if suffix not in {".csv", ".xlsx", ".docx"}:
+        raise HTTPException(status_code=400, detail="工单画像目前仅支持 csv / xlsx / docx")
 
     out_root = Path(output_dir).expanduser().resolve()
     upload_dir = out_root / "_uploads"
@@ -989,7 +990,7 @@ async def profile_work_orders(
     try:
         content = await file.read()
         saved_path.write_bytes(content)
-        profile = profile_work_order_file(saved_path)
+        profile = profile_pr_docx_file(saved_path) if suffix == ".docx" else profile_work_order_file(saved_path)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1014,8 +1015,8 @@ async def import_work_orders(
     name = (file.filename or "upload.bin").strip()
     safe_name = "".join([c for c in name if c not in '\\/:*?"<>|']) or "upload.bin"
     suffix = Path(safe_name).suffix.lower()
-    if suffix not in {".csv", ".xlsx"}:
-        raise HTTPException(status_code=400, detail="工单导入目前仅支持 csv / xlsx")
+    if suffix not in {".csv", ".xlsx", ".docx"}:
+        raise HTTPException(status_code=400, detail="工单导入目前仅支持 csv / xlsx / docx")
 
     out_root = Path(output_dir).expanduser().resolve()
     upload_dir = out_root / "_uploads"
@@ -1032,14 +1033,23 @@ async def import_work_orders(
             source="knowledge_base_upload:work_order",
             metadata={"uploaded_file_path": str(saved_path), "file_format": suffix.lstrip(".")},
         )
-        result = import_work_order_file(
-            saved_path,
-            output_dir=str(out_root),
-            file_id=reserved_version["file_id"],
-            file_version_id=reserved_version["file_version_id"],
-            file_name=safe_name,
-            field_mapping=field_mapping,
-        )
+        if suffix == ".docx":
+            result = import_pr_docx(
+                saved_path,
+                output_dir=str(out_root),
+                file_id=reserved_version["file_id"],
+                file_version_id=reserved_version["file_version_id"],
+                file_name=safe_name,
+            )
+        else:
+            result = import_work_order_file(
+                saved_path,
+                output_dir=str(out_root),
+                file_id=reserved_version["file_id"],
+                file_version_id=reserved_version["file_version_id"],
+                file_name=safe_name,
+                field_mapping=field_mapping,
+            )
     except HTTPException:
         raise
     except Exception as exc:
