@@ -1432,7 +1432,7 @@ function HomePage() {
             <div className="home-upload-row">
               <label className="home-upload-btn">
                 上传文件
-                <input type="file" multiple onChange={handleFileChange} />
+                <input type="file" multiple accept=".pdf,.md,.txt,.csv,.xlsx,.docx" onChange={handleFileChange} />
               </label>
               <button type="button" className="home-3d-btn" onClick={openThreeDModal} title="上传 GLB 与部件列表">
                 三维

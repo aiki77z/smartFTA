@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 const CATEGORY_OPTIONS = [
   { value: 'document', label: '文档资料', desc: 'PDF / Markdown / TXT 走通用知识抽取链路' },
-  { value: 'work_order', label: '工单数据', desc: 'CSV / XLSX，先做字段画像，再按一行一条故障事件导入' },
+  { value: 'work_order', label: '工单数据', desc: 'CSV / XLSX 做字段画像；DOCX 按 PR 表单自动解析' },
   { value: 'maintenance_record', label: '维修记录', desc: 'CSV / DOCX / PDF / MD，按维修案例切分并生成 case_summary' },
 ]
 
@@ -23,7 +23,7 @@ const WORK_ORDER_FIELDS = [
 
 function inferCategory(file) {
   const name = String(file?.name || '').toLowerCase()
-  if (name.endsWith('.docx')) return 'maintenance_record'
+  if (name.endsWith('.docx')) return 'work_order'
   if (name.endsWith('.xlsx')) return 'work_order'
   if (name.endsWith('.pdf')) return name.includes('维修') ? 'maintenance_record' : 'document'
   if (name.endsWith('.md') || name.endsWith('.txt')) return name.includes('维修') ? 'maintenance_record' : 'document'
@@ -69,7 +69,12 @@ function getCategoryLabel(category) {
   return CATEGORY_OPTIONS.find((option) => option.value === category)?.label || '未选择'
 }
 
+function isDocxDraft(draft) {
+  return String(draft?.name || '').toLowerCase().endsWith('.docx')
+}
+
 function isWorkOrderReady(draft) {
+  if (isDocxDraft(draft)) return true
   const profile = draft?.profile
   if (!profile || draft?.profileStatus !== 'success') return false
   const mapping = draft?.fieldMapping || {}
@@ -350,7 +355,7 @@ export default function KnowledgeImportModal({
                           {activeDraft.profile.can_import ? '可导入' : '需要补全关键字段'}
                         </span>
                       ) : (
-                        <span className="home-import-inline-note">上传 CSV/XLSX 后先画像，再确认字段映射。</span>
+                        <span className="home-import-inline-note">CSV/XLSX 先画像并确认字段映射；DOCX 可直接按 PR 表单导入。</span>
                       )}
                     </div>
 
