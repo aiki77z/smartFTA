@@ -220,8 +220,8 @@ def build_prompt(context_text: str, target_text: str, context_chunk_id: str, tar
 3. 故障分类：故障事件 -> 故障类别。例如：编码器故障 -> 通信故障。
 4. 故障处理：维修方法 -> 故障事件。例如：更换编码器 -> 编码器故障。
 5. 规则触发：触发规则 -> 故障事件。例如：温度超过80℃持续3秒 -> 过温停机。
-6. 参与组合：故障事件 -> 逻辑组。不要在 [RELATION] 中直接输出，遇到 AND/OR 组合时输出 [LOGIC_GROUP]。
-7. 组合导致：逻辑组 -> 故障事件。不要在 [RELATION] 中直接输出，遇到 AND/OR 组合时输出 [LOGIC_GROUP]。
+6. 参与组合：故障事件 -> 逻辑组。不要在 [RELATION] 中直接输出；只有遇到 AND 组合时才输出 [LOGIC_GROUP]。
+7. 组合导致：逻辑组 -> 故障事件。不要在 [RELATION] 中直接输出；只有遇到 AND 组合时才输出 [LOGIC_GROUP]。
 
 只输出以下三个段落，不要输出 JSON，不要解释。字段用英文竖线 | 分隔。
 
@@ -252,8 +252,9 @@ evidence 格式：
 - 关系 evidence 要记录支持该关系判断的所有关键证据；跨 chunk 关系必须同时记录两侧相关 evidence，并在 involved_chunk_ids 中包含两个 chunk_id。
 - polarity 只能是 positive 或 negative。
 - certainty 只能是 certain 或 possible。
-- [LOGIC_GROUP] 表示多个故障事件通过同一个逻辑门连接到上层故障事件的一组组合逻辑。
-- logic_type 只能填 AND 或 OR。members 和 result 必须引用 [ENTITY] 中的故障事件。
+- [LOGIC_GROUP] 只表示多个故障事件共同满足后才导致上层故障事件的一组 AND 组合逻辑。
+- logic_type 只能填 AND。members 和 result 必须引用 [ENTITY] 中的故障事件。
+- 不要输出 OR 逻辑组。如果原文表示“任一事件均可导致上层事件”“A 或 B 导致 C”，应拆成多条普通 [RELATION]：A | 故障触发 | C，以及 B | 故障触发 | C。
 - LOGIC_GROUP 单独保存，不作为普通实体；它的 members 和 result 通过实体引用，并用 evidence 记录逻辑表达对应的原文依据。
 - 如果某个段落没有内容，保留段落标题但下面留空。
 
@@ -484,11 +485,14 @@ def parse_logic_groups(lines: List[str], name_to_id: Dict[str, str], target_chun
         parts = split_pipe_line(line)
         if len(parts) < 3:
             continue
+        logic_type = str(parts[0]).strip().upper()
+        if logic_type != "AND":
+            continue
         members = [resolve_ref(item, name_to_id) for item in re.split(r"[;,，；]", parts[1]) if item.strip()]
         groups.append(
             {
                 "id": f"LG{len(groups) + 1}",
-                "logic_type": parts[0],
+                "logic_type": "AND",
                 "members": members,
                 "result": resolve_ref(parts[2], name_to_id),
                 "relation_type": "组合导致",
