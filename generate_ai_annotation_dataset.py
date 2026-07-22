@@ -180,6 +180,10 @@ def fetch_chunks(args: argparse.Namespace) -> List[Dict[str, Any]]:
     from pymongo import MongoClient
 
     query: Dict[str, Any] = {}
+    if args.file_version_ids:
+        version_ids = [item.strip() for item in re.split(r"[;,，；]", args.file_version_ids) if item.strip()]
+        if version_ids:
+            query["file_version_id"] = {"$in": version_ids}
     if args.file_version_id:
         query["file_version_id"] = args.file_version_id
     if args.file_id:
@@ -582,6 +586,7 @@ def main() -> None:
     parser.add_argument("--mongo-db", default=None)
     parser.add_argument("--collection", default=None)
     parser.add_argument("--file-version-id", default=None, help="只处理指定文件版本。")
+    parser.add_argument("--file-version-ids", default=None, help="处理多个文件版本，用分号或逗号分隔。")
     parser.add_argument("--file-id", default=None)
     parser.add_argument("--output-csv", default=str(DEFAULT_OUTPUT_CSV))
     parser.add_argument("--raw-jsonl", default=str(DEFAULT_RAW_JSONL))
