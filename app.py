@@ -2,6 +2,7 @@ import html
 import json
 from pathlib import Path
 from typing import Any
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -9,12 +10,12 @@ import streamlit.components.v1 as components
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = BASE_DIR / "sample_annotations.csv"
 DEFAULT_DRAFT = BASE_DIR / "ai_annotation_draft.csv"
 DEFAULT_OUTPUT = BASE_DIR / "reviewed_annotations.csv"
 UPLOADED_CACHE = BASE_DIR / "_uploaded_annotations.csv"
 
 JSON_COLUMNS = [
+    "entities_json",
     "context_entities_json",
     "target_entities_json",
     "relations_json",
@@ -34,6 +35,7 @@ REQUIRED_COLUMNS = [
     "reviewer_notes",
 ]
 STATUS_OPTIONS = ["draft", "reviewing", "reviewed", "needs_fix"]
+ENTITY_TYPES = ["故障事件", "故障类别", "报警码", "维修方法", "触发规则"]
 NESTED_LIST_COLUMNS = {"members", "involved_chunk_ids"}
 TRANSIENT_COLUMNS = {"_selected", "_linked"}
 
@@ -119,30 +121,120 @@ def load_data(path_or_file: Any) -> pd.DataFrame:
         df["target_entities_json"] = df["entities_json"]
     for col in REQUIRED_COLUMNS:
         df[col] = df[col] if col in df.columns else ("[]" if col in JSON_COLUMNS else "")
+    if "entities_json" in df.columns:
+        df["entities_json"] = df.apply(
+            lambda row: row["entities_json"]
+            if str(row.get("entities_json", "")).strip() not in {"", "[]"}
+            else json.dumps(
+                parse_json_cell(row.get("context_entities_json", "[]")) + parse_json_cell(row.get("target_entities_json", "[]")),
+                ensure_ascii=False,
+            ),
+            axis=1,
+        )
     for col in JSON_COLUMNS:
         df[col] = df[col].apply(lambda value: json.dumps(parse_json_cell(value), ensure_ascii=False))
     df["status"] = df["status"].replace("", "draft")
     return df[REQUIRED_COLUMNS]
 
 
-def save_data(df: pd.DataFrame, path: Path = DEFAULT_OUTPUT) -> None:
+def empty_dataset() -> pd.DataFrame:
+    return pd.DataFrame(columns=REQUIRED_COLUMNS)
+
+
+def list_available_csv_files() -> list[Path]:
+    return sorted(
+        [
+            path
+            for path in BASE_DIR.glob("*.csv")
+            if path.is_file() and path.name != UPLOADED_CACHE.name
+        ],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def choose_initial_csv() -> Path | None:
+    reviewed_versions = sorted(
+        BASE_DIR.glob("reviewed_annotations_*.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in [*reviewed_versions, DEFAULT_OUTPUT, DEFAULT_DRAFT, *list_available_csv_files()]:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def make_timestamped_review_path() -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = BASE_DIR / f"reviewed_annotations_{timestamp}.csv"
+    if not base.exists():
+        return base
+    for index in range(1, 1000):
+        candidate = BASE_DIR / f"reviewed_annotations_{timestamp}_{index}.csv"
+        if not candidate.exists():
+            return candidate
+    return BASE_DIR / f"reviewed_annotations_{timestamp}_{datetime.now().microsecond}.csv"
+
+
+def start_new_output_file() -> Path:
+    path = make_timestamped_review_path()
+    st.session_state.output_path = str(path)
+    return path
+
+
+def current_output_path() -> Path:
+    if not st.session_state.get("output_path"):
+        return start_new_output_file()
+    return Path(str(st.session_state.output_path))
+
+
+def save_data(df: pd.DataFrame, path: Path | None = None) -> None:
+    path = path or current_output_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+    try:
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        if "last_save_warning" in st.session_state:
+            st.session_state.pop("last_save_warning", None)
+    except PermissionError:
+        fallback = path.with_name(f"{path.stem}_autosave_{datetime.now().strftime('%Y%m%d_%H%M%S')}{path.suffix}")
+        df.to_csv(fallback, index=False, encoding="utf-8-sig")
+        try:
+            st.session_state.output_path = str(fallback)
+        except Exception:
+            pass
+        try:
+            st.session_state.last_save_warning = (
+                f"{path.name} is locked, so changes were saved to {fallback.name}. "
+                "Close the CSV in Excel/WPS and save again."
+            )
+        except Exception:
+            pass
 
 
 def ensure_session_state() -> None:
     if "df" not in st.session_state:
-        source = DEFAULT_OUTPUT if DEFAULT_OUTPUT.exists() else DEFAULT_INPUT
-        st.session_state.df = load_data(source)
-        st.session_state.loaded_path = str(source)
+        source = choose_initial_csv()
+        if source:
+            st.session_state.df = load_data(source)
+            st.session_state.loaded_path = str(source)
+            st.session_state.loaded_display_name = source.name
+        else:
+            st.session_state.df = empty_dataset()
+            st.session_state.loaded_path = ""
+            st.session_state.loaded_display_name = ""
+    if "output_path" not in st.session_state:
+        start_new_output_file()
     if "selected_sample_id" not in st.session_state:
         st.session_state.selected_sample_id = st.session_state.df.iloc[0]["sample_id"] if len(st.session_state.df) else ""
     st.session_state.setdefault("undo_stack", {})
     st.session_state.setdefault("redo_stack", {})
     st.session_state.setdefault("last_saved_snapshot", {})
     st.session_state.setdefault("editor_versions", {})
+    st.session_state.setdefault("editor_drafts", {})
     st.session_state.setdefault("linked_entity_ids", {})
     st.session_state.setdefault("scroll_to_top", False)
+    st.session_state.setdefault("loaded_display_name", "")
 
 
 def inject_styles() -> None:
@@ -189,7 +281,12 @@ def inject_styles() -> None:
             font-size: 0.85rem;
             margin: -0.15rem 0 0.45rem 0;
         }
-        .table-bottom-gap { height: 30px; }
+        .table-bottom-gap { height: 22px; }
+        .evidence-preview-title {
+            margin-top: -10px;
+            margin-bottom: 4px;
+            font-weight: 700;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -224,14 +321,17 @@ def scroll_to_top_if_needed() -> None:
 
 def load_dataset(path_or_file: Any, loaded_name: str | None = None) -> None:
     st.session_state.df = load_data(path_or_file)
-    st.session_state.loaded_path = loaded_name or str(path_or_file)
+    st.session_state.loaded_path = str(path_or_file) if isinstance(path_or_file, (str, Path)) else loaded_name or ""
+    st.session_state.loaded_display_name = loaded_name or Path(str(path_or_file)).name
     st.session_state.selected_sample_id = st.session_state.df.iloc[0]["sample_id"] if len(st.session_state.df) else ""
     st.session_state.undo_stack = {}
     st.session_state.redo_stack = {}
     st.session_state.last_saved_snapshot = {}
     st.session_state.editor_versions = {}
+    st.session_state.editor_drafts = {}
     st.session_state.linked_entity_ids = {}
     st.session_state.scroll_to_top = True
+    start_new_output_file()
     save_data(st.session_state.df)
 
 
@@ -239,10 +339,16 @@ def reload_current_dataset() -> None:
     loaded_path = Path(str(st.session_state.get("loaded_path", "")))
     if loaded_path.exists():
         load_dataset(loaded_path)
-    elif DEFAULT_OUTPUT.exists():
-        load_dataset(DEFAULT_OUTPUT)
     else:
-        load_dataset(DEFAULT_INPUT)
+        source = choose_initial_csv()
+        if source:
+            load_dataset(source)
+        else:
+            st.session_state.df = empty_dataset()
+            st.session_state.loaded_path = ""
+            st.session_state.loaded_display_name = ""
+            st.session_state.selected_sample_id = ""
+            start_new_output_file()
 
 
 def sample_label(row: pd.Series) -> str:
@@ -269,73 +375,92 @@ def sync_sidebar_choice() -> None:
 def render_sidebar() -> pd.DataFrame | None:
     with st.sidebar:
         st.header("样本")
-        uploaded = st.file_uploader("导入 CSV", type=["csv"])
+        uploaded = st.file_uploader("上传 CSV", type=["csv"])
         if uploaded is not None:
             try:
-                UPLOADED_CACHE.write_bytes(uploaded.getvalue())
-                load_dataset(UPLOADED_CACHE)
-                st.success(f"已导入 {uploaded.name}，共 {len(st.session_state.df)} 条样本。")
-                st.rerun()
+                upload_key = f"{uploaded.name}:{uploaded.size}"
+                if st.session_state.get("last_uploaded_key") != upload_key:
+                    UPLOADED_CACHE.write_bytes(uploaded.getvalue())
+                    st.session_state.last_uploaded_key = upload_key
+                    load_dataset(UPLOADED_CACHE, uploaded.name)
+                    st.rerun()
+                else:
+                    st.success(f"已加载 {uploaded.name}，共 {len(st.session_state.df)} 条样本。")
             except Exception as exc:
                 st.error(f"导入失败：{exc}")
                 return None
 
-        if DEFAULT_DRAFT.exists() and st.button("直接加载 ai_annotation_draft.csv", use_container_width=True):
-            try:
-                load_dataset(DEFAULT_DRAFT)
-                st.success(f"已加载 ai_annotation_draft.csv，共 {len(st.session_state.df)} 条样本。")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"加载失败：{exc}")
-                return None
+        csv_files = list_available_csv_files()
+        if csv_files:
+            csv_names = [path.name for path in csv_files]
+            selected_csv = st.selectbox("从当前目录选择 CSV", csv_names, key="folder_csv_choice")
+            if st.button("加载选中的 CSV", use_container_width=True):
+                try:
+                    load_dataset(BASE_DIR / selected_csv)
+                    st.success(f"已加载 {selected_csv}，共 {len(st.session_state.df)} 条样本。")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"加载失败：{exc}")
+                    return None
+        else:
+            st.info("当前 annotation-data-pipeline 目录下没有 CSV 文件。")
 
         df = st.session_state.df
-        status_filter = st.multiselect(
-            "状态筛选",
-            options=sorted(df["status"].unique().tolist()),
-            default=sorted(df["status"].unique().tolist()),
-        )
+        if df.empty:
+            st.warning("还没有加载样本。")
+            st.caption(f"保存目标：{current_output_path().name}")
+            return None
+        statuses = sorted([status for status in df["status"].unique().tolist() if str(status).strip()]) or ["draft"]
+        status_filter = st.multiselect("状态筛选", options=statuses, default=statuses)
         view_df = df[df["status"].isin(status_filter)] if status_filter else df
         if view_df.empty:
-            st.warning("没有匹配的样本。")
+            st.warning("没有符合筛选条件的样本。")
             return None
 
         sample_ids = view_df["sample_id"].tolist()
-        if st.session_state.selected_sample_id not in sample_ids:
-            st.session_state.selected_sample_id = sample_ids[0]
-        if st.session_state.get("sidebar_choice_id") not in sample_ids:
+        all_sample_ids = df["sample_id"].tolist()
+        if st.session_state.selected_sample_id not in all_sample_ids:
+            st.session_state.selected_sample_id = all_sample_ids[0]
+
+        select_sample_ids = sample_ids
+        if st.session_state.selected_sample_id not in select_sample_ids:
+            select_sample_ids = [st.session_state.selected_sample_id, *sample_ids]
+        if st.session_state.get("sidebar_choice_id") not in select_sample_ids:
             st.session_state.sidebar_choice_id = st.session_state.selected_sample_id
 
         st.selectbox(
             "选择样本",
-            sample_ids,
+            select_sample_ids,
             format_func=lambda sample_id: sample_label_by_id(df, sample_id),
             key="sidebar_choice_id",
             on_change=sync_sidebar_choice,
         )
 
-        if st.button("保存全部到 reviewed CSV", use_container_width=True):
+        if st.button("保存全部到本次时间戳 CSV", use_container_width=True):
             save_data(st.session_state.df)
-            st.success(f"已保存：{DEFAULT_OUTPUT.name}")
+            st.success(f"已保存：{current_output_path().name}")
 
-        st.caption(f"当前数据：{Path(str(st.session_state.loaded_path)).name}")
-        st.caption(f"视图样本数：{len(view_df)} / 全部样本数：{len(df)}")
+        loaded_name = st.session_state.get("loaded_display_name") or (
+            Path(str(st.session_state.loaded_path)).name if st.session_state.get("loaded_path") else "none"
+        )
+        st.caption(f"当前数据：{loaded_name}")
+        st.caption(f"保存目标：{current_output_path().name}")
+        st.caption(f"当前可见样本：{len(view_df)} / 全部样本：{len(df)}")
         return view_df
-
 
 def add_selection_column(df: pd.DataFrame, linked_ids: set[str] | None = None) -> pd.DataFrame:
     out = df.copy()
     if "_selected" not in out.columns:
         out.insert(0, "_selected", False)
     if linked_ids is not None:
-        linked = out.get("id", pd.Series([""] * len(out))).apply(lambda value: "★" if str(value) in linked_ids else "")
+        linked = out.get("id", pd.Series([""] * len(out))).apply(lambda value: "*" if str(value) in linked_ids else "")
         out.insert(1, "_linked", linked)
     return out
 
 
 def editor_height(row_count: int) -> int:
-    rows = max(row_count + 1, 2)
-    return 48 + rows * 36
+    rows = min(max(row_count, 2), 5)
+    return 42 + rows * 34
 
 
 def editor_from_json(
@@ -345,8 +470,13 @@ def editor_from_json(
     key: str,
     linked_ids: set[str] | None = None,
 ) -> pd.DataFrame:
-    records = parse_json_cell(row.get(col, "[]"))
-    df = pd.DataFrame(records)
+    sample_id = str(row.get("sample_id", ""))
+    draft_key = f"{sample_id}::{col}"
+    if draft_key in st.session_state.editor_drafts:
+        df = st.session_state.editor_drafts[draft_key].copy()
+    else:
+        records = parse_json_cell(row.get(col, "[]"))
+        df = pd.DataFrame(records)
     for column in columns:
         if column not in df.columns:
             df[column] = ""
@@ -355,16 +485,22 @@ def editor_from_json(
     column_config = {"_selected": st.column_config.CheckboxColumn("选中", width="small")}
     if linked_ids is not None:
         column_config["_linked"] = st.column_config.TextColumn("关联", width="small", disabled=True)
+    for text_col in ["mention", "normalized_name", "source", "target", "members", "result"]:
+        if text_col in df.columns:
+            column_config[text_col] = st.column_config.TextColumn(text_col, width="medium")
+    if "evidence" in df.columns:
+        column_config["evidence"] = st.column_config.TextColumn("evidence", width=720)
     edited = st.data_editor(
         df,
         key=key,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         height=editor_height(len(df)),
         hide_index=True,
         column_config=column_config,
     )
     st.markdown('<div class="table-bottom-gap"></div>', unsafe_allow_html=True)
+    st.session_state.editor_drafts[draft_key] = edited.copy()
     return edited
 
 
@@ -380,9 +516,59 @@ def first_selected_record(df: pd.DataFrame) -> dict[str, Any] | None:
     return records[0] if records else None
 
 
-def entity_options(context_entities: pd.DataFrame, target_entities: pd.DataFrame) -> list[dict[str, Any]]:
+def evidence_records(value: Any) -> list[dict[str, Any]]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    parsed = parse_editor_cell("evidence", value)
+    if isinstance(parsed, list):
+        rows = []
+        for item in parsed:
+            if isinstance(item, dict):
+                rows.append(
+                    {
+                        "chunk_id": item.get("chunk_id", ""),
+                        "text_field": item.get("text_field", ""),
+                        "start": format_position_cell(item.get("start")),
+                        "end": format_position_cell(item.get("end")),
+                        "text": item.get("text", ""),
+                    }
+                )
+        return rows
+    text = str(value or "").strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return []
+    return [{"chunk_id": "", "text_field": "", "start": "", "end": "", "text": text}]
+
+
+def render_evidence_preview(title: str, df: pd.DataFrame) -> None:
+    selected = first_selected_record(df)
+    if not selected:
+        st.caption(f"{title}: 勾选一行后在这里查看 evidence 解析。")
+        return
+    rows = evidence_records(selected.get("evidence", ""))
+    if not rows:
+        st.caption(f"{title}: 选中行没有 evidence。")
+        return
+    st.markdown(f'<div class="evidence-preview-title">{title} evidence 解析</div>', unsafe_allow_html=True)
+    st.dataframe(
+        pd.DataFrame(rows, columns=["chunk_id", "text_field", "start", "end", "text"]),
+        use_container_width=True,
+        hide_index=True,
+        height=min(260, 42 + max(len(rows), 1) * 42),
+    )
+
+
+def entity_options(entities_df: pd.DataFrame, context_entities: pd.DataFrame | None = None, target_entities: pd.DataFrame | None = None) -> list[dict[str, Any]]:
     entities = []
+    if entities_df is not None and not entities_df.empty:
+        for record in rows_without_transient(entities_df):
+            entity_id = str(record.get("id", "")).strip()
+            if entity_id:
+                entities.append(record)
+        return entities
     for scope, df in [("context", context_entities), ("target", target_entities)]:
+        if df is None:
+            continue
         for record in rows_without_transient(df):
             entity_id = str(record.get("id", "")).strip()
             if not entity_id:
@@ -417,6 +603,17 @@ def add_entity_highlights(highlights: list[dict[str, Any]], entities: dict[str, 
         entity = entities.get(str(entity_id))
         if not entity:
             continue
+        for evidence in parse_editor_cell("evidence", entity.get("evidence", [])):
+            if not isinstance(evidence, dict):
+                continue
+            try:
+                start = parse_position(evidence.get("start"))
+                end = parse_position(evidence.get("end"))
+            except ValueError:
+                continue
+            field = normalize_text_field(evidence.get("text_field"), entity.get("scope"))
+            if end > start:
+                highlights.append({"field": field, "start": start, "end": end, "kind": "entity"})
         field = normalize_text_field(entity.get("text_field"), entity.get("scope"))
         try:
             start = parse_position(entity.get("start"))
@@ -444,6 +641,20 @@ def normalize_text_field(value: Any, scope: Any = None) -> str:
 
 
 def add_evidence_highlights(highlights: list[dict[str, Any]], evidence: str, context_text: str, text: str) -> None:
+    evidence_items = parse_editor_cell("evidence", evidence)
+    if isinstance(evidence_items, list):
+        for item in evidence_items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = parse_position(item.get("start"))
+                end = parse_position(item.get("end"))
+            except ValueError:
+                continue
+            field = normalize_text_field(item.get("text_field"))
+            if end > start:
+                highlights.append({"field": field, "start": start, "end": end, "kind": "evidence"})
+        return
     evidence = str(evidence or "").strip()
     if not evidence:
         return
@@ -454,6 +665,7 @@ def add_evidence_highlights(highlights: list[dict[str, Any]], evidence: str, con
 
 
 def collect_highlights(
+    entities_df: pd.DataFrame,
     context_entities: pd.DataFrame,
     target_entities: pd.DataFrame,
     relations: pd.DataFrame,
@@ -465,6 +677,8 @@ def collect_highlights(
     highlights: list[dict[str, Any]] = []
     ids: set[str] = set()
     selected_entities = []
+    for entity in selected_records(entities_df):
+        selected_entities.append(entity)
     for entity in selected_records(context_entities):
         entity["scope"] = "context"
         selected_entities.append(entity)
@@ -515,16 +729,18 @@ def highlighted_html(source: str, field: str, highlights: list[dict[str, Any]]) 
         pieces.append(f"<mark style='background:{color};padding:1px 2px;border-radius:3px'>{html.escape(source[start:end])}</mark>")
         cursor = end
     pieces.append(html.escape(source[cursor:]))
-    return "".join(pieces).replace("\n", "<br>")
+    return "".join(pieces)
 
 
-def render_text_block(title: str, text: str, field: str, highlights: list[dict[str, Any]]) -> None:
+def render_text_block(title: str, text: str, field: str, highlights: list[dict[str, Any]], chunk_id: str) -> None:
     if not text:
         st.markdown(f"**{title}**")
         st.info("该样本没有上下文 chunk。")
         return
     body = highlighted_html(str(text), field, highlights)
     component_height = 720
+    chunk_id_json = json.dumps(str(chunk_id or ""), ensure_ascii=False)
+    field_json = json.dumps(field, ensure_ascii=False)
     components.html(
         f"""
         <div style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
@@ -539,8 +755,17 @@ def render_text_block(title: str, text: str, field: str, highlights: list[dict[s
             margin-bottom:8px;
             box-shadow:0 4px 10px rgba(0,0,0,.16);
           ">
-            选中文字可显示 start / end
+            Select text to show start / end
           </div>
+          <button id="{field}-copy" style="
+            margin-left:8px;
+            border:1px solid #d1d5db;
+            border-radius:6px;
+            background:#fff;
+            color:#111827;
+            padding:5px 9px;
+            cursor:pointer;
+          ">Copy evidence</button>
           <div id="{field}-text" style="
             white-space:pre-wrap;
             word-break:break-word;
@@ -561,6 +786,7 @@ def render_text_block(title: str, text: str, field: str, highlights: list[dict[s
         <script>
         const box = document.getElementById("{field}-text");
         const tip = document.getElementById("{field}-tip");
+        const copyBtn = document.getElementById("{field}-copy");
         function charOffset(root, node, offset) {{
           const range = document.createRange();
           range.selectNodeContents(root);
@@ -574,14 +800,32 @@ def render_text_block(title: str, text: str, field: str, highlights: list[dict[s
           if (!box.contains(range.startContainer) || !box.contains(range.endContainer)) return;
           const start = Math.trunc(charOffset(box, range.startContainer, range.startOffset));
           const end = Math.trunc(charOffset(box, range.endContainer, range.endOffset));
-          tip.textContent = `start=${{start}}  end=${{end}}  选中长度=${{end - start}}`;
+          tip.dataset.start = String(start);
+          tip.dataset.end = String(end);
+          tip.dataset.text = sel.toString();
+          tip.textContent = `start=${{start}}  end=${{end}}  length=${{end - start}}`;
+        }});
+        copyBtn.addEventListener("click", async () => {{
+          const start = tip.dataset.start || "";
+          const end = tip.dataset.end || "";
+          const selectedText = tip.dataset.text || "";
+          if (!selectedText) {{
+            tip.textContent = "Select text first";
+            return;
+          }}
+          const token = [{chunk_id_json}, {field_json}, start, end, selectedText].join("::");
+          try {{
+            await navigator.clipboard.writeText(token);
+            tip.textContent = "Copied evidence";
+          }} catch (e) {{
+            tip.textContent = token;
+          }}
         }});
         </script>
         """,
         height=component_height,
         scrolling=False,
     )
-
 
 def render_position_helper(context_text: str, text: str) -> None:
     with st.expander("start / end 辅助定位", expanded=False):
@@ -599,6 +843,7 @@ def render_position_helper(context_text: str, text: str) -> None:
 def snapshot_from_widgets(
     status: str,
     notes: str,
+    entities: pd.DataFrame,
     context_entities: pd.DataFrame,
     target_entities: pd.DataFrame,
     relations: pd.DataFrame,
@@ -607,6 +852,7 @@ def snapshot_from_widgets(
     return {
         "status": status,
         "reviewer_notes": notes,
+        "entities_json": rows_without_transient(entities),
         "context_entities_json": rows_without_transient(context_entities),
         "target_entities_json": rows_without_transient(target_entities),
         "relations_json": rows_without_transient(relations),
@@ -618,6 +864,7 @@ def current_saved_snapshot(row: pd.Series) -> dict[str, Any]:
     return {
         "status": row.get("status", "draft") or "draft",
         "reviewer_notes": row.get("reviewer_notes", ""),
+        "entities_json": parse_json_cell(row.get("entities_json", "[]")),
         "context_entities_json": parse_json_cell(row.get("context_entities_json", "[]")),
         "target_entities_json": parse_json_cell(row.get("target_entities_json", "[]")),
         "relations_json": parse_json_cell(row.get("relations_json", "[]")),
@@ -646,9 +893,11 @@ def autosave_if_changed(idx: int, sample_id: str, snapshot: dict[str, Any]) -> N
     digest = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
     if st.session_state.last_saved_snapshot.get(sample_id) == digest:
         return
+    if st.session_state.last_saved_snapshot.get(sample_id) is None:
+        st.session_state.last_saved_snapshot[sample_id] = digest
+        return
     previous = current_saved_snapshot(st.session_state.df.loc[idx])
-    if st.session_state.last_saved_snapshot.get(sample_id) is not None:
-        push_undo(sample_id, previous)
+    push_undo(sample_id, previous)
     apply_snapshot(idx, snapshot)
     st.session_state.last_saved_snapshot[sample_id] = digest
 
@@ -657,18 +906,26 @@ def persist_current_sample(
     idx: int,
     status: str,
     notes: str,
+    entities: pd.DataFrame,
     context_entities: pd.DataFrame,
     target_entities: pd.DataFrame,
     relations: pd.DataFrame,
     logic_groups: pd.DataFrame,
 ) -> None:
-    snapshot = snapshot_from_widgets(status, notes, context_entities, target_entities, relations, logic_groups)
+    snapshot = snapshot_from_widgets(status, notes, entities, context_entities, target_entities, relations, logic_groups)
     autosave_if_changed(idx, st.session_state.df.loc[idx, "sample_id"], snapshot)
 
 
 def bump_editor_version(sample_id: str) -> None:
     versions = st.session_state.editor_versions
     versions[sample_id] = versions.get(sample_id, 0) + 1
+
+
+def clear_editor_drafts(sample_id: str) -> None:
+    prefix = f"{sample_id}::"
+    for key in list(st.session_state.editor_drafts.keys()):
+        if str(key).startswith(prefix):
+            st.session_state.editor_drafts.pop(key, None)
 
 
 def editor_key(sample_id: str, name: str) -> str:
@@ -682,6 +939,7 @@ def render_status_badge(status: str) -> None:
 
 def render_relation_endpoint_editor(
     relations: pd.DataFrame,
+    entities_df: pd.DataFrame,
     context_entities: pd.DataFrame,
     target_entities: pd.DataFrame,
     sample_id: str,
@@ -691,7 +949,7 @@ def render_relation_endpoint_editor(
         st.info("勾选一条关系后，可以在这里重新选择 source / target。")
         return relations
 
-    entities = entity_options(context_entities, target_entities)
+    entities = entity_options(entities_df, context_entities, target_entities)
     if not entities:
         st.warning("当前没有实体，无法修改关系两侧实体。")
         return relations
@@ -732,6 +990,110 @@ def render_relation_endpoint_editor(
     return relations
 
 
+def parse_evidence_token(token: str) -> dict[str, Any] | None:
+    parts = str(token or "").strip().split("::", 4)
+    if len(parts) != 5:
+        return None
+    try:
+        start = parse_position(parts[2])
+        end = parse_position(parts[3])
+    except ValueError:
+        return None
+    return {
+        "chunk_id": parts[0],
+        "text_field": normalize_text_field(parts[1]),
+        "start": start,
+        "end": end,
+        "text": parts[4],
+    }
+
+
+def next_entity_id(entities_df: pd.DataFrame) -> str:
+    existing = {str(row.get("id", "")) for row in rows_without_transient(entities_df)}
+    index = 1
+    while f"E{index}" in existing:
+        index += 1
+    return f"E{index}"
+
+
+def append_evidence_to_row(df: pd.DataFrame, row_index: Any, evidence: dict[str, Any]) -> pd.DataFrame:
+    updated = df.copy()
+    current = []
+    if "evidence" in updated.columns:
+        current = evidence_records(updated.at[row_index, "evidence"])
+    current.append(evidence)
+    updated.at[row_index, "evidence"] = json.dumps(current, ensure_ascii=False)
+    return updated
+
+
+def render_evidence_quick_add(sample_id: str, entities_df: pd.DataFrame, relations: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    with st.expander("Evidence quick add", expanded=False):
+        st.caption("Select text on the left, click Copy evidence, paste the token here, then apply it to a selected row.")
+        token = st.text_area(
+            "Evidence token",
+            key=f"evidence_token_{sample_id}",
+            height=72,
+            placeholder="chunk_id::text_field::start::end::text",
+        )
+        target = st.radio("Apply to", ["selected entity", "new entity", "selected relation"], horizontal=True, key=f"evidence_target_{sample_id}")
+
+        new_type = ""
+        new_mention = ""
+        new_normalized = ""
+        if target == "new entity":
+            c1, c2, c3 = st.columns([1, 1, 1])
+            new_mention = c1.text_input("mention", key=f"new_entity_mention_{sample_id}")
+            new_type = c2.selectbox("type", ENTITY_TYPES, key=f"new_entity_type_{sample_id}")
+            new_normalized = c3.text_input("normalized_name", key=f"new_entity_norm_{sample_id}")
+
+        if st.button("Apply evidence", use_container_width=True, key=f"apply_evidence_{sample_id}"):
+            evidence = parse_evidence_token(token)
+            if evidence is None:
+                st.error("Evidence token format should be: chunk_id::text_field::start::end::text")
+                return entities_df, relations
+
+            if target == "selected entity":
+                selected_idx = entities_df.index[
+                    entities_df["_selected"].apply(lambda value: str(value).lower() in {"true", "1", "yes"})
+                ]
+                if not len(selected_idx):
+                    st.error("Select one entity row first.")
+                    return entities_df, relations
+                st.session_state[f"pending_entities_{sample_id}"] = append_evidence_to_row(entities_df, selected_idx[0], evidence)
+                bump_editor_version(sample_id)
+                st.rerun()
+
+            if target == "new entity":
+                mention = new_mention.strip() or evidence["text"]
+                normalized = new_normalized.strip() or mention
+                rows = rows_without_transient(entities_df)
+                rows.append(
+                    {
+                        "id": next_entity_id(entities_df),
+                        "mention": mention,
+                        "type": new_type or "故障事件",
+                        "normalized_name": normalized,
+                        "evidence": [evidence],
+                    }
+                )
+                st.session_state[f"pending_entities_{sample_id}"] = pd.DataFrame(rows)
+                bump_editor_version(sample_id)
+                st.rerun()
+
+            if target == "selected relation":
+                selected_idx = relations.index[
+                    relations["_selected"].apply(lambda value: str(value).lower() in {"true", "1", "yes"})
+                ]
+                if not len(selected_idx):
+                    st.error("Select one relation row first.")
+                    return entities_df, relations
+                st.session_state[f"pending_relations_{sample_id}"] = append_evidence_to_row(relations, selected_idx[0], evidence)
+                bump_editor_version(sample_id)
+                st.rerun()
+
+    return entities_df, relations
+
+
 def main() -> None:
     st.set_page_config(page_title="标注审核工具原型", layout="wide")
     inject_styles()
@@ -739,7 +1101,9 @@ def main() -> None:
     scroll_to_top_if_needed()
 
     st.title("标注审核工具原型")
-    st.caption("读取 AI 草稿 CSV，编辑上下文实体、当前实体、关系和逻辑组，并自动保存到 reviewed CSV。")
+    st.caption("读取 AI 草稿 CSV，编辑统一实体、关系和逻辑组，并自动保存到 reviewed CSV。")
+    if st.session_state.get("last_save_warning"):
+        st.warning(st.session_state.last_save_warning)
 
     view_df = render_sidebar()
     if view_df is None:
@@ -776,6 +1140,7 @@ def main() -> None:
                 current = current_saved_snapshot(st.session_state.df.loc[idx])
                 st.session_state.redo_stack.setdefault(sample_id, []).append(current)
                 apply_snapshot(idx, stack.pop())
+                clear_editor_drafts(sample_id)
                 bump_editor_version(sample_id)
                 st.rerun()
         if redo_col.button("重做", use_container_width=True):
@@ -784,32 +1149,32 @@ def main() -> None:
                 current = current_saved_snapshot(st.session_state.df.loc[idx])
                 st.session_state.undo_stack.setdefault(sample_id, []).append(current)
                 apply_snapshot(idx, stack.pop())
+                clear_editor_drafts(sample_id)
                 bump_editor_version(sample_id)
                 st.rerun()
 
         linked_ids = set(st.session_state.linked_entity_ids.get(sample_id, []))
-        st.markdown("**上下文实体 context_entities**")
-        st.markdown('<div class="linked-help">勾选实体行会高亮原文；勾选关系或逻辑组后，关联实体会显示 ★。</div>', unsafe_allow_html=True)
-        context_entities = editor_from_json(
+        st.markdown("**实体 entities**")
+        st.markdown('<div class="linked-help">实体不再单独保存 start/end；原文位置统一写在 evidence 数组中。勾选实体行会高亮所有 evidence。</div>', unsafe_allow_html=True)
+        pending_entities_key = f"pending_entities_{sample_id}"
+        if pending_entities_key in st.session_state:
+            row["entities_json"] = dump_json_cell(st.session_state.pop(pending_entities_key))
+            st.session_state.editor_drafts.pop(f"{sample_id}::entities_json", None)
+        entities_df = editor_from_json(
             row,
-            "context_entities_json",
-            ["id", "mention", "type", "normalized_name", "chunk_id", "text_field", "start", "end", "evidence", "annotation_role"],
-            editor_key(sample_id, "context_entities"),
+            "entities_json",
+            ["id", "mention", "type", "normalized_name", "evidence"],
+            editor_key(sample_id, "entities"),
             linked_ids=linked_ids,
         )
-
-        st.markdown("**目标实体 target_entities**")
-        target_entities = editor_from_json(
-            row,
-            "target_entities_json",
-            ["id", "mention", "type", "normalized_name", "chunk_id", "text_field", "start", "end", "evidence"],
-            editor_key(sample_id, "target_entities"),
-            linked_ids=linked_ids,
-        )
+        render_evidence_preview("实体", entities_df)
+        context_entities = pd.DataFrame()
+        target_entities = pd.DataFrame()
 
         pending_key = f"pending_relations_{sample_id}"
         if pending_key in st.session_state:
             row["relations_json"] = dump_json_cell(st.session_state.pop(pending_key))
+            st.session_state.editor_drafts.pop(f"{sample_id}::relations_json", None)
         st.markdown("**关系 relations**")
         relations = editor_from_json(
             row,
@@ -817,7 +1182,9 @@ def main() -> None:
             ["id", "source", "relation_type", "target", "cross_chunk", "involved_chunk_ids", "evidence", "polarity", "certainty"],
             editor_key(sample_id, "relations"),
         )
-        relations = render_relation_endpoint_editor(relations, context_entities, target_entities, sample_id)
+        render_evidence_preview("关系", relations)
+        relations = render_relation_endpoint_editor(relations, entities_df, context_entities, target_entities, sample_id)
+        entities_df, relations = render_evidence_quick_add(sample_id, entities_df, relations)
 
         st.markdown("**逻辑组 logic_groups**")
         logic_groups = editor_from_json(
@@ -826,18 +1193,18 @@ def main() -> None:
             ["id", "logic_type", "members", "result", "relation_type", "involved_chunk_ids", "evidence"],
             editor_key(sample_id, "logic"),
         )
+        render_evidence_preview("逻辑组", logic_groups)
 
         new_linked_ids = collect_linked_entity_ids(relations, logic_groups)
         if set(st.session_state.linked_entity_ids.get(sample_id, [])) != new_linked_ids:
             st.session_state.linked_entity_ids[sample_id] = sorted(new_linked_ids)
-            st.rerun()
 
         actions = st.columns(3)
         if actions[0].button("保存当前样本", use_container_width=True):
-            persist_current_sample(idx, status, notes, context_entities, target_entities, relations, logic_groups)
-            st.success(f"当前样本已保存到 {DEFAULT_OUTPUT.name}")
+            persist_current_sample(idx, status, notes, entities_df, context_entities, target_entities, relations, logic_groups)
+            st.success(f"当前样本已保存到 {current_output_path().name}")
         if actions[1].button("标注为已审核", use_container_width=True):
-            persist_current_sample(idx, "reviewed", notes, context_entities, target_entities, relations, logic_groups)
+            persist_current_sample(idx, "reviewed", notes, entities_df, context_entities, target_entities, relations, logic_groups)
             bump_editor_version(sample_id)
             st.session_state.scroll_to_top = True
             st.success("已标记为 reviewed 并保存。")
@@ -846,26 +1213,27 @@ def main() -> None:
             reload_current_dataset()
             st.rerun()
 
-        snapshot = snapshot_from_widgets(status, notes, context_entities, target_entities, relations, logic_groups)
+        snapshot = snapshot_from_widgets(status, notes, entities_df, context_entities, target_entities, relations, logic_groups)
         autosave_if_changed(idx, sample_id, snapshot)
-        st.caption(f"自动保存文件：{DEFAULT_OUTPUT.name}")
+        st.caption(f"自动保存文件：{current_output_path().name}")
 
         st.markdown('<div class="nav-button-note">切换样本时会自动保存当前修改。</div>', unsafe_allow_html=True)
         nav_cols = st.columns(2)
         current_pos = get_sample_position(all_sample_ids, sample_id)
         if nav_cols[0].button("↑\n上一个样本", use_container_width=True, disabled=current_pos <= 0):
-            persist_current_sample(idx, status, notes, context_entities, target_entities, relations, logic_groups)
+            persist_current_sample(idx, status, notes, entities_df, context_entities, target_entities, relations, logic_groups)
             st.session_state.selected_sample_id = all_sample_ids[current_pos - 1]
             st.session_state.scroll_to_top = True
             st.rerun()
         if nav_cols[1].button("↓\n下一个样本", use_container_width=True, disabled=current_pos >= len(all_sample_ids) - 1):
-            persist_current_sample(idx, status, notes, context_entities, target_entities, relations, logic_groups)
+            persist_current_sample(idx, status, notes, entities_df, context_entities, target_entities, relations, logic_groups)
             st.session_state.selected_sample_id = all_sample_ids[current_pos + 1]
             st.session_state.scroll_to_top = True
             st.rerun()
 
-    entities = entity_options(context_entities, target_entities)
+    entities = entity_options(entities_df, context_entities, target_entities)
     highlights = collect_highlights(
+        entities_df,
         context_entities,
         target_entities,
         relations,
@@ -882,11 +1250,11 @@ def main() -> None:
         st.text_input("chapter_id", value=row.get("chapter_id", ""), disabled=True)
         st.text_input("target_chunk_id", value=row.get("target_chunk_id", ""), disabled=True)
         render_position_helper(row.get("context_text", ""), row.get("text", ""))
-        render_text_block("context_text", row.get("context_text", ""), "context_text", highlights)
-        render_text_block("text", row.get("text", ""), "text", highlights)
+        render_text_block("context_text", row.get("context_text", ""), "context_text", highlights, row.get("context_chunk_id", ""))
+        render_text_block("text", row.get("text", ""), "text", highlights, row.get("target_chunk_id", ""))
 
     st.divider()
-    st.caption(f"默认输入：{DEFAULT_INPUT.name}；审核保存：{DEFAULT_OUTPUT.name}")
+    st.caption(f"可从左侧选择或上传 CSV；本次审核保存到：{current_output_path().name}")
 
 
 if __name__ == "__main__":

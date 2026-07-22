@@ -23,6 +23,7 @@ CSV_COLUMNS = [
     "target_chunk_id",
     "context_text",
     "text",
+    "entities_json",
     "context_entities_json",
     "target_entities_json",
     "relations_json",
@@ -190,7 +191,8 @@ def fetch_chunks(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 
 def build_prompt(context_text: str, target_text: str, context_chunk_id: str, target_chunk_id: str) -> str:
-    return f"""你是工业设备故障知识标注助手。请阅读一个滑动窗口样本，并生成供人工审核的标注草稿。
+    context_chunk_id_for_prompt = context_chunk_id or ""
+    return f"""你是工业设备故障知识标注助手。请阅读一个滑动窗口样本，生成供人工审核的标注草稿。
 
 窗口字段：
 - context_text：前一个 chunk，仅用于理解上下文。
@@ -198,14 +200,15 @@ def build_prompt(context_text: str, target_text: str, context_chunk_id: str, tar
 
 标注范围：
 1. 只标注与当前 target chunk 相关的内容。
-2. 单独只出现在 context_text 中、且没有和当前 text 发生关系的实体或关系，不要输出。
-3. 出现在当前 text 中的实体和关系要输出。
-4. context_text 中的实体只有在参与跨 chunk 关系或跨 chunk 逻辑组时才输出到 [CONTEXT_ENTITY]。
-5. 如果故障事件需要从原文概括生成，可以输出 normalized_name 和 mention；start/end 可填 -1，但 evidence 必须来自原文。
-6. 不要编造没有证据的关系。不能确定时 certainty 填 possible。
+2. 完全只出现在 context_text 中、且与当前 text 无关的实体和关系，不要标注。
+3. 出现在当前 text 中的实体、关系、逻辑组要标注。
+4. context_text 中的实体只有在参与跨 chunk 关系、跨 chunk 逻辑组，或与当前 text 中同一实体形成同一实体多证据时，才输出。
+5. 同一实体在 context_text 和 text 中都被提及时，只保留一个实体，不要拆成两个实体；用 evidence 数组记录它在不同 chunk 中的所有原文依据。
+6. 实体本身不记录 start/end；mention 负责表达实体含义，evidence 负责记录原文定位。
+7. 不要编造没有证据的实体或关系。不能确定时 certainty 填 possible。
 
 实体类型只能使用以下 5 类：
-1. 故障事件：设备异常、故障现象、故障原因、停机/失效/异常状态等。例如：编码器通信故障、反馈信号丢失、主轴保护停机。
+1. 故障事件：设备异常、故障现象、故障原因、停机、失效、异常状态等。例如：编码器通信故障、反馈信号丢失、主轴保护停机。
 2. 故障类别：对故障事件的类别归纳。例如：通信故障、温度故障、润滑系统故障。
 3. 报警码：故障码、报警号、错误码。例如：F01000。
 4. 维修方法：检查、处理、修复、观察、更换、紧固、清洗等措施。例如：更换编码器、重新紧固接头。
@@ -217,16 +220,13 @@ def build_prompt(context_text: str, target_text: str, context_chunk_id: str, tar
 3. 故障分类：故障事件 -> 故障类别。例如：编码器故障 -> 通信故障。
 4. 故障处理：维修方法 -> 故障事件。例如：更换编码器 -> 编码器故障。
 5. 规则触发：触发规则 -> 故障事件。例如：温度超过80℃持续3秒 -> 过温停机。
-6. 参与组合：故障事件 -> 逻辑组。该关系不要在 [RELATION] 中直接输出，遇到 AND/OR 组合时输出 [LOGIC_GROUP]。
-7. 组合导致：逻辑组 -> 故障事件。该关系不要在 [RELATION] 中直接输出，遇到 AND/OR 组合时输出 [LOGIC_GROUP]。
+6. 参与组合：故障事件 -> 逻辑组。不要在 [RELATION] 中直接输出，遇到 AND/OR 组合时输出 [LOGIC_GROUP]。
+7. 组合导致：逻辑组 -> 故障事件。不要在 [RELATION] 中直接输出，遇到 AND/OR 组合时输出 [LOGIC_GROUP]。
 
-只输出以下四个段落，不要输出 JSON，不要解释。字段用英文竖线 | 分隔。
+只输出以下三个段落，不要输出 JSON，不要解释。字段用英文竖线 | 分隔。
 
-[CONTEXT_ENTITY]
-mention | type | normalized_name | start | end | annotation_role | evidence
-
-[TARGET_ENTITY]
-mention | type | normalized_name | start | end | evidence
+[ENTITY]
+mention | type | normalized_name | evidence
 
 [RELATION]
 source | relation_type | target | cross_chunk | involved_chunk_ids | evidence | polarity | certainty
@@ -234,24 +234,43 @@ source | relation_type | target | cross_chunk | involved_chunk_ids | evidence | 
 [LOGIC_GROUP]
 logic_type | members | result | involved_chunk_ids | evidence
 
+evidence 格式：
+- evidence 是一个数组式字符串，用 ;; 分隔多个证据片段。
+- 每个证据片段格式固定为：chunk_id::text_field::start::end::text
+- chunk_id 只能填写 {context_chunk_id_for_prompt or target_chunk_id} 或 {target_chunk_id}。
+- text_field 只能填写 context_text 或 text。
+- start/end 是该证据片段在对应字段中的字符起止位置，必须是整数。
+- text 必须是原文中从 start 到 end 对应的连续片段。
+- 如果实体是概括出来的事件，mention 可以是概括表达，但 evidence.text 必须来自原文。
+- 同一实体在两个 chunk 或同一 chunk 多处出现时，只输出一行 [ENTITY]，把所有提及位置都放进 evidence。
+
 格式规则：
 - source/target/members/result 优先填写实体 normalized_name，也可填写 mention。
 - [RELATION] 中 relation_type 只能使用：故障触发、故障表征、故障分类、故障处理、规则触发。
 - cross_chunk 只能填 true 或 false。
-- involved_chunk_ids 用分号连接，例如 {target_chunk_id} 或 {context_chunk_id};{target_chunk_id}。
-- evidence 如果涉及多个 chunk，用两个证据片段拼接，格式为：chunk_id::text_field::证据文本;;chunk_id::text_field::证据文本。
-- text_field 只能是 context_text 或 text。
+- involved_chunk_ids 用分号连接，例如 {target_chunk_id} 或 {context_chunk_id_for_prompt};{target_chunk_id}。
+- 关系 evidence 要记录支持该关系判断的所有关键证据；跨 chunk 关系必须同时记录两侧相关 evidence，并在 involved_chunk_ids 中包含两个 chunk_id。
 - polarity 只能是 positive 或 negative。
 - certainty 只能是 certain 或 possible。
 - [LOGIC_GROUP] 表示多个故障事件通过同一个逻辑门连接到上层故障事件的一组组合逻辑。
-- logic_type 只能填 AND 或 OR。members 只能是故障事件实体，result 只能是故障事件实体。
-- 例如“润滑油压力过低且轴承温度过高时触发保护停机”应输出：
-  AND | 润滑油压力过低;轴承温度过高 | 保护停机 | {target_chunk_id} | {target_chunk_id}::text::润滑油压力过低且轴承温度过高时触发保护停机
-- LOGIC_GROUP 在图谱中等价于：members --参与组合--> 逻辑组，逻辑组 --组合导致--> result。
+- logic_type 只能填 AND 或 OR。members 和 result 必须引用 [ENTITY] 中的故障事件。
+- LOGIC_GROUP 单独保存，不作为普通实体；它的 members 和 result 通过实体引用，并用 evidence 记录逻辑表达对应的原文依据。
 - 如果某个段落没有内容，保留段落标题但下面留空。
 
+示例：
+[ENTITY]
+润滑油压力过低 | 故障事件 | 润滑油压力过低 | {target_chunk_id}::text::0::7::润滑油压力过低
+轴承温度过高 | 故障事件 | 轴承温度过高 | {target_chunk_id}::text::8::15::轴承温度过高
+保护停机 | 故障事件 | 保护停机 | {target_chunk_id}::text::18::22::保护停机
+
+[RELATION]
+润滑油压力过低 | 故障触发 | 保护停机 | false | {target_chunk_id} | {target_chunk_id}::text::0::22::润滑油压力过低且轴承温度过高时触发保护停机 | positive | possible
+
+[LOGIC_GROUP]
+AND | 润滑油压力过低;轴承温度过高 | 保护停机 | {target_chunk_id} | {target_chunk_id}::text::0::22::润滑油压力过低且轴承温度过高时触发保护停机
+
 【context_chunk_id】
-{context_chunk_id or ""}
+{context_chunk_id_for_prompt}
 
 【context_text】
 {context_text or ""}
@@ -262,7 +281,6 @@ logic_type | members | result | involved_chunk_ids | evidence
 【text】
 {target_text}
 """
-
 
 def call_llm(client: Any, model: str, prompt: str, temperature: float, max_tokens: int) -> str:
     response = client.chat.completions.create(
@@ -278,11 +296,11 @@ def call_llm(client: Any, model: str, prompt: str, temperature: float, max_token
 
 
 def split_sections(text: str) -> Dict[str, List[str]]:
-    sections = {"CONTEXT_ENTITY": [], "TARGET_ENTITY": [], "RELATION": [], "LOGIC_GROUP": []}
+    sections = {"ENTITY": [], "CONTEXT_ENTITY": [], "TARGET_ENTITY": [], "RELATION": [], "LOGIC_GROUP": []}
     current: Optional[str] = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        marker = re.fullmatch(r"\[(CONTEXT_ENTITY|TARGET_ENTITY|RELATION|LOGIC_GROUP)\]", line, re.I)
+        marker = re.fullmatch(r"\[(ENTITY|CONTEXT_ENTITY|TARGET_ENTITY|RELATION|LOGIC_GROUP)\]", line, re.I)
         if marker:
             current = marker.group(1).upper()
             continue
@@ -363,6 +381,40 @@ def parse_entities(
     return entities, name_to_id
 
 
+def parse_unified_entities(lines: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    entities: List[Dict[str, Any]] = []
+    name_to_id: Dict[str, str] = {}
+    seen: Dict[str, str] = {}
+    for line in lines:
+        parts = split_pipe_line(line)
+        if len(parts) < 3:
+            continue
+        mention = parts[0]
+        entity_type = parts[1]
+        normalized_name = parts[2] or mention
+        evidence = parse_evidence(parts[3] if len(parts) > 3 else "")
+        compact_name = re.sub(r"\s+", "", normalized_name or mention)
+        dedupe_key = f"{entity_type}::{compact_name}"
+        if dedupe_key in seen:
+            entity = next(item for item in entities if item["id"] == seen[dedupe_key])
+            entity["evidence"].extend(evidence)
+            continue
+        entity_id = f"E{len(entities) + 1}"
+        entity = {
+            "id": entity_id,
+            "mention": mention,
+            "type": entity_type,
+            "normalized_name": normalized_name,
+            "evidence": evidence,
+        }
+        entities.append(entity)
+        seen[dedupe_key] = entity_id
+        for key in {mention, normalized_name, entity_id}:
+            if key:
+                name_to_id[key] = entity_id
+    return entities, name_to_id
+
+
 def resolve_ref(value: str, name_to_id: Dict[str, str]) -> str:
     text = str(value).strip()
     if text in name_to_id:
@@ -379,17 +431,27 @@ def parse_involved_chunks(value: str, default_chunk_id: str) -> List[str]:
     return chunks or [default_chunk_id]
 
 
-def parse_evidence(value: str) -> List[Dict[str, str]]:
-    evidence_items: List[Dict[str, str]] = []
+def parse_evidence(value: str) -> List[Dict[str, Any]]:
+    evidence_items: List[Dict[str, Any]] = []
     for item in str(value or "").split(";;"):
         item = item.strip()
         if not item:
             continue
-        parts = item.split("::", 2)
-        if len(parts) == 3:
-            evidence_items.append({"chunk_id": parts[0], "text_field": parts[1], "text": parts[2]})
+        parts = item.split("::", 4)
+        if len(parts) == 5:
+            evidence_items.append(
+                {
+                    "chunk_id": parts[0],
+                    "text_field": parts[1],
+                    "start": parse_int(parts[2], 0),
+                    "end": parse_int(parts[3], 0),
+                    "text": parts[4],
+                }
+            )
+        elif len(parts) == 3:
+            evidence_items.append({"chunk_id": parts[0], "text_field": parts[1], "start": None, "end": None, "text": parts[2]})
         else:
-            evidence_items.append({"chunk_id": "", "text_field": "", "text": item})
+            evidence_items.append({"chunk_id": "", "text_field": "", "start": None, "end": None, "text": item})
     return evidence_items
 
 
@@ -431,7 +493,7 @@ def parse_logic_groups(lines: List[str], name_to_id: Dict[str, str], target_chun
                 "result": resolve_ref(parts[2], name_to_id),
                 "relation_type": "组合导致",
                 "involved_chunk_ids": parse_involved_chunks(parts[3] if len(parts) > 3 else "", target_chunk_id),
-                "evidence": parts[4] if len(parts) > 4 else "",
+                "evidence": parse_evidence(parts[4] if len(parts) > 4 else ""),
             }
         )
     return groups
@@ -443,8 +505,14 @@ def parse_llm_output(
     target_chunk_id: str,
     context_text: str,
     target_text: str,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     sections = split_sections(llm_output)
+    if sections["ENTITY"]:
+        entities, name_to_id = parse_unified_entities(sections["ENTITY"])
+        relations = parse_relations(sections["RELATION"], name_to_id, target_chunk_id)
+        logic_groups = parse_logic_groups(sections["LOGIC_GROUP"], name_to_id, target_chunk_id)
+        return entities, [], [], relations, logic_groups
+
     context_entities, context_map = parse_entities(
         sections["CONTEXT_ENTITY"], context_chunk_id, "context_text", context_text, context_chunk_id or "context", True
     )
@@ -454,7 +522,7 @@ def parse_llm_output(
     name_to_id = {**context_map, **target_map}
     relations = parse_relations(sections["RELATION"], name_to_id, target_chunk_id)
     logic_groups = parse_logic_groups(sections["LOGIC_GROUP"], name_to_id, target_chunk_id)
-    return context_entities, target_entities, relations, logic_groups
+    return context_entities + target_entities, context_entities, target_entities, relations, logic_groups
 
 
 def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
@@ -478,6 +546,7 @@ def build_sample_id(chunk: Dict[str, Any]) -> str:
 def build_row(
     chunk: Dict[str, Any],
     context_chunk: Optional[Dict[str, Any]],
+    entities: List[Dict[str, Any]],
     context_entities: List[Dict[str, Any]],
     target_entities: List[Dict[str, Any]],
     relations: List[Dict[str, Any]],
@@ -492,6 +561,7 @@ def build_row(
         "target_chunk_id": get_chunk_id(chunk),
         "context_text": get_chunk_text(context_chunk),
         "text": get_chunk_text(chunk),
+        "entities_json": json.dumps(entities, ensure_ascii=False),
         "context_entities_json": json.dumps(context_entities, ensure_ascii=False),
         "target_entities_json": json.dumps(target_entities, ensure_ascii=False),
         "relations_json": json.dumps(relations, ensure_ascii=False),
@@ -556,17 +626,18 @@ def main() -> None:
 
         if args.dry_run:
             llm_output = ""
+            entities: List[Dict[str, Any]] = []
             context_entities: List[Dict[str, Any]] = []
             target_entities: List[Dict[str, Any]] = []
             relations: List[Dict[str, Any]] = []
             logic_groups: List[Dict[str, Any]] = []
         else:
             llm_output = call_llm(client, model, prompt, args.temperature, args.max_tokens)
-            context_entities, target_entities, relations, logic_groups = parse_llm_output(
+            entities, context_entities, target_entities, relations, logic_groups = parse_llm_output(
                 llm_output, context_chunk_id, target_chunk_id, context_text, target_text
             )
 
-        row = build_row(chunk, context_chunk, context_entities, target_entities, relations, logic_groups)
+        row = build_row(chunk, context_chunk, entities, context_entities, target_entities, relations, logic_groups)
         output_rows.append(row)
         append_jsonl(
             raw_path,
@@ -589,7 +660,7 @@ def main() -> None:
         print(
             f"[{index + 1}/{len(chunks)}] {row['sample_id']} "
             f"context={bool(context_chunk)}{debug_suffix} "
-            f"target_entities={len(target_entities)} relations={len(relations)}"
+            f"entities={len(entities)} relations={len(relations)} logic_groups={len(logic_groups)}"
         )
         if args.sleep > 0:
             time.sleep(args.sleep)
