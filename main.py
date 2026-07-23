@@ -952,6 +952,51 @@ async def run_pipeline_job_upload(
     return resp
 
 
+@app.post("/api/kb/jobs/chunk-preview")
+def run_chunk_preview_job(request: PipelineJobRequest):
+    preview_request = request.model_copy(
+        update={
+            "skip_clean": True,
+            "skip_entity": True,
+            "skip_relation": True,
+            "sync_to_generate_fta": False,
+            "print_raw_text": False,
+        }
+    )
+    return run_pipeline_job(preview_request)
+
+
+@app.post("/api/kb/jobs/chunk-preview-upload")
+async def run_chunk_preview_job_upload(
+    file: UploadFile = File(...),
+    output_dir: str = Form("./output"),
+    chunk_size: int = Form(800),
+    skip_mineru: bool = Form(False),
+    source_type: str = Form("manual_document"),
+    file_format: Optional[str] = Form(None),
+    chunk_type: str = Form("document_section"),
+    source_record_type: Optional[str] = Form(None),
+    source_record_id: Optional[str] = Form(None),
+):
+    return await run_pipeline_job_upload(
+        file=file,
+        output_dir=output_dir,
+        chunk_size=chunk_size,
+        skip_mineru=skip_mineru,
+        skip_clean=True,
+        skip_entity=True,
+        skip_relation=True,
+        print_raw_text=False,
+        sync_to_generate_fta=False,
+        generate_fta_base_url=DEFAULT_GENERATE_FTA_BASE_URL,
+        clear_graph_before_import=False,
+        source_type=source_type,
+        file_format=file_format,
+        chunk_type=chunk_type,
+        source_record_type=source_record_type,
+        source_record_id=source_record_id,
+    )
+
 def _parse_field_mapping_json(field_mapping_json: Optional[str]) -> Dict[str, str]:
     raw = str(field_mapping_json or "").strip()
     if not raw:
