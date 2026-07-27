@@ -75,6 +75,7 @@ class TableHTMLParser(HTMLParser):
         self.rows = []
         self.current_row = None
         self.current_cell = None
+        self.current_cell_attrs = None
         self.in_cell = False
 
     def handle_starttag(self, tag, attrs):
@@ -85,6 +86,7 @@ class TableHTMLParser(HTMLParser):
             if self.current_row is None:
                 self.current_row = []
             self.current_cell = []
+            self.current_cell_attrs = dict(attrs)
             self.in_cell = True
         elif tag == "br" and self.in_cell and self.current_cell is not None:
             self.current_cell.append("\n")
@@ -97,19 +99,31 @@ class TableHTMLParser(HTMLParser):
         tag = tag.lower()
         if tag in ("td", "th") and self.in_cell:
             text = normalize_cell_text("".join(self.current_cell or []))
-            self.current_row.append(text)
+            self.current_row.append({
+                "text": text,
+                "rowspan": self.current_cell_attrs.get("rowspan", "1"),
+                "colspan": self.current_cell_attrs.get("colspan", "1"),
+            })
             self.current_cell = None
+            self.current_cell_attrs = None
             self.in_cell = False
         elif tag == "tr" and self.current_row is not None:
-            if any(cell.strip() for cell in self.current_row):
+            if any(normalize_cell_text(cell.get("text", "") if isinstance(cell, dict) else cell) for cell in self.current_row):
                 self.rows.append(self.current_row)
             self.current_row = None
 
     def close(self):
         if self.in_cell and self.current_row is not None:
             text = normalize_cell_text("".join(self.current_cell or []))
-            self.current_row.append(text)
-        if self.current_row is not None and any(cell.strip() for cell in self.current_row):
+            self.current_row.append({
+                "text": text,
+                "rowspan": (self.current_cell_attrs or {}).get("rowspan", "1"),
+                "colspan": (self.current_cell_attrs or {}).get("colspan", "1"),
+            })
+        if self.current_row is not None and any(
+            normalize_cell_text(cell.get("text", "") if isinstance(cell, dict) else cell)
+            for cell in self.current_row
+        ):
             self.rows.append(self.current_row)
         super().close()
 
@@ -131,7 +145,7 @@ def parse_html_table_rows(table_text):
         parser.rows = []
 
     if parser.rows:
-        return parser.rows
+        return expand_html_table_rows(parser.rows)
 
     rows = []
     row_matches = re.findall(r"<tr\b[^>]*>(.*?)</tr>", table_text, flags=re.I | re.S)
@@ -143,6 +157,62 @@ def parse_html_table_rows(table_text):
         if any(clean_cells):
             rows.append(clean_cells)
     return rows
+
+
+def _positive_span(value):
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def expand_html_table_rows(rows):
+    """Expand HTML row/column spans into a rectangular logical table."""
+    expanded_rows = []
+    pending_cells = {}
+
+    for source_row in rows:
+        row = []
+        occupied = set()
+        for column, (text, remaining) in pending_cells.items():
+            while len(row) <= column:
+                row.append("")
+            row[column] = text
+            occupied.add(column)
+
+        next_pending = {
+            column: (text, remaining - 1)
+            for column, (text, remaining) in pending_cells.items()
+            if remaining > 1
+        }
+        column = 0
+        for cell in source_row:
+            while column in occupied:
+                column += 1
+            if isinstance(cell, dict):
+                text = normalize_cell_text(cell.get("text", ""))
+                rowspan = _positive_span(cell.get("rowspan"))
+                colspan = _positive_span(cell.get("colspan"))
+            else:
+                text = normalize_cell_text(cell)
+                rowspan = colspan = 1
+
+            for offset in range(colspan):
+                target = column + offset
+                while len(row) <= target:
+                    row.append("")
+                # A colspan represents one logical value, not duplicated values.
+                row[target] = text if offset == 0 else ""
+                occupied.add(target)
+                if rowspan > 1:
+                    next_pending[target] = (text if offset == 0 else "", rowspan - 1)
+            column += colspan
+
+        if any(cell.strip() for cell in row):
+            expanded_rows.append(row)
+        pending_cells = next_pending
+
+    return expanded_rows
 
 
 def parse_markdown_table_rows(table_text):
@@ -346,6 +416,110 @@ def table_rows_to_records(rows):
     return records
 
 
+ALARM_TABLE_HEADERS = ("告警ID", "告警名称", "告警级别", "产生原因", "处理建议")
+
+
+def normalize_alarm_header(value):
+    value = normalize_cell_text(value).replace(" ", "")
+    return value.replace("級", "级").replace("別", "别")
+
+
+def is_alarm_table_header(row):
+    normalized = {normalize_alarm_header(cell) for cell in row if cell}
+    return "告警ID" in normalized and len(normalized.intersection(ALARM_TABLE_HEADERS)) >= 3
+
+
+def extract_alarm_id(value):
+    value = normalize_cell_text(value)
+    match = re.fullmatch(r"(?:告警ID\s*)?(\d+(?:\s*[~\-]\s*\d+)?)", value, flags=re.I)
+    return match.group(1).replace(" ", "") if match else ""
+
+
+def append_table_field(record, field, value):
+    value = normalize_cell_text(value)
+    if not value or value == "●":
+        return
+    existing = record.get(field, "")
+    if not existing:
+        record[field] = value
+    elif value != existing and value not in existing:
+        record[field] = f"{existing} {value}"
+
+
+def table_rows_to_alarm_records(rows):
+    """Reassemble an alarm table into one complete record per alarm ID."""
+    header_index = next((index for index, row in enumerate(rows) if is_alarm_table_header(row)), None)
+    if header_index is None:
+        return []
+
+    header = [normalize_alarm_header(cell) for cell in rows[header_index]]
+    column_map = {index: field for index, field in enumerate(header) if field in ALARM_TABLE_HEADERS}
+    records = []
+    current = None
+
+    for row_index, row in enumerate(rows[header_index + 1:], start=header_index + 2):
+        cells = [normalize_cell_text(cell) for cell in row]
+        if not any(cells) or is_alarm_table_header(cells):
+            continue
+
+        first_cell = cells[0] if cells else ""
+        alarm_id = extract_alarm_id(first_cell)
+        if alarm_id and current and alarm_id == current["alarm_id"]:
+            # Expanded rowspan values repeat the active ID on continuation rows.
+            alarm_id = ""
+        if alarm_id:
+            current = {
+                "alarm_id": alarm_id,
+                "row_index": row_index,
+                "告警名称": "",
+                "告警级别": "",
+                "产生原因": "",
+                "处理建议": "",
+            }
+            records.append(current)
+
+            # A page continuation can render the next alarm ID in a repeated
+            # header cell ("告警ID 301"). Its remaining cells are headers, not data.
+            if normalize_alarm_header(first_cell).startswith("告警ID"):
+                continue
+
+        if current is None:
+            continue
+
+        if not alarm_id and len(cells) == 1:
+            # A rowspan continuation with only one cell is the tail of the
+            # right-most "处理建议" column.
+            append_table_field(current, "处理建议", cells[0])
+            continue
+
+        if not alarm_id and not first_cell and len(cells) < len(header):
+            # MinerU sometimes retains an empty placeholder for a rowspan.
+            # Align such continuation cells to the right-most table columns.
+            start_column = len(header) - len(cells)
+            for offset, value in enumerate(cells):
+                field = column_map.get(start_column + offset)
+                if field and field != "告警ID":
+                    append_table_field(current, field, value)
+            continue
+
+        for column, field in column_map.items():
+            if field != "告警ID" and column < len(cells):
+                append_table_field(current, field, cells[column])
+
+    return [
+        record for record in records
+        if any(record.get(field) for field in ALARM_TABLE_HEADERS[1:])
+    ]
+
+
+def build_alarm_record_text(record):
+    lines = [f"告警ID: {record['alarm_id']}"]
+    for field in ALARM_TABLE_HEADERS[1:]:
+        if record.get(field):
+            lines.append(f"{field}: {record[field]}")
+    return "\n".join(lines)
+
+
 def build_table_summary(records, limit=80):
     lines = ["\u8868\u683c\u8bb0\u5f55\uff1a"]
     for idx, record in enumerate(records[:limit], start=1):
@@ -366,6 +540,7 @@ def parse_structured_table(table_text):
         "status": "failed",
         "structured_table": None,
         "summary_text": "",
+        "record_kind": "generic",
         "error": None,
     }
     try:
@@ -381,13 +556,16 @@ def parse_structured_table(table_text):
             result["error"] = "no_table_rows_parsed"
             return result
 
-        records = table_rows_to_records(rows)
+        alarm_records = table_rows_to_alarm_records(rows)
+        records = alarm_records or table_rows_to_records(rows)
+        record_kind = "alarm" if alarm_records else "generic"
         if not records:
             result["status"] = "partial"
             result["structured_table"] = {
                 "table_type": table_type,
                 "rows": rows,
                 "records": [],
+                "record_kind": record_kind,
             }
             result["summary_text"] = "\u8868\u683c\u539f\u59cb\u884c\uff1a\n" + "\n".join(
                 f"{idx}. {' | '.join(row)}" for idx, row in enumerate(rows, start=1)
@@ -399,8 +577,14 @@ def parse_structured_table(table_text):
             "table_type": table_type,
             "rows": rows,
             "records": records,
+            "record_kind": record_kind,
         }
-        result["summary_text"] = build_table_summary(records)
+        result["record_kind"] = record_kind
+        result["summary_text"] = (
+            "\n\n".join(build_alarm_record_text(record) for record in records)
+            if record_kind == "alarm"
+            else build_table_summary(records)
+        )
         return result
     except Exception as exc:
         result["error"] = str(exc)
@@ -483,11 +667,11 @@ def split_text_by_tables(text):
         line = lines[i].strip()
         if is_md_table_start(i):
             end, table_text = collect_table(i, 'md')
-            segments.append((table_text_for_chunk(table_text), False))
+            segments.append((table_text, True))
             i = end
         elif is_html_table_start(i):
             end, table_text = collect_table(i, 'html')
-            segments.append((table_text_for_chunk(table_text), False))
+            segments.append((table_text, True))
             i = end
         else:
             start = i
@@ -599,10 +783,76 @@ def parse_markdown_hierarchy(
     all_chunks = []
     chunk_id = 0
 
-    def append_text_chunks(block_text, chapter, section, subsection, section_path, source_line):
+    def append_table_chunks(table_text, chapter, section, subsection, section_path, source_line):
         nonlocal chunk_id
-        normalized_text = normalize_tables_for_chunking(block_text)
-        for chunk_text in split_content_by_size(normalized_text, chunk_size):
+        parsed = parse_structured_table(table_text)
+        structured_table = parsed.get("structured_table")
+        if not structured_table:
+            append_plain_text_chunks(table_text, chapter, section, subsection, section_path, source_line)
+            return
+
+        if parsed.get("record_kind") == "alarm":
+            for record in structured_table["records"]:
+                content = build_alarm_record_text(record)
+                chunk_obj = make_chunk_obj(
+                    chunk_id=chunk_id,
+                    doc_name=doc_name,
+                    content=content,
+                    chapter=chapter,
+                    section=section,
+                    subsection=subsection,
+                    section_path=section_path,
+                    source_line=source_line,
+                    source_file=source_file,
+                    file_id=file_id,
+                    file_version_id=file_version_id,
+                    source_type=source_type,
+                    file_format=file_format,
+                    chunk_type="table_row_summary",
+                    source_record_type=source_record_type,
+                    source_record_id=source_record_id,
+                )
+                chunk_obj["raw_content"] = content
+                chunk_obj["table_row"] = record
+                chunk_obj["structured_table"] = {
+                    "table_type": structured_table["table_type"],
+                    "record_kind": "alarm",
+                    "header": list(ALARM_TABLE_HEADERS),
+                    "record": record,
+                }
+                chunk_obj["structured_parse_status"] = parsed["status"]
+                all_chunks.append(chunk_obj)
+                chunk_id += 1
+            return
+
+        content = parsed.get("summary_text") or table_text
+        chunk_obj = make_chunk_obj(
+            chunk_id=chunk_id,
+            doc_name=doc_name,
+            content=content,
+            chapter=chapter,
+            section=section,
+            subsection=subsection,
+            section_path=section_path,
+            source_line=source_line,
+            source_file=source_file,
+            file_id=file_id,
+            file_version_id=file_version_id,
+            source_type=source_type,
+            file_format=file_format,
+            chunk_type="table_row_summary",
+            source_record_type=source_record_type,
+            source_record_id=source_record_id,
+        )
+        chunk_obj["raw_content"] = table_text
+        chunk_obj["structured_table"] = structured_table
+        chunk_obj["structured_parse_status"] = parsed["status"]
+        all_chunks.append(chunk_obj)
+        chunk_id += 1
+
+    def append_plain_text_chunks(block_text, chapter, section, subsection, section_path, source_line):
+        nonlocal chunk_id
+        for chunk_text in split_content_by_size(block_text, chunk_size):
             all_chunks.append(
                 make_chunk_obj(
                     chunk_id=chunk_id,
@@ -624,6 +874,13 @@ def parse_markdown_hierarchy(
                 )
             )
             chunk_id += 1
+
+    def append_text_chunks(block_text, chapter, section, subsection, section_path, source_line):
+        for segment_text, is_table in split_text_by_tables(block_text):
+            if is_table:
+                append_table_chunks(segment_text, chapter, section, subsection, section_path, source_line)
+            else:
+                append_plain_text_chunks(segment_text, chapter, section, subsection, section_path, source_line)
 
     if not titles:
         append_text_chunks(content, "", "", "", "0.0.0", get_line_number(0, line_starts))
