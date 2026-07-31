@@ -4,6 +4,8 @@ Main metrics follow the planned protocol:
 - strict entity span + type precision/recall/F1
 - loose entity span + type precision/recall/F1
 - normalized entity F1
+- mention + type F1
+- exact evidence F1
 - strict directed relation triple F1: source, relation_type, target
 """
 
@@ -31,6 +33,9 @@ class Span(NamedTuple):
 class ParsedAnswer(NamedTuple):
     entity_spans: list[Span]
     normalized_entities: set[tuple[int, str, str]]
+    mention_entities: set[tuple[int, str, str]]
+    evidence_exact: set[tuple[int, str, str, int, int, str, str]]
+    evidence_text_type: set[tuple[int, str, str]]
     relation_triples: set[tuple[int, str, str, str]]
     relation_triples_with_attrs: set[tuple[int, str, str, str, str, str]]
     logic_groups: set[tuple[int, str, str, str]]
@@ -116,6 +121,9 @@ def _parse_answer(text: str, row_id: int) -> ParsedAnswer:
     sections = _split_sections(text)
     entity_spans: list[Span] = []
     normalized_entities: set[tuple[int, str, str]] = set()
+    mention_entities: set[tuple[int, str, str]] = set()
+    evidence_exact: set[tuple[int, str, str, int, int, str, str]] = set()
+    evidence_text_type: set[tuple[int, str, str]] = set()
     alias_map: dict[str, str] = {}
 
     for line in sections["ENTITY"]:
@@ -128,9 +136,12 @@ def _parse_answer(text: str, row_id: int) -> ParsedAnswer:
         alias_map[mention] = normalized_name
         alias_map[normalized_name] = normalized_name
         normalized_entities.add((row_id, entity_type, normalized_name))
+        mention_entities.add((row_id, entity_type, mention))
 
         evidence = fields[3] if len(fields) >= 4 else ""
-        for chunk_id, text_field, start, end, _quote in _parse_evidence(evidence):
+        for chunk_id, text_field, start, end, quote in _parse_evidence(evidence):
+            evidence_exact.add((row_id, chunk_id, text_field, start, end, entity_type, quote))
+            evidence_text_type.add((row_id, entity_type, quote))
             entity_spans.append(
                 Span(
                     row_id=row_id,
@@ -171,6 +182,9 @@ def _parse_answer(text: str, row_id: int) -> ParsedAnswer:
     return ParsedAnswer(
         entity_spans=entity_spans,
         normalized_entities=normalized_entities,
+        mention_entities=mention_entities,
+        evidence_exact=evidence_exact,
+        evidence_text_type=evidence_text_type,
         relation_triples=relation_triples,
         relation_triples_with_attrs=relation_triples_with_attrs,
         logic_groups=logic_groups,
@@ -231,6 +245,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     gold_spans: list[Span] = []
     pred_normalized: set[tuple[int, str, str]] = set()
     gold_normalized: set[tuple[int, str, str]] = set()
+    pred_mentions: set[tuple[int, str, str]] = set()
+    gold_mentions: set[tuple[int, str, str]] = set()
+    pred_evidence_exact: set[tuple[int, str, str, int, int, str, str]] = set()
+    gold_evidence_exact: set[tuple[int, str, str, int, int, str, str]] = set()
+    pred_evidence_text_type: set[tuple[int, str, str]] = set()
+    gold_evidence_text_type: set[tuple[int, str, str]] = set()
     pred_relations: set[tuple[int, str, str, str]] = set()
     gold_relations: set[tuple[int, str, str, str]] = set()
     pred_relations_attrs: set[tuple[int, str, str, str, str, str]] = set()
@@ -249,6 +269,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         gold_spans.extend(gold.entity_spans)
         pred_normalized.update(pred.normalized_entities)
         gold_normalized.update(gold.normalized_entities)
+        pred_mentions.update(pred.mention_entities)
+        gold_mentions.update(gold.mention_entities)
+        pred_evidence_exact.update(pred.evidence_exact)
+        gold_evidence_exact.update(gold.evidence_exact)
+        pred_evidence_text_type.update(pred.evidence_text_type)
+        gold_evidence_text_type.update(gold.evidence_text_type)
         pred_relations.update(pred.relation_triples)
         gold_relations.update(gold.relation_triples)
         pred_relations_attrs.update(pred.relation_triples_with_attrs)
@@ -266,6 +292,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "entity_strict_span_type": _set_score(pred_span_exact, gold_span_exact),
             "entity_loose_span_type": _loose_span_score(pred_spans, gold_spans),
             "entity_normalized": _set_score(pred_normalized, gold_normalized),
+            "entity_mention_type": _set_score(pred_mentions, gold_mentions),
+            "entity_evidence_exact": _set_score(pred_evidence_exact, gold_evidence_exact),
+            "entity_evidence_text_type": _set_score(pred_evidence_text_type, gold_evidence_text_type),
             "relation_strict_triple": _set_score(pred_relations, gold_relations),
         },
         "secondary_metrics": {
@@ -277,6 +306,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "gold_entity_spans": len(gold_spans),
             "pred_normalized_entities": len(pred_normalized),
             "gold_normalized_entities": len(gold_normalized),
+            "pred_mentions": len(pred_mentions),
+            "gold_mentions": len(gold_mentions),
+            "pred_evidence_exact": len(pred_evidence_exact),
+            "gold_evidence_exact": len(gold_evidence_exact),
+            "pred_evidence_text_type": len(pred_evidence_text_type),
+            "gold_evidence_text_type": len(gold_evidence_text_type),
             "pred_relations": len(pred_relations),
             "gold_relations": len(gold_relations),
             "pred_logic_groups": len(pred_logic),
