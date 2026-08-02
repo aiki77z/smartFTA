@@ -10,6 +10,7 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
@@ -22,6 +23,19 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
+
+
+ENTITY_TYPE_CODE_MAP = {
+    "故障事件": "FaultEvent",
+    "故障类别": "FaultCategory",
+    "报警码": "AlarmCode",
+    "维修方法": "MaintenanceAction",
+    "触发规则": "TriggerRule",
+}
+
+
+def entity_type_code(entity_type: str) -> str:
+    return ENTITY_TYPE_CODE_MAP.get(clean_scalar(entity_type), clean_scalar(entity_type))
 
 
 WEAK_SUFFIXES = [
@@ -2038,6 +2052,64 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> Non
         writer.writerows(rows)
 
 
+def mention_to_dict(mention: Mention, mention_to_cluster: dict[str, str]) -> dict[str, Any]:
+    return {
+        "mention_id": mention.mention_id,
+        "local_entity_id": mention.local_entity_id,
+        "file_id": mention.file_id,
+        "sample_id": mention.sample_id,
+        "chapter_id": mention.chapter_id,
+        "source_type": mention.source_type,
+        "entity_type": entity_type_code(mention.entity_type),
+        "entity_type_code": entity_type_code(mention.entity_type),
+        "entity_type_zh": mention.entity_type,
+        "mention": mention.mention,
+        "normalized_name": mention.normalized_name,
+        "evidence": mention.evidence,
+        "chunk_ids": mention.chunk_ids,
+        "neighbor_tokens": sorted(mention.neighbor_tokens),
+        "cluster_id": mention_to_cluster.get(mention.mention_id, ""),
+        "embedding_dim": len(mention.embedding or []),
+    }
+
+
+def relation_to_dict(relation: RawRelation) -> dict[str, Any]:
+    return {
+        "relation_id": relation.relation_id,
+        "file_id": relation.file_id,
+        "sample_id": relation.sample_id,
+        "source_mention_id": relation.source_mention_id,
+        "target_mention_id": relation.target_mention_id,
+        "source_text": relation.source_text,
+        "target_text": relation.target_text,
+        "relation_type": relation.relation_type,
+        "cross_chunk": relation.cross_chunk,
+        "involved_chunk_ids": relation.involved_chunk_ids,
+        "evidence": relation.evidence,
+        "polarity": relation.polarity,
+        "certainty": relation.certainty,
+    }
+
+
+def cluster_to_dict(cluster: Cluster) -> dict[str, Any]:
+    return {
+        "cluster_id": cluster.cluster_id,
+        "file_id": cluster.file_id,
+        "entity_type": entity_type_code(cluster.entity_type),
+        "entity_type_code": entity_type_code(cluster.entity_type),
+        "entity_type_zh": cluster.entity_type,
+        "canonical_name": cluster.canonical_name,
+        "mention_ids": cluster.mention_ids,
+        "aliases": sorted(cluster.aliases),
+        "evidence": cluster.evidence,
+        "chunk_ids": evidence_chunk_ids(cluster.evidence),
+        "neighbor_tokens": sorted(cluster.neighbor_tokens),
+        "merge_reasons": sorted(cluster.merge_reasons),
+        "mention_count": len(cluster.mention_ids),
+        "embedding_dim": len(cluster.embedding or []),
+    }
+
+
 def export_results(
     output_dir: Path,
     mentions: list[Mention],
@@ -2055,7 +2127,8 @@ def export_results(
                 "mention_id": m.mention_id,
                 "file_id": m.file_id,
                 "sample_id": m.sample_id,
-                "entity_type": m.entity_type,
+                "entity_type": entity_type_code(m.entity_type),
+                "entity_type_zh": m.entity_type,
                 "mention": m.mention,
                 "normalized_name": m.normalized_name,
                 "chunk_ids": join_list(m.chunk_ids),
@@ -2064,7 +2137,7 @@ def export_results(
             }
             for m in mentions
         ],
-        ["mention_id", "file_id", "sample_id", "entity_type", "mention", "normalized_name", "chunk_ids", "neighbor_tokens", "evidence"],
+        ["mention_id", "file_id", "sample_id", "entity_type", "entity_type_zh", "mention", "normalized_name", "chunk_ids", "neighbor_tokens", "evidence"],
     )
     if any(m.embedding for m in mentions):
         embedding_rows = []
@@ -2079,7 +2152,8 @@ def export_results(
                         "cluster_id": mention_to_cluster.get(mention.mention_id, ""),
                         "file_id": mention.file_id,
                         "sample_id": mention.sample_id,
-                        "entity_type": mention.entity_type,
+                        "entity_type": entity_type_code(mention.entity_type),
+                        "entity_type_zh": mention.entity_type,
                         "normalized_name": mention.normalized_name,
                         "embedding": mention.embedding,
                     },
@@ -2093,7 +2167,8 @@ def export_results(
             {
                 "cluster_id": c.cluster_id,
                 "file_id": c.file_id,
-                "entity_type": c.entity_type,
+                "entity_type": entity_type_code(c.entity_type),
+                "entity_type_zh": c.entity_type,
                 "canonical_name": c.canonical_name,
                 "mention_count": len(c.mention_ids),
                 "aliases": join_list(c.aliases),
@@ -2104,7 +2179,7 @@ def export_results(
             }
             for c in clusters
         ],
-        ["cluster_id", "file_id", "entity_type", "canonical_name", "mention_count", "aliases", "mention_ids", "neighbor_tokens", "merge_reasons", "evidence"],
+        ["cluster_id", "file_id", "entity_type", "entity_type_zh", "canonical_name", "mention_count", "aliases", "mention_ids", "neighbor_tokens", "merge_reasons", "evidence"],
     )
     write_csv(
         output_dir / "clustered_relations.csv",
@@ -2139,6 +2214,7 @@ def export_results(
         encoding="utf-8",
     )
     summary = {
+        "schema_version": "smartfta_entity_clustering_v1",
         "mentions": len(mentions),
         "raw_relations": len(relations),
         "clusters": len(clusters),
@@ -2151,6 +2227,26 @@ def export_results(
         "mentions_per_cluster": dict(Counter(str(len(c.mention_ids)) for c in clusters)),
     }
     (output_dir / "cluster_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    intermediate = {
+        "schema_version": "smartfta_cluster_intermediate_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "file_id": mentions[0].file_id if mentions else (clusters[0].file_id if clusters else ""),
+        "summary": summary,
+        "mentions": [mention_to_dict(mention, mention_to_cluster or {}) for mention in mentions],
+        "raw_relations": [relation_to_dict(relation) for relation in relations],
+        "clusters": [cluster_to_dict(cluster) for cluster in clusters],
+        "mention_to_cluster": mention_to_cluster or {},
+        "clustered_relations": clustered_relations,
+        "diagnostic_candidates": review_candidates,
+        "notes": {
+            "embedding_vectors": "Large embedding vectors are stored separately in entity_embeddings.jsonl when available.",
+            "neo4j_import": "Use import_cluster_intermediate_to_kb.py to import this artifact into Neo4j and MongoDB.",
+        },
+    }
+    (output_dir / "cluster_intermediate.json").write_text(
+        json.dumps(intermediate, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def main() -> None:
