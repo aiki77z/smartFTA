@@ -80,6 +80,229 @@ def _normalize_identifier(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _parse_json_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if value in (None, ""):
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except Exception:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _compact_text(value: Any) -> str:
+    return "".join(str(value or "").split())
+
+
+def _edge_node_name(node: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(node, dict):
+        return ""
+    return _normalize_text(node.get("name") or node.get("canonical_name") or node.get("cluster_id"))
+
+
+def _edge_direction_score(edge: Dict[str, Any], nodes_by_id: Dict[str, Dict[str, Any]]) -> float:
+    source = nodes_by_id.get(edge.get("source_graph_node_id"))
+    target = nodes_by_id.get(edge.get("target_graph_node_id"))
+    source_name = _compact_text(_edge_node_name(source))
+    target_name = _compact_text(_edge_node_name(target))
+    if not source_name or not target_name:
+        return 0.0
+    cues = ("导致", "触发", "引起", "造成", "致使", "使", "从而", "因此", "保护", "停机")
+    evidence = _parse_json_list(edge.get("evidence_json"))
+    best = 0.0
+    same_sentence = 0
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        text = _compact_text(item.get("text"))
+        if not text:
+            continue
+        s_pos = text.find(source_name)
+        t_pos = text.find(target_name)
+        if s_pos < 0 or t_pos < 0:
+            continue
+        same_sentence += 1
+        left, right = sorted([s_pos, t_pos])
+        between = text[left : right + max(len(source_name), len(target_name))]
+        has_cue = any(cue in between for cue in cues)
+        if s_pos < t_pos and has_cue:
+            best = max(best, 4.0)
+        elif s_pos < t_pos:
+            best = max(best, 2.0)
+        elif t_pos < s_pos and has_cue:
+            best = min(best, -2.5)
+        elif t_pos < s_pos:
+            best = min(best, -1.0)
+    if same_sentence == 0 and str(edge.get("cross_chunk") or "").lower() == "true":
+        best -= 1.2
+    return best
+
+
+def _edge_strength(edge: Dict[str, Any], nodes_by_id: Dict[str, Dict[str, Any]]) -> float:
+    evidence = _parse_json_list(edge.get("evidence_json"))
+    source_relation_ids = edge.get("source_relation_ids")
+    if not isinstance(source_relation_ids, list):
+        source_relation_ids = []
+    source_file_version_ids = edge.get("source_file_version_ids")
+    if not isinstance(source_file_version_ids, list):
+        source_file_version_ids = [edge.get("file_version_id")] if edge.get("file_version_id") else []
+    score = 0.0
+    score += 3.0 if str(edge.get("certainty") or "certain") == "certain" else 1.0
+    score += 1.0 if str(edge.get("polarity") or "positive") == "positive" else 0.0
+    score += min(len(evidence), 5) * 0.6
+    score += min(len(source_relation_ids), 5) * 0.4
+    score += min(len(source_file_version_ids), 5) * 0.5
+    if str(edge.get("cross_chunk") or "").lower() == "true":
+        score -= 0.8
+    score += _edge_direction_score(edge, nodes_by_id)
+    return score
+
+
+def _edge_stable_key(edge: Dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(edge.get("source_graph_node_id") or ""),
+            str(edge.get("target_graph_node_id") or ""),
+            str(edge.get("relation_type") or ""),
+            str(edge.get("relation_id") or ""),
+            str(edge.get("file_version_id") or ""),
+            ",".join(map(str, edge.get("source_chunk_refs") or edge.get("source_chunk_ids") or [])),
+        ]
+    )
+
+
+def _find_directed_cycles(edges: List[Dict[str, Any]], max_cycles: int = 100) -> List[List[Dict[str, Any]]]:
+    outgoing: Dict[str, List[Dict[str, Any]]] = {}
+    for edge in edges:
+        outgoing.setdefault(str(edge.get("source_graph_node_id")), []).append(edge)
+    cycles: List[List[Dict[str, Any]]] = []
+    seen = set()
+
+    def dfs(start: str, current: str, path: List[Dict[str, Any]], visiting: set) -> None:
+        if len(cycles) >= max_cycles:
+            return
+        for edge in outgoing.get(current, []):
+            nxt = str(edge.get("target_graph_node_id"))
+            if nxt == start:
+                cycle = path + [edge]
+                key = tuple(sorted(_edge_stable_key(item) for item in cycle))
+                if key not in seen:
+                    seen.add(key)
+                    cycles.append(cycle)
+                continue
+            if nxt in visiting:
+                continue
+            visiting.add(nxt)
+            dfs(start, nxt, path + [edge], visiting)
+            visiting.remove(nxt)
+
+    for node_id in sorted(outgoing):
+        dfs(node_id, node_id, [], {node_id})
+        if len(cycles) >= max_cycles:
+            break
+    return cycles
+
+
+def _temporarily_disable_causal_cycle_edges(
+    edges: List[Dict[str, Any]],
+    nodes_by_id: Dict[str, Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    remaining = [edge for edge in edges if edge.get("source_graph_node_id") != edge.get("target_graph_node_id")]
+    disabled: List[Dict[str, Any]] = [
+        {**edge, "disabled_reason": "self_loop_in_selected_view"}
+        for edge in edges
+        if edge.get("source_graph_node_id") == edge.get("target_graph_node_id")
+    ]
+    disabled_keys = {_edge_stable_key(edge) for edge in disabled}
+
+    while True:
+        active = [edge for edge in remaining if _edge_stable_key(edge) not in disabled_keys]
+        cycles = _find_directed_cycles(active, max_cycles=1)
+        if not cycles:
+            break
+        cycle = cycles[0]
+        weakest = sorted(cycle, key=lambda item: (_edge_strength(item, nodes_by_id), _edge_stable_key(item)))[0]
+        disabled_keys.add(_edge_stable_key(weakest))
+        disabled.append({**weakest, "disabled_reason": "causal_cycle_in_selected_file_view"})
+
+    cleaned = [edge for edge in remaining if _edge_stable_key(edge) not in disabled_keys]
+    return cleaned, disabled
+
+
+def _has_directed_path_without_edge(
+    source_id: str,
+    target_id: str,
+    edges: List[Dict[str, Any]],
+    excluded_key: str,
+    *,
+    max_hops: int = 3,
+) -> bool:
+    outgoing: Dict[str, List[Dict[str, Any]]] = {}
+    for edge in edges:
+        if _edge_stable_key(edge) == excluded_key:
+            continue
+        outgoing.setdefault(str(edge.get("source_graph_node_id")), []).append(edge)
+
+    queue: List[tuple[str, int]] = [(source_id, 0)]
+    visited = {source_id}
+    while queue:
+        current, depth = queue.pop(0)
+        if depth >= max_hops:
+            continue
+        for edge in outgoing.get(current, []):
+            nxt = str(edge.get("target_graph_node_id"))
+            if nxt == target_id:
+                return True
+            if nxt in visited:
+                continue
+            visited.add(nxt)
+            queue.append((nxt, depth + 1))
+    return False
+
+
+def _temporarily_prune_transitive_causal_edges(
+    edges: List[Dict[str, Any]],
+    nodes_by_id: Dict[str, Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Hide weak shortcut edges such as A->C when A->B->C is available in the selected view."""
+    candidates = [
+        edge
+        for edge in edges
+        if edge.get("source_graph_node_id")
+        and edge.get("target_graph_node_id")
+        and edge.get("source_graph_node_id") != edge.get("target_graph_node_id")
+    ]
+    disabled: List[Dict[str, Any]] = []
+    disabled_keys = set()
+
+    for edge in sorted(candidates, key=lambda item: (_edge_strength(item, nodes_by_id), _edge_stable_key(item))):
+        edge_key = _edge_stable_key(edge)
+        if edge_key in disabled_keys:
+            continue
+        active = [item for item in edges if _edge_stable_key(item) not in disabled_keys]
+        source_id = str(edge.get("source_graph_node_id"))
+        target_id = str(edge.get("target_graph_node_id"))
+        if not _has_directed_path_without_edge(source_id, target_id, active, edge_key, max_hops=3):
+            continue
+
+        strength = _edge_strength(edge, nodes_by_id)
+        evidence_count = len(_parse_json_list(edge.get("evidence_json")))
+        relation_count = len(edge.get("source_relation_ids") or [])
+        # Strong direct evidence should remain visible even if a longer explanatory chain exists.
+        if strength >= 8.5 or evidence_count >= 3 or relation_count >= 2:
+            continue
+
+        disabled_keys.add(edge_key)
+        disabled.append({**edge, "disabled_reason": "transitive_redundant_shortcut_in_selected_file_view"})
+
+    if not disabled:
+        return edges, []
+    cleaned = [edge for edge in edges if _edge_stable_key(edge) not in disabled_keys]
+    return cleaned, disabled
+
+
 def _normalize_file_name(value: Any) -> str:
     text = _normalize_identifier(value)
     text = re.sub(r"[\\/]+", "/", text)
@@ -257,6 +480,20 @@ def _build_file_version_filter(
     return {field_name: {"$in": normalized}}
 
 
+def _scope_list_expr(var_name: str) -> str:
+    return (
+        f"CASE WHEN 'source_file_version_ids' IN keys({var_name}) THEN {var_name}['source_file_version_ids'] "
+        f"WHEN {var_name}['file_version_id'] IS NULL THEN [] ELSE [{var_name}['file_version_id']] END"
+    )
+
+
+def _scope_filter_expr(var_name: str, param_name: str = "selected_file_version_ids") -> str:
+    return (
+        f"(${param_name} = [] OR "
+        f"any(fv IN {_scope_list_expr(var_name)} WHERE fv IN ${param_name}))"
+    )
+
+
 def list_active_file_version_ids() -> List[str]:
     cursor = file_versions_col.find({"is_active": True, "status": {"$nin": list(STATUS_INACTIVE_VALUES)}}, {"_id": 0, "file_version_id": 1})
     result = []
@@ -330,6 +567,16 @@ def _get_chunk_identifier(doc: Optional[Dict[str, Any]]) -> Any:
     return doc.get("id", doc.get("chunk_id"))
 
 
+def _chunk_body_text(doc: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(doc, dict):
+        return ""
+    for key in ("content", "text", "raw_text", "page_content", "body", "markdown"):
+        value = doc.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
 def _neo4j_available() -> bool:
     return bool(GraphDatabase and NEO4J_PASSWORD)
 
@@ -369,9 +616,17 @@ def _is_fault_like_entity_type(entity_type: Any) -> bool:
     text = _normalize_text(entity_type)
     if not text:
         return True
-    positive_tokens = ("故障", "异常", "报警", "现象")
+    if text in {"FaultEvent", "FAULT_EVENT", "fault_event", "FaultPhenomenon"}:
+        return True
+    if text.lower() in {"faultevent", "faultphenomenon"}:
+        return True
+    positive_tokens = (
+        "\u6545\u969c",
+        "\u5f02\u5e38",
+        "\u62a5\u8b66",
+        "\u73b0\u8c61",
+    )
     return any(token in text for token in positive_tokens)
-
 
 def _parse_maybe_json(value: Any, default):
     if value in (None, ""):
@@ -383,6 +638,24 @@ def _parse_maybe_json(value: Any, default):
             return json.loads(value)
         except Exception:
             return default
+
+
+def _evidence_chunk_refs(value: Any) -> List[str]:
+    refs: List[str] = []
+    for item in _parse_maybe_json(value, []):
+        if not isinstance(item, dict):
+            continue
+        chunk_ref = _normalize_identifier(item.get("chunk_ref"))
+        if chunk_ref:
+            refs.append(chunk_ref)
+            continue
+        file_version_id = _normalize_identifier(item.get("file_version_id"))
+        chunk_id = _normalize_identifier(item.get("chunk_id"))
+        if file_version_id and chunk_id:
+            refs.append(_make_chunk_ref(file_version_id, chunk_id))
+        elif chunk_id:
+            refs.append(chunk_id)
+    return _dedupe_keep_order(refs)
     return default
 
 
@@ -411,19 +684,51 @@ def _coerce_documents(value: Any) -> List[Dict[str, Any]]:
 def _decode_graph_node(raw: Dict[str, Any]) -> Dict[str, Any]:
     props = dict(raw.get("props") or {})
     documents = _coerce_documents(props.get("documents"))
-    source_chunk_ids = _coerce_chunk_ids(props.get("source_chunk_ids"))
+    source_chunk_ids = _coerce_chunk_ids(props.get("source_chunk_ids") or props.get("chunk_ids"))
     if not source_chunk_ids and documents:
         source_chunk_ids = _dedupe_keep_order([doc.get("chunk_id") for doc in documents])
-    file_id = props.get("file_id") or raw.get("file_id")
-    file_version_id = props.get("file_version_id") or raw.get("file_version_id")
+    source_file_ids = _dedupe_keep_order(
+        props.get("source_file_ids")
+        or ([props.get("file_id") or raw.get("file_id")] if (props.get("file_id") or raw.get("file_id")) else [])
+    )
+    source_file_version_ids = _dedupe_keep_order(
+        props.get("source_file_version_ids")
+        or ([props.get("file_version_id") or raw.get("file_version_id")] if (props.get("file_version_id") or raw.get("file_version_id")) else [])
+    )
+    file_id = source_file_ids[0] if source_file_ids else (props.get("file_id") or raw.get("file_id"))
+    file_version_id = source_file_version_ids[0] if source_file_version_ids else (props.get("file_version_id") or raw.get("file_version_id"))
+    graph_node_id = props.get("cluster_id") or raw.get("graph_node_id")
+    name = props.get("canonical_name") or props.get("name") or ""
+    normalized_name = props.get("normalized_name") or props.get("canonical_name") or props.get("name") or ""
+    explicit_chunk_refs = _dedupe_keep_order(props.get("source_chunk_refs") or props.get("chunk_refs") or [])
+    if explicit_chunk_refs:
+        source_chunk_refs = explicit_chunk_refs
+    elif len(source_file_version_ids) == 1:
+        source_chunk_refs = [
+            _make_chunk_ref(source_file_version_ids[0], chunk_id)
+            for chunk_id in source_chunk_ids
+            if chunk_id not in (None, "")
+        ]
+    else:
+        source_chunk_refs = [
+            _make_chunk_ref(file_version_id, chunk_id)
+            for chunk_id in source_chunk_ids
+            if chunk_id not in (None, "")
+        ]
     return {
-        "graph_node_id": raw.get("graph_node_id"),
+        "graph_node_id": graph_node_id,
+        "neo4j_element_id": raw.get("graph_node_id"),
+        "cluster_id": props.get("cluster_id"),
         "file_id": file_id,
         "file_version_id": file_version_id,
+        "source_file_ids": source_file_ids,
+        "source_file_version_ids": source_file_version_ids,
         "is_active": bool(props.get("is_active", True)),
-        "name": props.get("name") or "",
-        "normalized_name": props.get("normalized_name") or props.get("name") or "",
-        "entity_type": props.get("entity_type") or "",
+        "name": name,
+        "canonical_name": props.get("canonical_name") or name,
+        "normalized_name": normalized_name,
+        "entity_type": props.get("entity_type_zh") or props.get("entity_type") or "",
+        "entity_type_code": props.get("entity_type_code") or props.get("entity_type") or "",
         "node_type": props.get("node_type") or ("AND" if "LogicGate" in (raw.get("labels") or []) else "FAULT"),
         "labels": raw.get("labels") or [],
         "description": props.get("description") or "",
@@ -432,10 +737,11 @@ def _decode_graph_node(raw: Dict[str, Any]) -> Dict[str, Any]:
         "probability": props.get("probability"),
         "showProbability": props.get("showProbability"),
         "rule": props.get("rule") or "",
+        "rules": props.get("rules") or [],
         "investigateMethod": props.get("investigateMethod") or "",
         "documents": documents,
         "source_chunk_ids": source_chunk_ids,
-        "source_chunk_refs": [_make_chunk_ref(file_version_id, chunk_id) for chunk_id in source_chunk_ids if chunk_id not in (None, "")],
+        "source_chunk_refs": source_chunk_refs,
         "support_count": props.get("support_count"),
         "raw_props": props,
     }
@@ -443,26 +749,52 @@ def _decode_graph_node(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def _decode_graph_relation(raw: Dict[str, Any]) -> Dict[str, Any]:
     props = dict(raw.get("rel_props") or {})
-    source_chunk_ids = _coerce_chunk_ids(props.get("source_chunk_ids"))
+    source_chunk_ids = _coerce_chunk_ids(props.get("source_chunk_ids") or props.get("involved_chunk_ids"))
     chunk_id = props.get("chunk_id")
     if chunk_id not in (None, "") and chunk_id not in source_chunk_ids:
         source_chunk_ids.insert(0, chunk_id)
     file_id = props.get("file_id") or raw.get("file_id")
     file_version_id = props.get("file_version_id") or raw.get("file_version_id")
+    source_file_version_ids = _dedupe_keep_order(
+        props.get("source_file_version_ids")
+        or ([file_version_id] if file_version_id else [])
+    )
+    explicit_chunk_refs = _dedupe_keep_order(props.get("source_chunk_refs") or props.get("involved_chunk_refs") or [])
+    if explicit_chunk_refs:
+        source_chunk_refs = explicit_chunk_refs
+    elif len(source_file_version_ids) == 1:
+        source_chunk_refs = [
+            _make_chunk_ref(source_file_version_ids[0], item)
+            for item in source_chunk_ids
+            if item not in (None, "")
+        ]
+    else:
+        source_chunk_refs = [
+            _make_chunk_ref(file_version_id, item)
+            for item in source_chunk_ids
+            if item not in (None, "")
+        ]
     return {
         "source_graph_node_id": raw.get("source_graph_node_id"),
         "target_graph_node_id": raw.get("target_graph_node_id"),
         "file_id": file_id,
         "file_version_id": file_version_id,
+        "source_file_version_ids": source_file_version_ids,
         "is_active": bool(props.get("is_active", True)),
-        "relation_type": props.get("relation_type") or "触发",
+        "relation_type": props.get("relation_type_zh") or props.get("relation_type") or props.get("relation_type_code") or "CAUSES",
+        "relation_type_code": props.get("relation_type_code") or "",
+        "relation_id": props.get("relation_id") or "",
+        "evidence_json": props.get("evidence_json") or "[]",
+        "source_relation_ids": props.get("source_relation_ids") or [],
+        "cross_chunk": props.get("cross_chunk") or "",
+        "polarity": props.get("polarity") or "positive",
+        "certainty": props.get("certainty") or "certain",
         "chunk_id": chunk_id,
         "source_chunk_ids": source_chunk_ids,
-        "source_chunk_refs": [_make_chunk_ref(file_version_id, item) for item in source_chunk_ids if item not in (None, "")],
+        "source_chunk_refs": source_chunk_refs,
         "support_count": props.get("support_count"),
         "raw_props": props,
     }
-
 
 def _score_top_event_candidate(node: Dict[str, Any]) -> tuple:
     name = _normalize_text(node.get("name"))
@@ -541,6 +873,18 @@ def get_chunks_by_ids(
     return _fetch_chunks_by_identifiers(chunk_ids, effective_limit, selected_file_version_ids=selected_file_version_ids)
 
 
+def list_all_chunks(
+    *,
+    selected_file_version_ids: Optional[List[Any]] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    query = _build_file_version_filter(selected_file_version_ids) or {}
+    docs = list(chunks_col.find(query, {"_id": 0}).limit(safe_limit))
+    docs.sort(key=_chunk_sort_key)
+    return docs
+
+
 def hydrate_documents_by_chunk_ids(
     chunk_ids: List[Any],
     *,
@@ -555,12 +899,13 @@ def hydrate_documents_by_chunk_ids(
             {
                 "chunk_uid": chunk.get("chunk_uid") or _make_chunk_ref(chunk.get("file_version_id"), chunk_id),
                 "chunk_id": chunk_id,
-                "chunk_name": chunk.get("chunk_name", ""),
-                "section_path": chunk.get("section_path", ""),
-                "source_page": chunk.get("source", ""),
+                "chunk_name": chunk.get("chunk_name") or chunk.get("title") or chunk.get("heading") or chunk.get("chapter") or "",
+                "section_path": chunk.get("section_path") or chunk.get("section") or chunk.get("chapter") or "",
+                "source_page": chunk.get("source_page") or chunk.get("source") or chunk.get("page") or "",
                 "file_id": chunk.get("file_id"),
                 "file_version_id": chunk.get("file_version_id"),
                 "file": chunk.get("file"),
+                "content": _chunk_body_text(chunk),
             }
         )
     return documents
@@ -588,17 +933,23 @@ def match_top_event_from_graph(
     if not queries:
         raise ValueError("top_event_query is empty")
 
-    cypher = """
-    MATCH (n:Entity)
-    WITH n, elementId(n) AS graph_node_id, replace(coalesce(n.name, ''), ' ', '') AS compact_name
+    cypher = f"""
+    MATCH (n:EntityCluster:FaultEvent)
+    WITH n, elementId(n) AS graph_node_id,
+         replace(coalesce(n.canonical_name, n.name, ''), ' ', '') AS compact_name,
+         [alias IN coalesce(n.aliases, []) | replace(coalesce(alias, ''), ' ', '')] AS compact_aliases
     WHERE
       ($enforce_active_only = false OR coalesce(n.is_active, true) = true)
-      AND ($selected_file_version_ids = [] OR coalesce(n.file_version_id, '') IN $selected_file_version_ids)
+      AND {_scope_filter_expr("n")}
       AND (
-      n.name IN $queries
+      n.cluster_id IN $queries
+      OR n.name IN $queries
+      OR n.canonical_name IN $queries
       OR coalesce(n.normalized_name, '') IN $queries
+      OR any(alias IN coalesce(n.aliases, []) WHERE alias IN $queries)
       OR compact_name IN $compact_queries
-      OR any(query IN $queries WHERE n.name CONTAINS query OR query CONTAINS n.name)
+      OR any(alias IN compact_aliases WHERE alias IN $compact_queries)
+      OR any(query IN $queries WHERE coalesce(n.canonical_name, n.name, '') CONTAINS query OR query CONTAINS coalesce(n.canonical_name, n.name, ''))
       OR any(query IN $compact_queries WHERE compact_name CONTAINS query OR query CONTAINS compact_name)
       )
     RETURN
@@ -648,13 +999,13 @@ def match_top_event_from_graph(
     if _looks_like_fault_code(best.get("name", "")):
         with driver.session(database=NEO4J_DATABASE) as session:
             alias_row = session.run(
-                """
-                MATCH (code:Entity)-[:RELATION {relation_type:'触发'}]->(target:Entity)
-                WHERE elementId(code) = $graph_node_id
+                f"""
+                MATCH (code:EntityCluster)-[:CLUSTERED_INDICATES]->(target:EntityCluster:FaultEvent)
+                WHERE (elementId(code) = $graph_node_id OR code.cluster_id = $graph_node_id)
                   AND ($enforce_active_only = false OR coalesce(target.is_active, true) = true)
                   AND ($enforce_active_only = false OR coalesce(code.is_active, true) = true)
-                  AND ($selected_file_version_ids = [] OR coalesce(code.file_version_id, '') IN $selected_file_version_ids)
-                  AND ($selected_file_version_ids = [] OR coalesce(target.file_version_id, '') IN $selected_file_version_ids)
+                  AND {_scope_filter_expr("code")}
+                  AND {_scope_filter_expr("target")}
                 RETURN elementId(target) AS graph_node_id, labels(target) AS labels, properties(target) AS props
                 LIMIT 1
                 """,
@@ -731,11 +1082,11 @@ def get_graph_node_by_id(
     )
     with driver.session(database=NEO4J_DATABASE) as session:
         row = session.run(
-            """
-            MATCH (n)
-            WHERE elementId(n) = $graph_node_id
+            f"""
+            MATCH (n:EntityCluster)
+            WHERE (elementId(n) = $graph_node_id OR n.cluster_id = $graph_node_id)
               AND ($enforce_active_only = false OR coalesce(n.is_active, true) = true)
-              AND ($selected_file_version_ids = [] OR coalesce(n.file_version_id, '') IN $selected_file_version_ids)
+              AND {_scope_filter_expr("n")}
             RETURN elementId(n) AS graph_node_id, labels(n) AS labels, properties(n) AS props
             LIMIT 1
             """,
@@ -779,23 +1130,23 @@ def expand_local_fault_subgraph(
     visited = {root_node_id}
     depths = {root_node_id: 0}
 
-    node_query = """
-    MATCH (n)
-    WHERE elementId(n) = $node_id
+    node_query = f"""
+    MATCH (n:EntityCluster)
+    WHERE (elementId(n) = $node_id OR n.cluster_id = $node_id)
       AND ($enforce_active_only = false OR coalesce(n.is_active, true) = true)
-      AND ($selected_file_version_ids = [] OR coalesce(n.file_version_id, '') IN $selected_file_version_ids)
+      AND {_scope_filter_expr("n")}
     RETURN elementId(n) AS graph_node_id, labels(n) AS labels, properties(n) AS props
     """
-    expand_query = """
+    expand_query = f"""
     UNWIND $frontier AS parent_id
-    MATCH (child)-[r:RELATION {relation_type:'触发'}]->(parent)
-    WHERE elementId(parent) = parent_id
+    MATCH (child:EntityCluster)-[r:CLUSTERED_CAUSES]->(parent:EntityCluster)
+    WHERE (elementId(parent) = parent_id OR parent.cluster_id = parent_id)
       AND ($enforce_active_only = false OR coalesce(child.is_active, true) = true)
       AND ($enforce_active_only = false OR coalesce(parent.is_active, true) = true)
       AND ($enforce_active_only = false OR coalesce(r.is_active, true) = true)
-      AND ($selected_file_version_ids = [] OR coalesce(child.file_version_id, '') IN $selected_file_version_ids)
-      AND ($selected_file_version_ids = [] OR coalesce(parent.file_version_id, '') IN $selected_file_version_ids)
-      AND ($selected_file_version_ids = [] OR coalesce(r.file_version_id, '') IN $selected_file_version_ids)
+      AND {_scope_filter_expr("child")}
+      AND {_scope_filter_expr("parent")}
+      AND {_scope_filter_expr("r")}
     RETURN
       elementId(child) AS source_graph_node_id,
       labels(child) AS source_labels,
@@ -876,8 +1227,95 @@ def expand_local_fault_subgraph(
                     support_chunk_ids.extend(edge.get("source_chunk_refs") or edge.get("source_chunk_ids") or [])
             frontier = next_frontier
 
+        if nodes_by_id:
+            support_rows = session.run(
+                f"""
+                UNWIND $target_ids AS target_id
+                MATCH (support:EntityCluster)-[r]->(target:EntityCluster)
+                WHERE (elementId(target) = target_id OR target.cluster_id = target_id)
+                  AND type(r) IN ['CLUSTERED_HANDLED_BY', 'CLUSTERED_TRIGGERED_BY_RULE']
+                  AND ($enforce_active_only = false OR coalesce(support.is_active, true) = true)
+                  AND ($enforce_active_only = false OR coalesce(target.is_active, true) = true)
+                  AND ($enforce_active_only = false OR coalesce(r.is_active, true) = true)
+                  AND {_scope_filter_expr("support")}
+                  AND {_scope_filter_expr("target")}
+                  AND {_scope_filter_expr("r")}
+                RETURN
+                  target.cluster_id AS target_cluster_id,
+                  elementId(target) AS target_element_id,
+                  type(r) AS rel_type,
+                  labels(support) AS support_labels,
+                  properties(support) AS support_props,
+                  properties(r) AS rel_props
+                """,
+                target_ids=list(nodes_by_id.keys()),
+                selected_file_version_ids=scoped_file_version_ids,
+                enforce_active_only=(not explicit_scope),
+            ).data()
+
+            for row in support_rows:
+                target_id = row.get("target_cluster_id") or row.get("target_element_id")
+                if target_id not in nodes_by_id:
+                    continue
+                support_node = _decode_graph_node(
+                    {
+                        "graph_node_id": row.get("support_props", {}).get("cluster_id"),
+                        "labels": row.get("support_labels"),
+                        "props": row.get("support_props"),
+                    }
+                )
+                rel = _decode_graph_relation(
+                    {
+                        "source_graph_node_id": support_node.get("graph_node_id"),
+                        "target_graph_node_id": target_id,
+                        "rel_props": row.get("rel_props"),
+                    }
+                )
+                target_node = nodes_by_id[target_id]
+                support_name = _normalize_text(support_node.get("name") or support_node.get("canonical_name"))
+                if not support_name:
+                    continue
+
+                rel_chunk_refs = rel.get("source_chunk_refs") or rel.get("source_chunk_ids") or []
+                support_chunk_refs = support_node.get("source_chunk_refs") or support_node.get("source_chunk_ids") or []
+                evidence_refs = _evidence_chunk_refs((row.get("rel_props") or {}).get("evidence_json"))
+                merged_refs = _dedupe_keep_order(list(rel_chunk_refs) + list(support_chunk_refs) + evidence_refs)
+                support_chunk_ids.extend(merged_refs)
+                target_node["source_chunk_refs"] = _dedupe_keep_order((target_node.get("source_chunk_refs") or []) + merged_refs)
+                target_node["source_chunk_ids"] = _dedupe_keep_order((target_node.get("source_chunk_ids") or []) + support_node.get("source_chunk_ids", []))
+
+                documents = list(target_node.get("documents") or [])
+                for chunk_ref in merged_refs:
+                    documents.append({"chunk_id": chunk_ref})
+                target_node["documents"] = documents
+
+                if row.get("rel_type") == "CLUSTERED_HANDLED_BY":
+                    methods = _dedupe_keep_order((target_node.get("maintenance_methods") or []) + [support_name])
+                    target_node["maintenance_methods"] = methods
+                    if not target_node.get("investigateMethod"):
+                        target_node["investigateMethod"] = "；".join(methods[:3])
+                elif row.get("rel_type") == "CLUSTERED_TRIGGERED_BY_RULE":
+                    rule_names = _dedupe_keep_order((target_node.get("trigger_rule_names") or []) + [support_name])
+                    target_node["trigger_rule_names"] = rule_names
+                    target_node["rule"] = target_node.get("rule") or "；".join(rule_names[:3])
+                    existing_rules = target_node.get("rules") if isinstance(target_node.get("rules"), list) else []
+                    if not existing_rules:
+                        target_node["rules"] = [
+                            {
+                                "deviceTypeId": "",
+                                "measurePointName": rule_name,
+                                "symbol": "触发",
+                                "thresholds": [],
+                                "duration": "",
+                            }
+                            for rule_name in rule_names[:3]
+                        ]
+
     for node in nodes_by_id.values():
         support_chunk_ids.extend(node.get("source_chunk_refs") or node.get("source_chunk_ids") or [])
+
+    edges, disabled_cycle_edges = _temporarily_disable_causal_cycle_edges(edges, nodes_by_id)
+    edges, pruned_transitive_edges = _temporarily_prune_transitive_causal_edges(edges, nodes_by_id)
 
     child_targets = {}
     for edge in edges:
@@ -898,10 +1336,17 @@ def expand_local_fault_subgraph(
         "roots": [root_node_id],
         "nodes": list(nodes_by_id.values()),
         "edges": edges,
+        "disabled_cycle_edges": disabled_cycle_edges,
+        "pruned_transitive_edges": pruned_transitive_edges,
         "gate_groups": gate_groups,
         "support_chunk_ids": _dedupe_keep_order(support_chunk_ids),
         "source_file_version_ids": _dedupe_keep_order(
-            [node.get("file_version_id") for node in nodes_by_id.values() if node.get("file_version_id")]
+            [
+                file_version_id
+                for node in nodes_by_id.values()
+                for file_version_id in (node.get("source_file_version_ids") or ([node.get("file_version_id")] if node.get("file_version_id") else []))
+                if file_version_id
+            ]
         ),
     }
 
@@ -920,6 +1365,8 @@ def expand_scoped_local_fault_subgraph(
     merged_nodes: Dict[str, Dict[str, Any]] = {}
     merged_edges: List[Dict[str, Any]] = []
     merged_gate_groups: List[Dict[str, Any]] = []
+    merged_disabled_cycle_edges: List[Dict[str, Any]] = []
+    merged_pruned_transitive_edges: List[Dict[str, Any]] = []
     edge_keys = set()
     gate_keys = set()
     support_chunk_ids: List[Any] = []
@@ -955,12 +1402,21 @@ def expand_scoped_local_fault_subgraph(
             merged_gate_groups.append(gate_group)
         support_chunk_ids.extend(bundle.get("support_chunk_ids") or [])
         source_file_version_ids.extend(bundle.get("source_file_version_ids") or [])
+        merged_disabled_cycle_edges.extend(bundle.get("disabled_cycle_edges") or [])
+        merged_pruned_transitive_edges.extend(bundle.get("pruned_transitive_edges") or [])
+
+    merged_edges, scoped_disabled_cycle_edges = _temporarily_disable_causal_cycle_edges(merged_edges, merged_nodes)
+    merged_disabled_cycle_edges.extend(scoped_disabled_cycle_edges)
+    merged_edges, scoped_pruned_transitive_edges = _temporarily_prune_transitive_causal_edges(merged_edges, merged_nodes)
+    merged_pruned_transitive_edges.extend(scoped_pruned_transitive_edges)
 
     return {
         "root": roots[0],
         "roots": roots,
         "nodes": list(merged_nodes.values()),
         "edges": merged_edges,
+        "disabled_cycle_edges": merged_disabled_cycle_edges,
+        "pruned_transitive_edges": merged_pruned_transitive_edges,
         "gate_groups": merged_gate_groups,
         "support_chunk_ids": _dedupe_keep_order(support_chunk_ids),
         "source_file_version_ids": _dedupe_keep_order(source_file_version_ids),
@@ -983,7 +1439,7 @@ def collect_subgraph_chunks(subgraph_bundle: Dict[str, Any], chunk_limit: int = 
             chunk_id = doc.get("chunk_id")
             if chunk_id in (None, ""):
                 continue
-            key = _make_chunk_ref(node.get("file_version_id"), chunk_id)
+            key = str(chunk_id) if CHUNK_REF_SEPARATOR in str(chunk_id) else _make_chunk_ref(node.get("file_version_id"), chunk_id)
             scores[key] = scores.get(key, 0.0) + weight
 
     for edge in bundle_edges:
@@ -1012,10 +1468,10 @@ def list_graph_top_event_candidates(
         fallback_to_active=True,
         require_active=False,
     )
-    cypher = """
-    MATCH (n:Entity:FaultPhenomenon)
+    cypher = f"""
+    MATCH (n:EntityCluster:FaultEvent)
     WHERE ($enforce_active_only = false OR coalesce(n.is_active, true) = true)
-      AND ($selected_file_version_ids = [] OR coalesce(n.file_version_id, '') IN $selected_file_version_ids)
+      AND {_scope_filter_expr("n")}
     RETURN elementId(n) AS graph_node_id, labels(n) AS labels, properties(n) AS props
     """
     with driver.session(database=NEO4J_DATABASE) as session:
@@ -1047,6 +1503,7 @@ def list_graph_top_event_candidates(
             "normalized_name": node.get("normalized_name"),
             "file_id": node.get("file_id"),
             "file_version_id": node.get("file_version_id"),
+            "file_version_ids": node.get("source_file_version_ids") or ([node.get("file_version_id")] if node.get("file_version_id") else []),
             "support_count": int(node.get("support_count") or len(node.get("source_chunk_ids") or [])),
             "source_chunk_ids": node.get("source_chunk_ids") or [],
             "source_chunk_refs": node.get("source_chunk_refs") or [],
@@ -1078,7 +1535,7 @@ def update_graph_node_properties(graph_node_id: str, properties: Dict[str, Any])
         result = session.run(
             """
             MATCH (n)
-            WHERE elementId(n) = $graph_node_id
+            WHERE elementId(n) = $graph_node_id OR n.cluster_id = $graph_node_id
             SET n += $props,
                 n.updated_at = datetime()
             RETURN count(n) AS updated
@@ -1140,20 +1597,27 @@ def search_chunks_by_entity_names(
         fallback_to_active=True,
         require_active=False,
     )
-    cypher = """
-    MATCH (n:Entity)
-    WHERE n.name IN $entity_names
-      AND ($file_version_ids = [] OR n.file_version_id IN $file_version_ids)
-    RETURN n.file_version_id AS file_version_id,
-           coalesce(n.source_chunk_refs, n.source_chunk_ids, []) AS chunk_refs
+    cypher = f"""
+    MATCH (n:EntityCluster)
+    WHERE (
+        n.name IN $entity_names
+        OR n.canonical_name IN $entity_names
+        OR n.normalized_name IN $entity_names
+        OR any(alias IN coalesce(n.aliases, []) WHERE alias IN $entity_names)
+      )
+      AND {_scope_filter_expr("n", "file_version_ids")}
+    RETURN {_scope_list_expr("n")} AS file_version_ids,
+           coalesce(n.source_chunk_refs, n.chunk_refs, n.source_chunk_ids, n.chunk_ids, []) AS chunk_refs
     """
     refs = []
     with driver.session(database=NEO4J_DATABASE) as session:
         for row in session.run(cypher, entity_names=cleaned_names, file_version_ids=scoped_versions):
+            row_versions = row.get("file_version_ids") or []
+            fallback_version = row_versions[0] if len(row_versions) == 1 else None
             for value in row.get("chunk_refs") or []:
                 ref = str(value or "").strip()
                 if ref and CHUNK_REF_SEPARATOR not in ref:
-                    ref = _make_chunk_ref(row.get("file_version_id"), ref)
+                    ref = _make_chunk_ref(fallback_version, ref)
                 if ref and ref not in refs:
                     refs.append(ref)
     return _fetch_chunks_by_identifiers(refs, limit, selected_file_version_ids=scoped_versions)
@@ -1178,6 +1642,7 @@ def search_chunks_by_keywords(
 
     results = []
     seen_ids = set()
+    version_filter = _build_file_version_filter(selected_file_version_ids)
 
     exact_query: Dict[str, Any] = {"key_word": {"$in": cleaned_keywords}}
     if version_filter:

@@ -39,6 +39,7 @@ from database import (
     get_tree_meta,
     get_version,
     get_version_list,
+    list_all_chunks,
     list_graph_top_event_candidates,
     list_generation_job_items,
     list_top_event_catalog,
@@ -1804,6 +1805,37 @@ def api_generate(req: GenerateRequest):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Queue generation failed: {exc}")
+
+
+@app.get("/api/chunks")
+def api_list_chunks(
+    file_version_ids: Optional[List[str]] = None,
+    limit: int = 200,
+    all: bool = False,
+):
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    scoped_file_version_ids = [] if all else _resolve_selected_scope(file_version_ids)
+    chunks = list_all_chunks(selected_file_version_ids=scoped_file_version_ids or None, limit=safe_limit)
+    return {"chunks": chunks, "total": len(chunks)}
+
+
+@app.get("/api/chunk/{chunk_id}")
+def api_get_chunk(
+    chunk_id: str,
+    file_version_id: Optional[str] = None,
+):
+    selected_file_version_ids = [file_version_id] if file_version_id else None
+    chunks = get_chunks_by_ids([chunk_id], limit=1, selected_file_version_ids=selected_file_version_ids)
+    if not chunks:
+        raise HTTPException(status_code=404, detail=f"Chunk not found: {chunk_id}")
+    chunk = dict(chunks[0])
+    if not chunk.get("content"):
+        for key in ("text", "raw_text", "page_content", "body", "markdown"):
+            value = chunk.get(key)
+            if value not in (None, ""):
+                chunk["content"] = str(value)
+                break
+    return chunk
 
 
 @app.post("/api/debug/graph-recall")

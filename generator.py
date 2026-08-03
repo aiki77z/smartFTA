@@ -59,6 +59,7 @@ PROPERTY_FIELDS = (
     "probability",
     "showProbability",
     "rule",
+    "rules",
     "investigateMethod",
 )
 
@@ -163,6 +164,66 @@ def _subgraph_nodes_by_id(subgraph_bundle: Dict[str, Any]) -> Dict[str, Dict[str
     return {node["graph_node_id"]: node for node in (subgraph_bundle.get("nodes") or []) if node.get("graph_node_id")}
 
 
+def _dedupe_values(values: List[Any]) -> List[Any]:
+    result = []
+    seen = set()
+    for value in values or []:
+        if value in (None, ""):
+            continue
+        key = str(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _parse_json_list_safe(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except Exception:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _edge_documents_seed(edge: Dict[str, Any]) -> List[Dict[str, Any]]:
+    docs: List[Dict[str, Any]] = []
+    for ref in edge.get("source_chunk_refs") or edge.get("source_chunk_ids") or []:
+        if ref not in (None, ""):
+            docs.append({"chunk_id": ref})
+    for item in _parse_json_list_safe(edge.get("evidence_json")):
+        if not isinstance(item, dict):
+            continue
+        chunk_id = item.get("chunk_id")
+        if chunk_id not in (None, ""):
+            docs.append({"chunk_id": chunk_id})
+    return _dedupe_document_refs(docs)
+
+
+def _edge_detail_payload(edge: Dict[str, Any]) -> Dict[str, Any]:
+    evidence = [item for item in _parse_json_list_safe(edge.get("evidence_json")) if isinstance(item, dict)]
+    evidence_texts = _dedupe_values([item.get("text") for item in evidence if item.get("text")])
+    return {
+        "relation_type": edge.get("relation_type") or "",
+        "relation_type_code": edge.get("relation_type_code") or "",
+        "relation_id": edge.get("relation_id") or "",
+        "polarity": edge.get("polarity") or "",
+        "certainty": edge.get("certainty") or "",
+        "cross_chunk": edge.get("cross_chunk") or "",
+        "source_relation_ids": edge.get("source_relation_ids") or [],
+        "source_chunk_ids": edge.get("source_chunk_ids") or [],
+        "source_chunk_refs": edge.get("source_chunk_refs") or [],
+        "source_file_version_ids": edge.get("source_file_version_ids") or [],
+        "evidence": evidence,
+        "evidence_texts": evidence_texts,
+        "documents": _edge_documents_seed(edge),
+    }
+
+
 def _compress_subgraph_to_tree_skeleton(subgraph_bundle: Dict[str, Any]) -> Dict[str, Any]:
     nodes_by_id = _subgraph_nodes_by_id(subgraph_bundle)
     root_id = subgraph_bundle["root"]
@@ -237,6 +298,7 @@ def _compress_subgraph_to_tree_skeleton(subgraph_bundle: Dict[str, Any]) -> Dict
                         "sourceId": child_tree_id,
                         "targetId": parent_tree_id,
                         "isCondition": False,
+                        "relation": _edge_detail_payload(edge),
                     }
                 )
                 continue
@@ -254,6 +316,11 @@ def _compress_subgraph_to_tree_skeleton(subgraph_bundle: Dict[str, Any]) -> Dict
                         "sourceId": graph_to_tree[gate_child_graph_id],
                         "targetId": parent_tree_id,
                         "isCondition": False,
+                        "relation": {
+                            "gate_type": "AND",
+                            "member_relation": _edge_detail_payload(gate_edge),
+                            "gate_relation": _edge_detail_payload(edge),
+                        },
                     }
                 )
 
@@ -277,16 +344,16 @@ def _compress_subgraph_to_tree_skeleton(subgraph_bundle: Dict[str, Any]) -> Dict
 def _format_evidence_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     evidence = []
     for chunk in chunks[:MAX_CHUNKS_FOR_PROMPT]:
-        content = str(chunk.get("content") or "").strip()
+        content = _chunk_content_excerpt(chunk, limit=MAX_CHUNK_CHARS)
         if len(content) > MAX_CHUNK_CHARS:
             content = content[:MAX_CHUNK_CHARS] + "..."
         evidence.append(
             {
                 "chunk_uid": chunk.get("chunk_uid"),
                 "chunk_id": chunk.get("id", chunk.get("chunk_id")),
-                "chunk_name": chunk.get("chunk_name", ""),
-                "section_path": chunk.get("section_path", ""),
-                "source_page": chunk.get("source", ""),
+                "chunk_name": chunk.get("chunk_name") or chunk.get("title") or chunk.get("heading") or chunk.get("chapter") or "",
+                "section_path": chunk.get("section_path") or chunk.get("section") or chunk.get("chapter") or "",
+                "source_page": chunk.get("source_page") or chunk.get("source") or chunk.get("page") or "",
                 "file_id": chunk.get("file_id", ""),
                 "file_version_id": chunk.get("file_version_id", ""),
                 "file": chunk.get("file", ""),
@@ -346,7 +413,7 @@ def build_fault_tree_from_subgraph_and_chunks(
 1. 必须保留骨架中的节点和连线，不要凭空新增结构。
 2. 图谱中没有单独的 OR 节点；如果某个父节点有多个子节点且未标明 AND，默认 gate=OR。
 3. 如果骨架中父节点 gate=AND，则保留为 AND。
-4. 顶事件节点 type=top_event，event 必须为 null。
+4. 顶事件节点 type=top_event，且要像其他故障事件节点一样保留完整 event 字段。
 5. intermediate_event 和 basic_event 必须有完整 event 字段。
 6. event 中优先使用 graph_props 里的字段，chunks 只用于补充和润色。
 7. documents 只能输出轻量溯源引用字段，且每个节点最多 1-3 条：
@@ -520,6 +587,30 @@ _ALLOWED_DOCUMENT_FIELDS = (
 )
 
 
+def _document_ref_key(doc: Dict[str, Any]) -> str:
+    if not isinstance(doc, dict):
+        return ""
+    chunk_id = doc.get("chunk_id")
+    file_version_id = doc.get("file_version_id") or doc.get("fileVersionId") or ""
+    if chunk_id in (None, ""):
+        return ""
+    return f"{file_version_id}::{chunk_id}" if file_version_id else str(chunk_id)
+
+
+def _dedupe_document_refs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen = set()
+    for doc in docs or []:
+        if not isinstance(doc, dict):
+            continue
+        key = _document_ref_key(doc)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(doc)
+    return result
+
+
 def _sanitize_fault_tree_documents(tree: Dict[str, Any]) -> Dict[str, Any]:
     """Keep fault-tree evidence references lightweight; chunk content is loaded on demand."""
     if not isinstance(tree, dict):
@@ -538,11 +629,37 @@ def _sanitize_fault_tree_documents(tree: Dict[str, Any]) -> Dict[str, Any]:
             for doc in next_event.get("documents") or []:
                 if isinstance(doc, dict):
                     docs.append({field: doc.get(field, "") for field in _ALLOWED_DOCUMENT_FIELDS})
-            next_event["documents"] = docs
+            next_event["documents"] = _dedupe_document_refs(docs)
             next_node["event"] = next_event
         sanitized_nodes.append(next_node)
     out["nodeList"] = sanitized_nodes
+    sanitized_links: List[Dict[str, Any]] = []
+    for link in out.get("linkList") or []:
+        if not isinstance(link, dict):
+            sanitized_links.append(link)
+            continue
+        next_link = dict(link)
+        relation = next_link.get("relation")
+        if isinstance(relation, dict):
+            next_relation = dict(relation)
+            docs = []
+            for doc in next_relation.get("documents") or []:
+                if isinstance(doc, dict):
+                    docs.append({field: doc.get(field, "") for field in _ALLOWED_DOCUMENT_FIELDS})
+            next_relation["documents"] = _dedupe_document_refs(docs)
+            next_link["relation"] = next_relation
+        sanitized_links.append(next_link)
+    out["linkList"] = sanitized_links
     return out
+
+
+def _chunk_content_excerpt(chunk: Dict[str, Any], limit: int = 220) -> str:
+    for key in ("content", "text", "raw_text", "page_content", "body", "markdown"):
+        value = chunk.get(key)
+        if value not in (None, ""):
+            text = re.sub(r"\s+", " ", str(value).strip())
+            return text[:limit] + ("..." if len(text) > limit else "")
+    return ""
 
 
 def _post_process_generated_tree(
@@ -556,9 +673,9 @@ def _post_process_generated_tree(
     for chunk in evidence_chunks:
         doc_ref = {
             "chunk_id": chunk.get("chunk_id"),
-            "chunk_name": chunk.get("chunk_name", ""),
-            "section_path": chunk.get("section_path", ""),
-            "source_page": chunk.get("source_page", ""),
+            "chunk_name": chunk.get("chunk_name") or chunk.get("title") or chunk.get("heading") or chunk.get("chapter") or "",
+            "section_path": chunk.get("section_path") or chunk.get("section") or chunk.get("chapter") or "",
+            "source_page": chunk.get("source_page") or chunk.get("source") or chunk.get("page") or "",
             "file_id": chunk.get("file_id", ""),
             "file_version_id": chunk.get("file_version_id", ""),
         }
@@ -569,6 +686,32 @@ def _post_process_generated_tree(
         ):
             if key not in (None, ""):
                 evidence_doc_map[str(key)] = doc_ref
+
+    def hydrate_relation_documents(relation: Dict[str, Any], fallback_file_version_id: str = "") -> Dict[str, Any]:
+        if not isinstance(relation, dict):
+            return {}
+        next_relation = dict(relation)
+        chunk_ids: List[Any] = []
+        for doc in next_relation.get("documents") or []:
+            if isinstance(doc, dict) and doc.get("chunk_id") not in (None, ""):
+                chunk_ids.append(doc.get("chunk_id"))
+        for item in next_relation.get("evidence") or []:
+            if isinstance(item, dict) and item.get("chunk_id") not in (None, ""):
+                chunk_ids.append(item.get("chunk_id"))
+        chunk_ids.extend(next_relation.get("source_chunk_refs") or next_relation.get("source_chunk_ids") or [])
+        docs = []
+        for chunk_id in dict.fromkeys(chunk_ids):
+            chunk_ref = str(chunk_id)
+            if fallback_file_version_id and "::" not in chunk_ref:
+                chunk_ref = f"{fallback_file_version_id}::{chunk_id}"
+            if chunk_ref in evidence_doc_map:
+                docs.append(evidence_doc_map[chunk_ref])
+            elif str(chunk_id) in evidence_doc_map:
+                docs.append(evidence_doc_map[str(chunk_id)])
+            elif chunk_id not in (None, ""):
+                docs.append({"chunk_id": chunk_id, "file_version_id": fallback_file_version_id})
+        next_relation["documents"] = _dedupe_document_refs(docs)
+        return next_relation
 
     node_list = tree.get("nodeList") or []
     if not node_list:
@@ -602,7 +745,7 @@ def _post_process_generated_tree(
         name = node.get("name") or (skeleton_node.get("name") if skeleton_node else "")
         file_id = node.get("fileId") or (skeleton_node.get("fileId") if skeleton_node else None)
         file_version_id = node.get("fileVersionId") or (skeleton_node.get("fileVersionId") if skeleton_node else None)
-        if node_type == "top_event":
+        if False and node_type == "top_event":
             event = None
         else:
             graph_props = dict((skeleton_node or {}).get("graph_props") or {})
@@ -616,7 +759,7 @@ def _post_process_generated_tree(
             merged["probability"] = event.get("probability", graph_props.get("probability", 1e-8))
             merged["showProbability"] = event.get("showProbability", graph_props.get("showProbability", merged["probability"]))
             merged["rule"] = str(event.get("rule") or graph_props.get("rule") or "")
-            merged["rules"] = _coerce_rules(event.get("rules") or merged["rule"])
+            merged["rules"] = _coerce_rules(event.get("rules") or graph_props.get("rules") or merged["rule"])
             merged["investigateMethod"] = str(
                 event.get("investigateMethod") or graph_props.get("investigateMethod") or f"检查{name}相关状态与报警记录"
             )
@@ -650,7 +793,7 @@ def _post_process_generated_tree(
                     documents.append(evidence_doc_map[str(chunk_id)])
             if not documents:
                 documents = _match_documents_for_event(name, evidence_chunks, limit=2)
-            merged["documents"] = documents
+            merged["documents"] = _dedupe_document_refs(documents)
             event = merged
 
         normalized_nodes.append(
@@ -671,6 +814,11 @@ def _post_process_generated_tree(
     node_ids = {node["id"] for node in normalized_nodes}
     link_list = []
     seen = set()
+    skeleton_link_map = {
+        (link.get("sourceId"), link.get("targetId")): link
+        for link in skeleton.get("links") or []
+        if isinstance(link, dict)
+    }
     for link in tree.get("linkList") or skeleton["links"]:
         source_id = link.get("sourceId")
         target_id = link.get("targetId")
@@ -680,12 +828,18 @@ def _post_process_generated_tree(
         if key in seen:
             continue
         seen.add(key)
+        skeleton_link = skeleton_link_map.get((source_id, target_id), {})
+        relation = link.get("relation") if isinstance(link.get("relation"), dict) else None
+        if not relation:
+            relation = skeleton_link.get("relation") if isinstance(skeleton_link.get("relation"), dict) else {}
+        relation = hydrate_relation_documents(relation)
         link_list.append(
             {
                 "type": "link",
                 "sourceId": source_id,
                 "targetId": target_id,
                 "isCondition": False,
+                "relation": relation,
             }
         )
 
@@ -777,6 +931,16 @@ def generate_fault_tree(
         f"[graph-subgraph] root={matched['matched_name']} roots={len(subgraph_bundle.get('roots') or [])} "
         f"nodes={len(subgraph_bundle.get('nodes') or [])} edges={len(subgraph_bundle.get('edges') or [])}"
     )
+    if subgraph_bundle.get("disabled_cycle_edges"):
+        emit(
+            "[graph-subgraph] temporarily disabled "
+            f"{len(subgraph_bundle.get('disabled_cycle_edges') or [])} causal cycle edges in selected file view"
+        )
+    if subgraph_bundle.get("pruned_transitive_edges"):
+        emit(
+            "[graph-subgraph] temporarily pruned "
+            f"{len(subgraph_bundle.get('pruned_transitive_edges') or [])} transitive shortcut edges in selected file view"
+        )
 
     chunk_ids = collect_subgraph_chunks(subgraph_bundle, chunk_limit=MAX_CHUNKS_FOR_PROMPT)
     evidence_chunks = hydrate_documents_by_chunk_ids(chunk_ids, selected_file_version_ids=scoped_file_version_ids)
@@ -835,6 +999,13 @@ def generate_fault_tree(
             f"[graph-validate] validation failed attempt={attempt} "
             f"errors={validation['error_count']} warnings={validation['warning_count']}"
         )
+        for issue in (validation.get("issues") or [])[:6]:
+            emit(
+                "[graph-validate-issue] "
+                f"level={issue.get('level')} code={issue.get('code')} "
+                f"node={issue.get('node_id') or issue.get('node_name') or ''} "
+                f"message={issue.get('message')}"
+            )
         if attempt <= MAX_RETRY:
             emit(f"[graph-regenerate] retrying draft generation next_attempt={attempt + 1}")
         if attempt > MAX_RETRY:
@@ -939,9 +1110,7 @@ def _chunk_reference(chunk: Dict[str, Any]) -> Any:
 def _format_chunks_for_prompt(chunks: List[Dict[str, Any]]) -> str:
     lines = []
     for chunk in (chunks or [])[:MAX_CHUNKS_FOR_PROMPT]:
-        content = str(chunk.get("content") or "").strip()
-        if len(content) > MAX_CHUNK_CHARS:
-            content = content[:MAX_CHUNK_CHARS] + "..."
+        content = _chunk_content_excerpt(chunk, limit=MAX_CHUNK_CHARS)
         lines.append(
             f"[chunk_id={_chunk_reference(chunk)} | {chunk.get('chunk_name', '')} | 章节:{chunk.get('section_path', '')} | 页码:{chunk.get('source', '')}]\n"
             f"{content}\n"
@@ -1123,9 +1292,9 @@ def build_fault_tree_from_chunk_elements(
     chunks_ref = [
         {
             "chunk_id": _chunk_reference(chunk),
-            "chunk_name": chunk.get("chunk_name", ""),
-            "section_path": chunk.get("section_path", ""),
-            "source_page": chunk.get("source", ""),
+            "chunk_name": chunk.get("chunk_name") or chunk.get("title") or chunk.get("heading") or chunk.get("chapter") or "",
+            "section_path": chunk.get("section_path") or chunk.get("section") or chunk.get("chapter") or "",
+            "source_page": chunk.get("source_page") or chunk.get("source") or chunk.get("page") or "",
             "file_id": chunk.get("file_id", ""),
             "file_version_id": chunk.get("file_version_id", ""),
         }
@@ -1834,12 +2003,23 @@ def generate_fault_tree(
         f"[graph-subgraph] root={matched['matched_name']} roots={len(subgraph_bundle.get('roots') or [])} "
         f"nodes={len(subgraph_bundle.get('nodes') or [])} edges={len(subgraph_bundle.get('edges') or [])}"
     )
+    if subgraph_bundle.get("disabled_cycle_edges"):
+        emit(
+            "[graph-subgraph] temporarily disabled "
+            f"{len(subgraph_bundle.get('disabled_cycle_edges') or [])} causal cycle edges in selected file view"
+        )
+    if subgraph_bundle.get("pruned_transitive_edges"):
+        emit(
+            "[graph-subgraph] temporarily pruned "
+            f"{len(subgraph_bundle.get('pruned_transitive_edges') or [])} transitive shortcut edges in selected file view"
+        )
     performance["graph_subgraph"] = _make_stage_profile(
         time.perf_counter() - stage_started,
         root_count=len(subgraph_bundle.get("roots") or []),
         node_count=len(subgraph_bundle.get("nodes") or []),
         edge_count=len(subgraph_bundle.get("edges") or []),
         gate_group_count=len(subgraph_bundle.get("gate_groups") or []),
+        pruned_transitive_edge_count=len(subgraph_bundle.get("pruned_transitive_edges") or []),
         multi_root_runtime_merge=bool(len(subgraph_bundle.get("roots") or []) > 1),
     )
 
@@ -2202,9 +2382,9 @@ def _match_documents_for_event(name: str, chunks: List[Dict[str, Any]], *, limit
         matched.append(
             {
                 "chunk_id": chunk.get("chunk_id", chunk.get("id")),
-                "chunk_name": chunk.get("chunk_name", ""),
-                "section_path": chunk.get("section_path", ""),
-                "source_page": chunk.get("source", chunk.get("source_page", "")),
+                "chunk_name": chunk.get("chunk_name") or chunk.get("title") or chunk.get("heading") or chunk.get("chapter") or "",
+                "section_path": chunk.get("section_path") or chunk.get("section") or chunk.get("chapter") or "",
+                "source_page": chunk.get("source_page") or chunk.get("source") or chunk.get("page") or "",
                 "file_id": chunk.get("file_id", ""),
                 "file_version_id": chunk.get("file_version_id", ""),
             }
@@ -2212,7 +2392,7 @@ def _match_documents_for_event(name: str, chunks: List[Dict[str, Any]], *, limit
         return len(matched) >= limit
 
     for chunk in chunks or []:
-        content = str(chunk.get("content") or "")
+        content = _chunk_content_excerpt(chunk, limit=2000)
         haystack = _normalize_event_key(content)
         if normalized_name and normalized_name in haystack:
             if append_doc(chunk):
@@ -2344,7 +2524,7 @@ def _post_process_chunk_generated_tree(
         elif not gate:
             gate = gate_map.get(node_id) or ("OR" if children_map.get(node_id) else None)
 
-        if node_type == "top_event":
+        if False and node_type == "top_event":
             event = None
         else:
             extracted = event_index.get(_normalize_event_key(name), {})
@@ -2460,8 +2640,8 @@ Skeleton constraints:
 2. Do not delete skeleton nodes and do not invent a new parallel structure.
 3. If a parent node already has `gate=AND`, keep it as `AND`.
 4. If a parent has multiple children and no explicit AND mark, keep or infer `gate=OR`.
-5. The top event node must stay `type=top_event` and `event=null`.
-6. Every non-top node must have a complete `event` object.
+5. The top event node must stay `type=top_event` and should keep a complete `event` object like other fault-event nodes.
+6. Every event node must have a complete `event` object.
 7. Keep `graphNodeId` and `kg_key` identical to the input skeleton.
 8. `documents` must be filled from the recalled evidence chunks, but each document object may contain only:
    `chunk_id`, `chunk_name`, `section_path`, `source_page`, `file_id`, `file_version_id`.
@@ -2581,9 +2761,9 @@ def build_fault_tree_from_chunk_elements(
     chunks_ref = [
         {
             "chunk_id": _chunk_reference(chunk),
-            "chunk_name": chunk.get("chunk_name", ""),
-            "section_path": chunk.get("section_path", ""),
-            "source_page": chunk.get("source", ""),
+            "chunk_name": chunk.get("chunk_name") or chunk.get("title") or chunk.get("heading") or chunk.get("chapter") or "",
+            "section_path": chunk.get("section_path") or chunk.get("section") or chunk.get("chapter") or "",
+            "source_page": chunk.get("source_page") or chunk.get("source") or chunk.get("page") or "",
             "file_id": chunk.get("file_id", ""),
             "file_version_id": chunk.get("file_version_id", ""),
         }
@@ -2631,7 +2811,7 @@ User requirements:
 
 Output rules:
 1. Output complete `nodeList` and `linkList`.
-2. There must be exactly one `top_event` node named "{top_event}", and its `event` must be `null`.
+2. There must be exactly one `top_event` node named "{top_event}", and it should keep a complete `event` object like other fault-event nodes.
 3. Every other node must be `intermediate_event` or `basic_event`.
 4. If a node still has children in `linkList`, it must be `intermediate_event`; if it has no children, it must be `basic_event`.
 5. Every `top_event` and `intermediate_event` must explicitly carry `gate`. Use `OR` by default if evidence is insufficient.
@@ -2656,7 +2836,7 @@ Required JSON shape:
       "type": "top_event/intermediate_event/basic_event",
       "gate": "AND/OR/null",
       "transfer": "",
-      "event": null or {{
+      "event": {{
         "id": "E001",
         "name": "event name",
         "description": "description",
