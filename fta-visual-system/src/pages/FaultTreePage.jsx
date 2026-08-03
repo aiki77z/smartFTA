@@ -22,8 +22,8 @@ import {
   deleteTree,
   validateFaultTreeGraph,
   validateTreeSemantic,
+  getFtaChunk,
 } from '../api/ftaBackend.js'
-import { getChunk } from '../api/kbBackend.js'
 import { editFaultTreeWithAi, sendAssistantAgentMessage, truncateAssistantSession } from '../api/ftaAiEditor.js'
 import {
   parseRawFtaJson,
@@ -74,6 +74,48 @@ const EVENT_TYPES = ['top', 'intermediate', 'basic']
 const MAX_HIRES_SNAPSHOT_JSON_LEN = 7000
 const AI_ASSIST_STORE_PREFIX = 'fta-ai-assistant:'
 const AI_ASSIST_FILE_PREFIX = 'fta-ai-selected-files:'
+const ENABLE_MOCK_IMPORTED_KB_FILE = true
+const MOCK_IMPORTED_KB_FILE = {
+  id: 'mock-huawei-luna2000-alarm-reference',
+  name: 'HUAWEI LUNA2000 alarm reference (KB v2 imported)',
+  size: 0,
+  status: 'done',
+  uploadProgress: 100,
+  parseProgress: 100,
+  kbImportComplete: true,
+  kbCategory: 'document',
+  kbCategoryLabel: 'KB v2 imported',
+  sourceType: 'manual_document',
+  fileId: 'huawei_luna2000_alarm_reference',
+  fileVersionId: 'huawei_luna2000_alarm_reference_v1',
+  versionNo: 1,
+  isActive: true,
+  importedFileName: 'HUAWEI LUNA2000 alarm reference',
+  createdAt: Date.now(),
+  updatedAt: Date.now(),
+}
+
+function ensureMockImportedKbFile(files) {
+  const list = Array.isArray(files) ? files : []
+  if (!ENABLE_MOCK_IMPORTED_KB_FILE) return list
+  const exists = list.some(
+    (f) =>
+      f?.id === MOCK_IMPORTED_KB_FILE.id ||
+      String(f?.fileVersionId || '') === MOCK_IMPORTED_KB_FILE.fileVersionId,
+  )
+  return exists ? list : [MOCK_IMPORTED_KB_FILE, ...list]
+}
+
+function makeChunkRefKey(ref) {
+  if (ref && typeof ref === 'object') {
+    const chunkId = ref.chunk_id ?? ref.chunkId ?? ref.id
+    const fileVersionId = ref.file_version_id ?? ref.fileVersionId ?? ''
+    if (chunkId === undefined || chunkId === null || chunkId === '') return ''
+    return fileVersionId ? `${fileVersionId}::${chunkId}` : String(chunkId)
+  }
+  if (ref === undefined || ref === null || ref === '') return ''
+  return String(ref)
+}
 
 function renderAssistantInlineMarkdown(text, keyPrefix) {
   const source = String(text || '')
@@ -666,6 +708,7 @@ function FaultTreePage() {
   const [backendVersion, setBackendVersion] = useState(null)
   const [backendLoading, setBackendLoading] = useState(false)
   const [selectedNode, setSelectedNode] = useState(null)
+  const [selectedEdge, setSelectedEdge] = useState(null)
   const [explodedHighlightNodeName, setExplodedHighlightNodeName] = useState('')
   /** 每次在画布选中节点且爆炸图已打开时递增，保证 ExplodedViewer 立即/切换时同步高亮 */
   const [explodedHighlightSync, setExplodedHighlightSync] = useState(0)
@@ -860,6 +903,7 @@ function FaultTreePage() {
   const handleNodeSelect = useCallback(
     (node) => {
       setSelectedNode(node)
+      setSelectedEdge(null)
       if (!explodedPanelOpen) return
       const desc = node?.data?.meta?.event?.description ?? ''
       const ref = extractObjectRefFromDescription(desc)
@@ -867,6 +911,14 @@ function FaultTreePage() {
       setExplodedHighlightSync((s) => s + 1)
     },
     [explodedPanelOpen],
+  )
+
+  const handleEdgeSelect = useCallback(
+    (edge) => {
+      setSelectedEdge(edge)
+      setSelectedNode(null)
+    },
+    [],
   )
 
   /** 侧栏从关到开时，用当前选中节点同步一次三维高亮 */
@@ -1003,6 +1055,7 @@ function FaultTreePage() {
     setAiSemanticValidation(null)
     setAiSemanticNotice('')
     setSelectedNode(null)
+    setSelectedEdge(null)
     setChunkPanelOpen(false)
     setChunkPanelChunkIds([])
     setChunkPanelActiveId(null)
@@ -1179,6 +1232,7 @@ function FaultTreePage() {
       setHistory([])
       setRedoHistory([])
       setSelectedNode(null)
+      setSelectedEdge(null)
       setError('')
       setNotice('')
     },
@@ -1417,9 +1471,14 @@ function FaultTreePage() {
       return
     }
     const ws = getWorkspace(projectIdFromQuery)
-    setProjectFiles(Array.isArray(ws?.files) ? ws.files : [])
+    const hydratedFiles = ensureMockImportedKbFile(Array.isArray(ws?.files) ? ws.files : [])
+    setProjectFiles(hydratedFiles)
     const raw = ws?.kbSourceFileIds
-    setKbAllowList(Array.isArray(raw) ? raw : null)
+    setKbAllowList(
+      Array.isArray(raw)
+        ? Array.from(new Set([MOCK_IMPORTED_KB_FILE.id, ...raw.map(String)]))
+        : null,
+    )
     const ep = typeof ws?.kbDatasetEpoch === 'number' ? ws.kbDatasetEpoch : 0
     if (ep > kbSyncedBaselineEpochRef.current) {
       requireGenerateViaGenerateRef.current = true
@@ -2807,6 +2866,7 @@ function FaultTreePage() {
       const name = `新中间事件${nextIndex}`
       applyEdit(addChildNode(graphData, parentId, name, 'intermediate'))
       setSelectedNode(null)
+      setSelectedEdge(null)
     },
     [graphData, applyEdit],
   )
@@ -2820,6 +2880,7 @@ function FaultTreePage() {
       const name = `新底事件${nextIndex}`
       applyEdit(addChildUnderGate(graphData, gateId, name, 'basic'))
       setSelectedNode(null)
+      setSelectedEdge(null)
     },
     [graphData, applyEdit],
   )
@@ -2828,6 +2889,7 @@ function FaultTreePage() {
     (nodeId) => {
       applyEdit(deleteNode(graphData, nodeId))
       setSelectedNode(null)
+      setSelectedEdge(null)
     },
     [graphData, applyEdit],
   )
@@ -2892,27 +2954,45 @@ function FaultTreePage() {
   /** 传入该节点下全部 chunk id（用于多 chunk 时标题栏 ◀/▶），可选 preferActiveId 为当前要点开的那条 */
   const openChunkPanel = useCallback((chunkIds, preferActiveId) => {
     const ids = (Array.isArray(chunkIds) ? chunkIds : [chunkIds])
-      .map((x) => Number(x))
-      .filter((x) => Number.isFinite(x))
+      .map((x) => {
+        if (x && typeof x === 'object') {
+          const chunkId = x.chunk_id ?? x.chunkId ?? x.id
+          if (chunkId === undefined || chunkId === null || chunkId === '') return null
+          return {
+            chunk_id: chunkId,
+            file_version_id: x.file_version_id ?? x.fileVersionId ?? '',
+            chunk_name: x.chunk_name ?? x.chunkName ?? '',
+          }
+        }
+        if (x === undefined || x === null || x === '') return null
+        return { chunk_id: x, file_version_id: '' }
+      })
+      .filter(Boolean)
     if (!ids.length) return
     setChunkPanelOpen(true)
     setChunkPanelChunkIds(ids)
-    const pref = Number(preferActiveId)
+    const pref = makeChunkRefKey(preferActiveId)
     const next =
-      Number.isFinite(pref) && ids.includes(pref) ? pref : ids[0]
+      pref && ids.some((item) => makeChunkRefKey(item) === pref) ? pref : makeChunkRefKey(ids[0])
     setChunkPanelActiveId(next)
   }, [])
 
   useEffect(() => {
     if (!chunkPanelOpen || !chunkPanelActiveId) return
     if (chunkPanelData[String(chunkPanelActiveId)]) return
+    const activeRef = chunkPanelChunkIds.find((item) => makeChunkRefKey(item) === String(chunkPanelActiveId))
+    if (!activeRef) return
 
     const controller = new AbortController()
     setChunkPanelLoading(true)
     setChunkPanelError('')
     ;(async () => {
       try {
-        const data = await getChunk({ chunkId: chunkPanelActiveId, signal: controller.signal })
+        const data = await getFtaChunk({
+          chunkId: activeRef.chunk_id,
+          fileVersionId: activeRef.file_version_id,
+          signal: controller.signal,
+        })
         setChunkPanelData((prev) => ({ ...prev, [String(chunkPanelActiveId)]: data }))
       } catch (e) {
         if (e?.name === 'AbortError') return
@@ -2923,7 +3003,7 @@ function FaultTreePage() {
     })()
 
     return () => controller.abort()
-  }, [chunkPanelOpen, chunkPanelActiveId, chunkPanelData])
+  }, [chunkPanelOpen, chunkPanelActiveId, chunkPanelData, chunkPanelChunkIds])
 
   const doInsertGate = useCallback(
     (parentId, gateType) => {
@@ -3014,6 +3094,7 @@ function FaultTreePage() {
     (edgeId) => {
       applyEdit(deleteEdgeById(graphData, edgeId))
       setEdgeMenu(null)
+      setSelectedEdge(null)
     },
     [graphData, applyEdit],
   )
@@ -3682,6 +3763,7 @@ function FaultTreePage() {
                     onPaneContextMenu={handlePaneContextMenu}
                     onNodeDoubleClick={handleNodeDoubleClick}
                     onConnectEdge={handleConnect}
+                    onEdgeSelect={handleEdgeSelect}
                     onEdgeContextMenu={handleEdgeContextMenu}
                     canvasActionsRef={canvasActionsRef}
                     theme={theme}
@@ -3689,28 +3771,39 @@ function FaultTreePage() {
                     legendPosition={jsonPanelOpen ? 'bottom-left' : 'top-left'}
                     showChrome
                   />
-                  {selectedNode && (
+                  {(selectedNode || selectedEdge) && (
                     <div
                       className={`fta-right-docks${
                         chunkPanelOpen ? ' fta-right-docks--chunk-open' : ''
                       }`}
                     >
                       <div className="fta-right-dock fta-right-dock--node">
-                        <NodeInfoPanel
-                          selectedNode={selectedNode}
-                          selectedMeta={selectedMeta}
-                          onClose={() => setSelectedNode(null)}
-                          onRename={(newName) => doRename(selectedNode.id, newName)}
-                          onChangeType={(newType) => doChangeType(selectedNode.id, newType)}
-                          onDelete={() => doDelete(selectedNode.id)}
-                          onChangeDescription={(newDesc) =>
-                            doChangeDescription(selectedNode.id, newDesc)
-                          }
-                          onPatchEvent={(patch) => doPatchEvent(selectedNode.id, patch)}
-                          onOpenChunks={(ids, activeId) =>
-                            openChunkPanel(ids, activeId)
-                          }
-                        />
+                        {selectedNode ? (
+                          <NodeInfoPanel
+                            selectedNode={selectedNode}
+                            selectedMeta={selectedMeta}
+                            onClose={() => setSelectedNode(null)}
+                            onRename={(newName) => doRename(selectedNode.id, newName)}
+                            onChangeType={(newType) => doChangeType(selectedNode.id, newType)}
+                            onDelete={() => doDelete(selectedNode.id)}
+                            onChangeDescription={(newDesc) =>
+                              doChangeDescription(selectedNode.id, newDesc)
+                            }
+                            onPatchEvent={(patch) => doPatchEvent(selectedNode.id, patch)}
+                            onOpenChunks={(ids, activeId) =>
+                              openChunkPanel(ids, activeId)
+                            }
+                          />
+                        ) : (
+                          <EdgeInfoPanel
+                            selectedEdge={selectedEdge}
+                            graphData={graphData}
+                            onClose={() => setSelectedEdge(null)}
+                            onOpenChunks={(ids, activeId) =>
+                              openChunkPanel(ids, activeId)
+                            }
+                          />
+                        )}
                       </div>
 
                       {chunkPanelOpen && (
@@ -3842,6 +3935,143 @@ function TriggerRulesReadableView({ rulesText }) {
   )
 }
 
+function EdgeInfoPanel({
+  selectedEdge,
+  graphData,
+  onClose,
+  onOpenChunks,
+}) {
+  const rawEdge = useMemo(() => selectedEdge?.data?.rawEdge || selectedEdge || {}, [selectedEdge])
+  const relation = useMemo(
+    () => selectedEdge?.data?.relation || selectedEdge?.data?.meta?.relation || rawEdge?.meta?.relation || rawEdge?.meta?.raw?.relation || {},
+    [selectedEdge, rawEdge],
+  )
+  const semanticSource = rawEdge?.meta?.semanticSource || relation?.semanticSource || rawEdge?.source
+  const semanticTarget = rawEdge?.meta?.semanticTarget || relation?.semanticTarget || rawEdge?.target
+  const sourceNode = (graphData?.nodes || []).find((n) => String(n.id) === String(semanticSource))
+  const targetNode = (graphData?.nodes || []).find((n) => String(n.id) === String(semanticTarget))
+  const relationItems = useMemo(
+    () =>
+      Array.isArray(relation?.relation_bundle) && relation.relation_bundle.length
+        ? relation.relation_bundle
+        : [relation],
+    [relation],
+  )
+  const evidenceTexts = relationItems.flatMap((item) => Array.isArray(item?.evidence_texts)
+    ? item.evidence_texts
+    : Array.isArray(item?.evidence)
+      ? item.evidence.map((x) => x?.text).filter(Boolean)
+      : [])
+  const documents = useMemo(() => {
+    const docs = relationItems.flatMap((item) => Array.isArray(item?.documents) ? item.documents : [])
+    return docs
+      .map((d) => {
+        if (!d || typeof d !== 'object') return null
+        const chunk_id = d.chunk_id ?? d.chunkId ?? d.id
+        if (chunk_id === undefined || chunk_id === null || chunk_id === '') return null
+        return {
+          kind: 'chunk',
+          chunk_id,
+          chunk_name: d.chunk_name ?? d.chunkName ?? '',
+          section_path: d.section_path ?? d.sectionPath ?? '',
+          source_page: d.source_page ?? d.sourcePage ?? d.page ?? '',
+          file_id: d.file_id ?? d.fileId ?? '',
+          file_version_id: d.file_version_id ?? d.fileVersionId ?? '',
+        }
+      })
+      .filter(Boolean)
+      .filter((d, idx, arr) => arr.findIndex((x) => makeChunkRefKey(x) === makeChunkRefKey(d)) === idx)
+      .sort((a, b) => Number(a.chunk_id) - Number(b.chunk_id))
+  }, [relationItems])
+  const chunkNavIds = useMemo(() => documents, [documents])
+
+  return (
+    <div className="fta-node-panel fta-edge-panel">
+      <div className="fta-node-panel-header">
+        <div style={{ flex: 1 }}>
+          <div className="fta-node-panel-title">关系详情</div>
+          <div className="fta-node-panel-subtitle">
+            {relation?.relation_bundle?.length
+              ? `多个下层事件 → ${targetNode?.label || semanticTarget}`
+              : `${sourceNode?.label || relation?.source_label || semanticSource} → ${targetNode?.label || relation?.target_label || semanticTarget}`}
+          </div>
+        </div>
+        <button
+          type="button"
+          className="fta-btn ghost fta-node-panel-close-btn"
+          title="关闭"
+          aria-label="关闭"
+          onClick={onClose}
+        >
+          <IconClose />
+        </button>
+      </div>
+      <div className="fta-node-panel-body">
+        <InfoRow label="关系类型" value={relation?.relation_type || selectedEdge?.relation || '故障触发'} />
+        <InfoRow label="极性" value={relation?.polarity || ''} />
+        <InfoRow label="置信度" value={relation?.certainty || ''} />
+        <InfoRow label="跨 chunk" value={String(relation?.cross_chunk || '')} />
+        <InfoRow label="关系 ID" value={relation?.relation_id || ''} />
+
+        <div className="fta-node-panel-row">
+          <span className="fta-node-panel-label">证据片段</span>
+          <div className="fta-node-panel-value" style={{ width: '100%' }}>
+            {!evidenceTexts.length && <div style={{ opacity: 0.7 }}>（空）</div>}
+            {relationItems.map((item, itemIdx) => {
+              const texts = Array.isArray(item?.evidence_texts)
+                ? item.evidence_texts
+                : Array.isArray(item?.evidence)
+                  ? item.evidence.map((x) => x?.text).filter(Boolean)
+                  : []
+              return texts.map((text, idx) => (
+                <div key={`evidence-${itemIdx}-${idx}`} className="fta-doc-tag fta-evidence-text">
+                  {item?.source_label && item?.target_label ? `${item.source_label} → ${item.target_label}：` : ''}
+                  {text}
+                </div>
+              ))
+            })}
+          </div>
+        </div>
+
+        <div className="fta-node-panel-row">
+          <span className="fta-node-panel-label">文档溯源</span>
+          <div className="fta-node-panel-value" style={{ width: '100%' }}>
+            {!documents.length && <div style={{ opacity: 0.7 }}>（空）</div>}
+            {documents.map((doc, idx) => (
+              <button
+                type="button"
+                key={`${makeChunkRefKey(doc)}-${idx}`}
+                className="fta-doc-card fta-doc-card--clickable"
+                onClick={() => onOpenChunks?.(chunkNavIds, doc)}
+                title="点击查看原始 chunk 内容"
+              >
+                <div className="fta-doc-card-row">
+                  <span className="fta-doc-card-label">chunk_id</span>
+                  <span className="fta-doc-card-value">{doc.chunk_id || '（空）'}</span>
+                </div>
+                <div className="fta-doc-card-row">
+                  <span className="fta-doc-card-label">chunk_name</span>
+                  <span className="fta-doc-card-value">{doc.chunk_name || '（空）'}</span>
+                </div>
+                <div className="fta-doc-card-row">
+                  <span className="fta-doc-card-label">section_path</span>
+                  <span className="fta-doc-card-value">{doc.section_path || '（空）'}</span>
+                </div>
+                <div className="fta-doc-card-row">
+                  <span className="fta-doc-card-label">source_page</span>
+                  <span className="fta-doc-card-value">
+                    {doc.source_page === '' ? '（空）' : String(doc.source_page)}
+                  </span>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function NodeInfoPanel({
   selectedNode,
   selectedMeta,
@@ -3883,10 +4113,12 @@ function NodeInfoPanel({
           const chunk_id = d.chunk_id ?? d.chunkId ?? d.id
           return {
             kind: 'chunk',
-            chunk_id: chunk_id === undefined ? undefined : Number(chunk_id),
+            chunk_id,
             chunk_name: d.chunk_name ?? d.chunkName ?? '',
             section_path: d.section_path ?? d.sectionPath ?? '',
             source_page: d.source_page ?? d.sourcePage ?? d.page ?? '',
+            file_id: d.file_id ?? d.fileId ?? '',
+            file_version_id: d.file_version_id ?? d.fileVersionId ?? '',
           }
         }
         return { kind: 'text', text: String(d) }
@@ -3894,21 +4126,18 @@ function NodeInfoPanel({
       .filter(Boolean)
 
     const chunks = normalized
-      .filter((x) => x.kind === 'chunk' && Number.isFinite(x.chunk_id))
-      .sort((a, b) => a.chunk_id - b.chunk_id)
-    const texts = normalized.filter((x) => x.kind !== 'chunk' || !Number.isFinite(x.chunk_id))
+      .filter((x) => x.kind === 'chunk' && x.chunk_id !== undefined && x.chunk_id !== null && x.chunk_id !== '')
+      .sort((a, b) => Number(a.chunk_id) - Number(b.chunk_id))
+    const texts = normalized.filter((x) => x.kind !== 'chunk' || x.chunk_id === undefined || x.chunk_id === null || x.chunk_id === '')
     return [...chunks, ...texts]
   }, [selectedMeta?.event?.documents])
   /** 用于 chunk 原文 dock：同一节点下全部 chunk id（去重、排序），便于多 chunk 时标题栏切换 */
   const chunkNavIds = useMemo(
     () =>
-      [
-        ...new Set(
-          documents
-            .filter((d) => d.kind === 'chunk' && Number.isFinite(d.chunk_id))
-            .map((d) => d.chunk_id),
-        ),
-      ].sort((a, b) => a - b),
+      documents
+        .filter((d) => d.kind === 'chunk' && d.chunk_id !== undefined && d.chunk_id !== null && d.chunk_id !== '')
+        .filter((d, idx, arr) => arr.findIndex((x) => makeChunkRefKey(x) === makeChunkRefKey(d)) === idx)
+        .sort((a, b) => Number(a.chunk_id) - Number(b.chunk_id)),
     [documents],
   )
   const [rulesText, setRulesText] = useState(
@@ -4027,8 +4256,7 @@ function NodeInfoPanel({
 
       {!isGate && (
         <div className="fta-node-panel-body">
-          {!isTop && (
-            <>
+          <>
               <div className="fta-node-panel-row">
                 <span className="fta-node-panel-label">事件编号</span>
                 <input
@@ -4049,8 +4277,7 @@ function NodeInfoPanel({
                   onBlur={() => onPatchEvent?.({ name: eventName })}
                 />
               </div>
-            </>
-          )}
+          </>
           <div className="fta-node-panel-row">
             <span className="fta-node-panel-label">描述</span>
             <textarea
@@ -4062,8 +4289,7 @@ function NodeInfoPanel({
               placeholder="（空）请输入描述"
             />
           </div>
-          {!isTop && (
-            <>
+          <>
               <div className="fta-node-panel-row">
                 <span className="fta-node-panel-label">错误等级</span>
                 <input
@@ -4119,7 +4345,7 @@ function NodeInfoPanel({
                           key={`${doc.chunk_id ?? 'chunk'}-${idx}`}
                           className="fta-doc-card fta-doc-card--clickable"
                           onClick={() =>
-                            onOpenChunks?.(chunkNavIds, doc.chunk_id)
+                            onOpenChunks?.(chunkNavIds, doc)
                           }
                           title="点击查看原始 chunk 内容"
                         >
@@ -4190,8 +4416,7 @@ function NodeInfoPanel({
                   {rulesError ? <div className="fta-error-text">{rulesError}</div> : null}
                 </div>
               </div>
-            </>
-          )}
+          </>
         </div>
       )}
 
@@ -4229,15 +4454,18 @@ function InfoRow({ label, value }) {
 
 function ChunkViewerPanel({ chunkIds, activeId, onSelect, onClose, loading, error, data }) {
   const ids = Array.isArray(chunkIds) ? chunkIds : []
-  const idx = activeId != null ? ids.indexOf(activeId) : -1
+  const keys = ids.map((item) => makeChunkRefKey(item))
+  const idx = activeId != null ? keys.indexOf(String(activeId)) : -1
   const multi = ids.length > 1
 
   const goPrev = () => {
-    if (idx > 0) onSelect(ids[idx - 1])
+    if (idx > 0) onSelect(keys[idx - 1])
   }
   const goNext = () => {
-    if (idx >= 0 && idx < ids.length - 1) onSelect(ids[idx + 1])
+    if (idx >= 0 && idx < ids.length - 1) onSelect(keys[idx + 1])
   }
+  const activeRef = idx >= 0 ? ids[idx] : null
+  const activeChunkId = activeRef?.chunk_id ?? activeRef?.chunkId ?? activeId
 
   return (
     <div className="fta-chunk-panel">
@@ -4258,7 +4486,7 @@ function ChunkViewerPanel({ chunkIds, activeId, onSelect, onClose, loading, erro
             <span className="fta-chunk-panel-title-text">Chunk 原文</span>
             {idx >= 0 && (
               <span className="fta-chunk-panel-title-sub">
-                #{activeId}
+                #{activeChunkId}
                 {multi ? ` (${idx + 1}/${ids.length})` : ''}
               </span>
             )}
@@ -4296,7 +4524,7 @@ function ChunkViewerPanel({ chunkIds, activeId, onSelect, onClose, loading, erro
             <div className="fta-chunk-meta">
               <div className="fta-chunk-meta-row">
                 <span className="fta-chunk-meta-label">chunk_id</span>
-                <span className="fta-chunk-meta-value">{String(data.id ?? activeId)}</span>
+                <span className="fta-chunk-meta-value">{String(data.chunk_id ?? data.id ?? activeChunkId)}</span>
               </div>
               <div className="fta-chunk-meta-row">
                 <span className="fta-chunk-meta-label">chunk_name</span>

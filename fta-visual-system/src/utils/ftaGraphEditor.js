@@ -699,16 +699,17 @@ export function graphToRawJson(graphData, attr, options = {}) {
     const parentEdge = edges.find((e) => e.source === gate.id)
     if (!parentEdge) continue
     const parentId = parentEdge.target
-    const childIds = edges
+    const childEdges = edges
       .filter((e) => e.target === gate.id)
-      .map((e) => e.source)
-    for (const childId of childIds) {
+    for (const childEdge of childEdges) {
+      const childId = childEdge.source
       if (eventNodes.some((n) => n.id === childId)) {
         linkList.push({
           type: 'link',
           sourceId: childId,
           targetId: parentId,
           isCondition: false,
+          relation: childEdge.meta?.relation || childEdge.meta?.raw?.relation || undefined,
         })
       }
     }
@@ -723,6 +724,7 @@ export function graphToRawJson(graphData, attr, options = {}) {
         sourceId: e.source,
         targetId: e.target,
         isCondition: false,
+        relation: e.meta?.relation || e.meta?.raw?.relation || undefined,
       })
     }
   }

@@ -52,6 +52,40 @@ import '../styles/home.css'
 
 const DEFAULT_FTA_BASE_URL = 'http://localhost:8000'
 
+// TEMP DEV MOCK: used to test GNR against a KB v2 graph that has already been
+// imported into MongoDB/Neo4j outside the frontend upload flow.
+const ENABLE_MOCK_IMPORTED_KB_FILE = true
+const MOCK_IMPORTED_KB_FILE = {
+  id: 'mock-huawei-luna2000-alarm-reference',
+  name: 'HUAWEI LUNA2000 alarm reference (KB v2 imported)',
+  size: 0,
+  status: 'done',
+  uploadProgress: 100,
+  parseProgress: 100,
+  kbImportComplete: true,
+  kbCategory: 'document',
+  kbCategoryLabel: 'KB v2 imported',
+  sourceType: 'manual_document',
+  fileId: 'huawei_luna2000_alarm_reference',
+  fileVersionId: 'huawei_luna2000_alarm_reference_v1',
+  versionNo: 1,
+  isActive: true,
+  importedFileName: 'HUAWEI LUNA2000 alarm reference',
+  createdAt: Date.now(),
+  updatedAt: Date.now(),
+}
+
+function ensureMockImportedKbFile(files) {
+  const list = Array.isArray(files) ? files : []
+  if (!ENABLE_MOCK_IMPORTED_KB_FILE) return list
+  const exists = list.some(
+    (f) =>
+      f?.id === MOCK_IMPORTED_KB_FILE.id ||
+      String(f?.fileVersionId || '') === MOCK_IMPORTED_KB_FILE.fileVersionId,
+  )
+  return exists ? list : [MOCK_IMPORTED_KB_FILE, ...list]
+}
+
 /**
  * 知识库构建全流程成功后的本地持久标记（随 workspace.files 写入 localStorage）。
  * KB 后端重启后仍可显示「解析成功」，且恢复轮询时不会因接口失败被误判为解析失败。
@@ -825,21 +859,27 @@ function HomePage() {
 
     const ws = getWorkspace(projectId)
     if (ws) {
-      setFiles((ws.files || []).map(migrateKbFileFromWorkspace))
+      const hydratedFiles = ensureMockImportedKbFile((ws.files || []).map(migrateKbFileFromWorkspace))
+      setFiles(hydratedFiles)
       setKbDatasetEpoch(typeof ws.kbDatasetEpoch === 'number' ? ws.kbDatasetEpoch : 0)
       if (Array.isArray(ws.kbSourceFileIds)) {
         const inc = {}
-        for (const f of ws.files || []) {
-          inc[f.id] = ws.kbSourceFileIds.includes(f.id)
+        for (const f of hydratedFiles) {
+          inc[f.id] = f.id === MOCK_IMPORTED_KB_FILE.id || ws.kbSourceFileIds.includes(f.id)
         }
         setKbChunkIncludeById(inc)
       } else {
-        setKbChunkIncludeById({})
+        const inc = {}
+        for (const f of hydratedFiles) inc[f.id] = f.isActive !== false
+        setKbChunkIncludeById(inc)
       }
     } else {
-      setFiles([])
+      const hydratedFiles = ensureMockImportedKbFile([])
+      setFiles(hydratedFiles)
       setKbDatasetEpoch(0)
-      setKbChunkIncludeById({})
+      const inc = {}
+      for (const f of hydratedFiles) inc[f.id] = true
+      setKbChunkIncludeById(inc)
     }
 
     setWorkspaceReady(true)

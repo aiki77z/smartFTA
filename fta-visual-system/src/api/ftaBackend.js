@@ -239,6 +239,16 @@ export function graphCypherQuery({ cypher, params, database, limit = 200, signal
   })
 }
 
+export function getFtaChunk({ chunkId, fileVersionId, signal } = {}) {
+  if (chunkId === undefined || chunkId === null || chunkId === '') {
+    throw new Error('缺少 chunkId')
+  }
+  const params = new URLSearchParams()
+  if (fileVersionId) params.set('file_version_id', String(fileVersionId))
+  const suffix = params.toString() ? `?${params.toString()}` : ''
+  return requestJson(`/api/chunk/${encodeURIComponent(chunkId)}${suffix}`, { signal })
+}
+
 // Legacy validator-service endpoints (now merged into the backend main:app)
 export function validateFaultTreeGraph({ graph, signal } = {}) {
   return requestJson('/validate-fault-tree', { method: 'POST', body: { graph }, signal })

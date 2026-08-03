@@ -346,6 +346,11 @@ function buildLayout(nodes, edges) {
       pathOptions: isFromGate ? { borderRadius: 0 } : undefined,
       animated: false,
       style: { strokeWidth: 2, stroke: '#64748b' },
+      data: {
+        rawEdge: e,
+        meta: e.meta || {},
+        relation: e.meta?.relation || e.meta?.raw?.relation || null,
+      },
     }
   })
 
@@ -532,6 +537,7 @@ function CanvasInner({
   onPaneContextMenu,
   onNodeDoubleClick,
   onConnectEdge,
+  onEdgeSelect,
   onEdgeContextMenu,
   showChrome = true,
   canvasActionsRef,
@@ -648,6 +654,7 @@ function CanvasInner({
       onNodesChange={(ch) => setNodes((ns) => applyNodeChanges(ch, ns))}
       onEdgesChange={(ch) => setEdges((es) => applyEdgeChanges(ch, es))}
       onNodeClick={(_, node) => onNodeSelect?.(node)}
+      onEdgeClick={(_, edge) => onEdgeSelect?.(edge)}
       onNodeContextMenu={handleNodeCtx}
       onPaneContextMenu={handlePaneCtx}
       onNodeDoubleClick={handleDblClick}

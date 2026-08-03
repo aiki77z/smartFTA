@@ -105,19 +105,70 @@ function buildGraphWithGates(baseNodes, baseEdges) {
     })
 
     incomingEdges.forEach((e) => {
+      const relation = parent.gate === 'AND' && e.meta?.relation?.member_relation
+        ? e.meta.relation.member_relation
+        : e.meta?.relation
       gateEdges.push({
         ...e,
         id: `${e.source}-${gateId}`,
         target: gateId,
+        meta: {
+          ...(e.meta || {}),
+          relation,
+          semanticSource: e.source,
+          semanticTarget: targetId,
+          visualGateSegment: 'input',
+          raw: {
+            ...(e.meta?.raw || {}),
+            relation,
+            sourceId: e.source,
+            targetId,
+          },
+        },
       })
     })
+
+    const gateRelation = (() => {
+      if (parent.gate === 'AND') {
+        const rel = incomingEdges.find((e) => e.meta?.relation?.gate_relation)?.meta?.relation?.gate_relation
+        return rel || null
+      }
+      const relations = incomingEdges
+        .map((e) => ({
+          ...(e.meta?.relation || {}),
+          semanticSource: e.source,
+          semanticTarget: targetId,
+          source_label: nodesById.get(e.source)?.label || e.source,
+          target_label: parent.label || targetId,
+        }))
+        .filter(Boolean)
+      if (relations.length === 1) return relations[0]
+      return {
+        relation_type: 'OR逻辑关系',
+        gate_type: 'OR',
+        relation_bundle: relations,
+        documents: relations.flatMap((r) => Array.isArray(r.documents) ? r.documents : []),
+        evidence_texts: relations.flatMap((r) => Array.isArray(r.evidence_texts) ? r.evidence_texts : []),
+      }
+    })()
 
     gateEdges.push({
       id: `${gateId}-${targetId}`,
       source: gateId,
       target: targetId,
       relation: parent.gate,
-      meta: { gateFor: targetId },
+      meta: {
+        gateFor: targetId,
+        relation: gateRelation,
+        semanticSource: parent.gate === 'OR' && incomingEdges.length === 1 ? incomingEdges[0].source : gateId,
+        semanticTarget: targetId,
+        visualGateSegment: 'output',
+        raw: {
+          relation: gateRelation,
+          sourceId: parent.gate === 'OR' && incomingEdges.length === 1 ? incomingEdges[0].source : gateId,
+          targetId,
+        },
+      },
     })
   })
 
@@ -192,9 +243,10 @@ export function parseRawFtaJson(raw) {
       id,
       source: sourceId,
       target: targetId,
-      relation: '',
+      relation: link.relation?.relation_type || link.relation_type || '',
       meta: {
         isCondition: link.isCondition,
+        relation: link.relation || null,
         raw: link,
       },
     }
