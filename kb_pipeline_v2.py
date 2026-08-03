@@ -219,6 +219,26 @@ def run_file_internal_clustering(
     return intermediate
 
 
+def resolve_clustering_env_file(default_env_file: Path) -> Path:
+    clustering_env = ROOT_DIR / "entity_clustering" / ".env"
+    return clustering_env.resolve() if clustering_env.exists() else default_env_file
+
+
+def load_clustering_embedding_env(clustering_env_file: Path) -> None:
+    load_local_env(clustering_env_file, override=True)
+    prefix_map = {
+        "ENTITY_CLUSTER_EMBEDDING_API_KEY": "EMBEDDING_API_KEY",
+        "ENTITY_CLUSTER_EMBEDDING_BASE_URL": "EMBEDDING_BASE_URL",
+        "ENTITY_CLUSTER_EMBEDDING_MODEL": "EMBEDDING_MODEL",
+        "ENTITY_CLUSTER_EMBEDDING_BATCH_SIZE": "EMBEDDING_BATCH_SIZE",
+        "ENTITY_CLUSTER_EMBEDDING_BACKEND": "KB_EMBEDDING_BACKEND",
+    }
+    for source, target in prefix_map.items():
+        value = os.getenv(source, "").strip()
+        if value:
+            os.environ[target] = value
+
+
 def run_cross_file_import(
     *,
     intermediate_json: Path,
@@ -250,6 +270,77 @@ def run_cross_file_import(
     run_command(cmd, "跨文件实体聚类并导入 Neo4j/MongoDB")
 
 
+def normalize_chunk_for_graph(chunk: dict[str, Any], *, file_id: str, file_version_id: str) -> dict[str, Any]:
+    normalized = dict(chunk or {})
+    chunk_id = normalized.get("chunk_id", normalized.get("id"))
+    if chunk_id in (None, ""):
+        return {}
+    chunk_id = str(chunk_id)
+    normalized["id"] = str(normalized.get("id", chunk_id))
+    normalized["chunk_id"] = chunk_id
+    normalized["file_id"] = file_id
+    normalized["file_version_id"] = file_version_id
+    normalized["chunk_uid"] = f"{file_version_id}::{chunk_id}"
+
+    body = ""
+    for key in ("content", "text", "markdown", "raw_text", "page_content", "body"):
+        value = normalized.get(key)
+        if value not in (None, ""):
+            body = str(value)
+            break
+    if body:
+        normalized.setdefault("content", body)
+        normalized.setdefault("text", body)
+        normalized.setdefault("markdown", body)
+
+    chunk_name = str(
+        normalized.get("chunk_name")
+        or normalized.get("title")
+        or normalized.get("heading")
+        or normalized.get("chapter")
+        or ""
+    ).strip()
+    section_path = str(
+        normalized.get("section_path")
+        or normalized.get("section")
+        or normalized.get("chapter_id")
+        or normalized.get("chapter")
+        or ""
+    ).strip()
+    chapter = str(normalized.get("chapter") or normalized.get("section") or chunk_name).strip()
+    if chunk_name:
+        normalized.setdefault("chunk_name", chunk_name)
+        normalized.setdefault("chapter_title", normalized.get("chapter_title") or chunk_name)
+    if section_path:
+        normalized.setdefault("section_path", section_path)
+        normalized.setdefault("chapter_id", normalized.get("chapter_id") or section_path)
+    if chapter:
+        normalized.setdefault("chapter", chapter)
+    return normalized
+
+
+def attach_full_chunks_to_intermediate(
+    *,
+    intermediate_json: Path,
+    chunks_json: Path,
+    file_id: str,
+    file_version_id: str,
+) -> None:
+    data = json.loads(intermediate_json.read_text(encoding="utf-8"))
+    chunks = load_chunks_from_json(chunks_json)
+    data["chunks"] = [
+        item
+        for item in (
+            normalize_chunk_for_graph(chunk, file_id=file_id, file_version_id=file_version_id)
+            for chunk in chunks
+        )
+        if item
+    ]
+    data["file_id"] = data.get("file_id") or file_id
+    data["file_version_id"] = data.get("file_version_id") or file_version_id
+    intermediate_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="SmartFTA KB v2 full pipeline: document -> chunks -> LLM extraction -> clustering -> graph.")
     parser.add_argument("--env-file", default=str(ROOT_DIR / ".env"))
@@ -272,7 +363,12 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=2200)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--sleep", type=float, default=0.0)
-    parser.add_argument("--embedding-backend", choices=["none", "hash", "sentence-transformers", "openai-compatible"], default="none")
+    parser.add_argument(
+        "--embedding-backend",
+        choices=["none", "hash", "sentence-transformers", "openai-compatible"],
+        default="",
+        help="Defaults to KB_EMBEDDING_BACKEND or openai-compatible. Use none only for smoke tests.",
+    )
     parser.add_argument("--reuse-embeddings-jsonl", default="")
     parser.add_argument("--refinement-merge-mode", choices=["single", "batch", "strong-batch"], default="single")
     parser.add_argument("--skip-cross-file-import", action="store_true", help="Stop after file-internal clustering.")
@@ -281,6 +377,18 @@ def main() -> None:
 
     env_file = Path(args.env_file).resolve()
     load_local_env(env_file, override=True)
+    clustering_env_file = resolve_clustering_env_file(env_file)
+    load_clustering_embedding_env(clustering_env_file)
+    embedding_backend = args.embedding_backend or os.getenv("KB_EMBEDDING_BACKEND", "openai-compatible")
+    if embedding_backend != "none":
+        embedding_model = os.getenv("EMBEDDING_MODEL", "").strip()
+        embedding_api_key = os.getenv("EMBEDDING_API_KEY", os.getenv("LLM_API_KEY", "")).strip()
+        if embedding_backend == "openai-compatible" and (not embedding_model or not embedding_api_key):
+            raise ValueError(
+                "KB v2 requires embedding for entity clustering. "
+                "Set EMBEDDING_MODEL and EMBEDDING_API_KEY in .env, "
+                "or explicitly pass --embedding-backend none only for smoke tests."
+            )
     input_path = Path(args.input_file).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"input file not found: {input_path}")
@@ -343,10 +451,16 @@ def main() -> None:
         annotations_csv=annotations_csv,
         file_id=file_id,
         output_dir=cluster_output_dir,
-        env_file=env_file,
-        embedding_backend=args.embedding_backend,
+        env_file=clustering_env_file,
+        embedding_backend=embedding_backend,
         reuse_embeddings_jsonl=args.reuse_embeddings_jsonl,
         refinement_merge_mode=args.refinement_merge_mode,
+    )
+    attach_full_chunks_to_intermediate(
+        intermediate_json=intermediate_json,
+        chunks_json=artifacts["chunks_json"],
+        file_id=file_id,
+        file_version_id=file_version_id,
     )
 
     diagnostics_jsonl = result_dir / "cross_file_diagnostics.jsonl"

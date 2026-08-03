@@ -286,7 +286,17 @@ def load_env(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        os.environ[key.strip()] = value.strip().strip('"').strip("'")
+    prefix_map = {
+        "ENTITY_CLUSTER_EMBEDDING_API_KEY": "EMBEDDING_API_KEY",
+        "ENTITY_CLUSTER_EMBEDDING_BASE_URL": "EMBEDDING_BASE_URL",
+        "ENTITY_CLUSTER_EMBEDDING_MODEL": "EMBEDDING_MODEL",
+        "ENTITY_CLUSTER_EMBEDDING_BATCH_SIZE": "EMBEDDING_BATCH_SIZE",
+    }
+    for source, target in prefix_map.items():
+        value = os.getenv(source, "").strip()
+        if value:
+            os.environ[target] = value
 
 
 def normalize_name(value: str) -> str:

@@ -379,11 +379,12 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
         request.chunk_type,
         "--workers",
         os.getenv("KB_V2_LLM_WORKERS", "1"),
-        "--embedding-backend",
-        os.getenv("KB_V2_EMBEDDING_BACKEND", "none"),
         "--refinement-merge-mode",
         os.getenv("KB_V2_REFINEMENT_MERGE_MODE", "single"),
     ]
+    embedding_backend = os.getenv("KB_V2_EMBEDDING_BACKEND") or os.getenv("KB_EMBEDDING_BACKEND")
+    if embedding_backend:
+        cmd.extend(["--embedding-backend", embedding_backend])
     if request.skip_mineru:
         cmd.append("--skip-mineru")
     if request.skip_clean:

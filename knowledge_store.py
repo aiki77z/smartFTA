@@ -354,6 +354,41 @@ def _normalize_chunk_import_doc(
     normalized["is_active"] = bool(normalized.get("is_active", is_active))
     if normalized_file_version_id and normalized.get("chunk_id") not in (None, ""):
         normalized["chunk_uid"] = _make_chunk_ref(normalized_file_version_id, normalized.get("chunk_id"))
+
+    # Keep the newer kb-v2 fields, but also materialize the older Luna2000-style
+    # fields that GNR and existing debug data already consume reliably.
+    body_text = ""
+    for key in ("content", "text", "markdown", "raw_text", "page_content", "body"):
+        value = normalized.get(key)
+        if value not in (None, ""):
+            body_text = str(value)
+            break
+    if body_text:
+        normalized.setdefault("content", body_text)
+        normalized.setdefault("text", body_text)
+        normalized.setdefault("markdown", body_text)
+
+    chunk_name = _normalize_identifier(
+        normalized.get("chunk_name")
+        or normalized.get("title")
+        or normalized.get("heading")
+        or normalized.get("chapter")
+    )
+    section_path = _normalize_identifier(
+        normalized.get("section_path")
+        or normalized.get("section")
+        or normalized.get("chapter_id")
+        or normalized.get("chapter")
+    )
+    chapter = _normalize_identifier(normalized.get("chapter") or normalized.get("section") or chunk_name)
+    if chunk_name:
+        normalized.setdefault("chunk_name", chunk_name)
+        normalized.setdefault("chapter_title", _normalize_identifier(normalized.get("chapter_title")) or chunk_name)
+    if section_path:
+        normalized.setdefault("section_path", section_path)
+        normalized.setdefault("chapter_id", _normalize_identifier(normalized.get("chapter_id")) or section_path)
+    if chapter:
+        normalized.setdefault("chapter", chapter)
     return normalized
 
 

@@ -26,3 +26,15 @@ def load_local_env(env_path: str | Path | None = None, *, override: bool = False
 
         if override or key not in os.environ:
             os.environ[key] = value
+
+    # Backward compatibility: older local .env files used OPENAI_* names.
+    # KB v2 uses provider-neutral LLM_* names.
+    aliases = {
+        "OPENAI_API_KEY": "LLM_API_KEY",
+        "OPENAI_BASE_URL": "LLM_BASE_URL",
+        "OPENAI_MODEL_NAME": "LLM_MODEL",
+    }
+    for old_key, new_key in aliases.items():
+        old_value = os.environ.get(old_key)
+        if old_value and (override or not os.environ.get(new_key)):
+            os.environ[new_key] = old_value

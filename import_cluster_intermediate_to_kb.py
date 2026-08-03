@@ -124,7 +124,72 @@ def infer_chunk_ids_from_evidence(evidence: list[dict[str, Any]]) -> list[str]:
     return dedupe_keep_order([item.get("chunk_id") for item in evidence if isinstance(item, dict)])
 
 
+def neo4j_property_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        if all(isinstance(item, (str, int, float, bool)) or item is None for item in value):
+            return ["" if item is None else item for item in value]
+        return json_dumps(value)
+    if isinstance(value, dict):
+        return json_dumps(value)
+    return str(value)
+
+
+def sanitize_neo4j_props(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: neo4j_property_value(value) for key, value in row.items()}
+
+
+def normalize_chunk_row(chunk: dict[str, Any], *, file_id: str, file_version_id: str) -> dict[str, Any]:
+    row = dict(chunk or {})
+    chunk_id = clean_scalar(row.get("chunk_id") if row.get("chunk_id") not in (None, "") else row.get("id"))
+    if not chunk_id:
+        return {}
+    row["id"] = clean_scalar(row.get("id")) or chunk_id
+    row["chunk_id"] = chunk_id
+    row["chunk_uid"] = clean_scalar(row.get("chunk_uid")) or f"{file_version_id}::{chunk_id}"
+    row["file_id"] = file_id
+    row["file_version_id"] = file_version_id
+
+    body = ""
+    for key in ("content", "text", "markdown", "raw_text", "page_content", "body"):
+        value = row.get(key)
+        if value not in (None, ""):
+            body = str(value)
+            break
+    if body:
+        row.setdefault("content", body)
+        row.setdefault("text", body)
+        row.setdefault("markdown", body)
+
+    chunk_name = clean_scalar(row.get("chunk_name") or row.get("title") or row.get("heading") or row.get("chapter"))
+    section_path = clean_scalar(row.get("section_path") or row.get("section") or row.get("chapter_id") or row.get("chapter"))
+    chapter = clean_scalar(row.get("chapter") or row.get("section") or chunk_name)
+    if chunk_name:
+        row.setdefault("chunk_name", chunk_name)
+        row.setdefault("chapter_title", clean_scalar(row.get("chapter_title")) or chunk_name)
+    if section_path:
+        row.setdefault("section_path", section_path)
+        row.setdefault("chapter_id", clean_scalar(row.get("chapter_id")) or section_path)
+    if chapter:
+        row.setdefault("chapter", chapter)
+    return sanitize_neo4j_props(row)
+
+
 def collect_chunks(data: dict[str, Any], file_id: str, file_version_id: str) -> list[dict[str, Any]]:
+    if isinstance(data.get("chunks"), list) and data.get("chunks"):
+        rows = [
+            row
+            for row in (
+                normalize_chunk_row(chunk, file_id=file_id, file_version_id=file_version_id)
+                for chunk in data.get("chunks", [])
+            )
+            if row
+        ]
+        return rows
+
     chunk_ids: set[str] = set()
     for mention in data.get("mentions", []):
         chunk_ids.update(split_semicolon(mention.get("chunk_ids")))

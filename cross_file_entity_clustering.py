@@ -120,6 +120,62 @@ def evidence_chunk_refs(evidence: list[dict[str, Any]], file_version_id: str) ->
     return dedupe_keep_order(refs)
 
 
+def neo4j_property_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        if all(isinstance(item, (str, int, float, bool)) or item is None for item in value):
+            return ["" if item is None else item for item in value]
+        return json_dumps(value)
+    if isinstance(value, dict):
+        return json_dumps(value)
+    return str(value)
+
+
+def sanitize_neo4j_props(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: neo4j_property_value(value) for key, value in row.items()}
+
+
+def normalize_chunk_row(chunk: dict[str, Any], *, file_id: str, file_version_id: str) -> dict[str, Any]:
+    row = dict(chunk or {})
+    chunk_id = clean_scalar(row.get("chunk_id") if row.get("chunk_id") not in (None, "") else row.get("id"))
+    if not chunk_id:
+        return {}
+    row["id"] = clean_scalar(row.get("id")) or chunk_id
+    row["chunk_id"] = chunk_id
+    row["chunk_uid"] = clean_scalar(row.get("chunk_uid")) or f"{file_version_id}::{chunk_id}"
+    row["file_id"] = file_id
+    row["file_version_id"] = file_version_id
+
+    body = ""
+    for key in ("content", "text", "markdown", "raw_text", "page_content", "body"):
+        value = row.get(key)
+        if value not in (None, ""):
+            body = str(value)
+            break
+    if body:
+        row.setdefault("content", body)
+        row.setdefault("text", body)
+        row.setdefault("markdown", body)
+
+    chunk_name = clean_scalar(row.get("chunk_name") or row.get("title") or row.get("heading") or row.get("chapter"))
+    section_path = clean_scalar(row.get("section_path") or row.get("section") or row.get("chapter_id") or row.get("chapter"))
+    chapter = clean_scalar(row.get("chapter") or row.get("section") or chunk_name)
+    if chunk_name:
+        row.setdefault("chunk_name", chunk_name)
+        row.setdefault("chapter_title", clean_scalar(row.get("chapter_title")) or chunk_name)
+    if section_path:
+        row.setdefault("section_path", section_path)
+        row.setdefault("chapter_id", clean_scalar(row.get("chapter_id")) or section_path)
+    if chapter:
+        row.setdefault("chapter", chapter)
+    row["source_file_ids"] = [file_id]
+    row["source_file_version_ids"] = [file_version_id]
+    return sanitize_neo4j_props(row)
+
+
 def cluster_to_pseudo_mention(cluster: dict[str, Any], *, file_id: str, file_version_id: str) -> Mention:
     evidence = enrich_evidence(cluster.get("evidence") or [], file_id=file_id, file_version_id=file_version_id)
     canonical = clean_scalar(cluster.get("canonical_name"))
@@ -339,6 +395,16 @@ def choose_cluster_mapping(
 
 
 def collect_chunks(data: dict[str, Any], *, file_id: str, file_version_id: str) -> list[dict[str, Any]]:
+    if isinstance(data.get("chunks"), list) and data.get("chunks"):
+        return [
+            row
+            for row in (
+                normalize_chunk_row(chunk, file_id=file_id, file_version_id=file_version_id)
+                for chunk in data.get("chunks", [])
+            )
+            if row
+        ]
+
     chunk_ids: set[str] = set()
     for mention in data.get("mentions", []):
         chunk_ids.update(split_semicolon(mention.get("chunk_ids")))
@@ -354,7 +420,6 @@ def collect_chunks(data: dict[str, Any], *, file_id: str, file_version_id: str) 
             "chunk_id": chunk_id,
             "source_file_ids": [file_id],
             "source_file_version_ids": [file_version_id],
-            "source_file_scopes": [file_scope(file_id, file_version_id)],
         }
         for chunk_id in sorted(chunk_ids, key=lambda value: (not str(value).isdigit(), str(value)))
     ]
@@ -382,7 +447,6 @@ def upsert_entity_cluster(
     code = entity_type_code(cluster.get("entity_type"))
     zh = entity_type_zh(cluster.get("entity_type"), cluster.get("entity_type_zh"))
     evidence = enrich_evidence(cluster.get("evidence") or [], file_id=file_id, file_version_id=file_version_id)
-    chunk_refs = evidence_chunk_refs(evidence, file_version_id)
     aliases = dedupe_keep_order([cluster.get("canonical_name"), *(cluster.get("aliases") or [])])
     mention_ids = dedupe_keep_order(cluster.get("mention_ids") or [])
     existing = session.run(
@@ -399,14 +463,13 @@ def upsert_entity_cluster(
         "aliases": aliases,
         "mention_ids": mention_ids,
         "mention_count": len(mention_ids),
-        "chunk_refs": chunk_refs,
         "chunk_ids": evidence_chunk_ids(evidence),
         "source_file_ids": [file_id],
         "source_file_version_ids": [file_version_id],
-        "source_file_scopes": [file_scope(file_id, file_version_id)],
         "neighbor_tokens": dedupe_keep_order(cluster.get("neighbor_tokens") or []),
         "merge_reasons": dedupe_keep_order(cluster.get("merge_reasons") or []),
         "evidence_json": json_dumps(evidence),
+        "embedding_dim": int(cluster.get("embedding_dim") or 0),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if existing:
@@ -417,14 +480,12 @@ def upsert_entity_cluster(
         props["aliases"] = merge_list(node.get("aliases"), aliases)
         props["mention_ids"] = merge_list(node.get("mention_ids"), mention_ids)
         props["mention_count"] = len(props["mention_ids"])
-        props["chunk_refs"] = merge_list(node.get("chunk_refs"), chunk_refs)
         props["chunk_ids"] = merge_list(node.get("chunk_ids"), evidence_chunk_ids(evidence))
         props["source_file_ids"] = merge_list(node.get("source_file_ids") or ([node.get("file_id")] if node.get("file_id") else []), [file_id])
         props["source_file_version_ids"] = merge_list(
             node.get("source_file_version_ids") or ([node.get("file_version_id")] if node.get("file_version_id") else []),
             [file_version_id],
         )
-        props["source_file_scopes"] = merge_list(node.get("source_file_scopes"), [file_scope(file_id, file_version_id)])
         props["neighbor_tokens"] = merge_list(node.get("neighbor_tokens"), props["neighbor_tokens"])
         props["merge_reasons"] = merge_list(node.get("merge_reasons"), props["merge_reasons"] + [f"cross_file:{file_version_id}"])
         props["evidence_json"] = json_dumps(merged_evidence)
@@ -432,7 +493,7 @@ def upsert_entity_cluster(
         f"""
         MERGE (e:EntityCluster:{label} {{cluster_id: $cluster_id}})
         SET e += $props
-        REMOVE e.file_id, e.file_version_id
+        REMOVE e.file_id, e.file_version_id, e.chunk_refs, e.source_file_scopes
         """,
         cluster_id=mapped_cluster_id,
         props=props,
@@ -449,13 +510,11 @@ def upsert_file_and_chunks(session: Any, *, chunks: list[dict[str, Any]], file_i
             f.file_name = $file_name,
             f.source_file_ids = [$file_id],
             f.source_file_version_ids = [$file_version_id],
-            f.source_file_scopes = [$scope],
             f.updated_at = $updated_at
         """,
         file_id=file_id,
         file_version_id=file_version_id,
         file_name=file_name,
-        scope=file_scope(file_id, file_version_id),
         updated_at=now,
     ).consume()
     session.run(
@@ -467,6 +526,7 @@ def upsert_file_and_chunks(session: Any, *, chunks: list[dict[str, Any]], file_i
         WITH c
         MATCH (f:File {file_version_id: c.file_version_id})
         MERGE (f)-[:HAS_CHUNK]->(c)
+        REMOVE c.source_file_scopes
         """,
         rows=chunks,
         updated_at=now,
@@ -506,10 +566,8 @@ def upsert_mentions(session: Any, *, data: dict[str, Any], cluster_mapping: dict
                     "mention": clean_scalar(mention.get("mention")),
                     "normalized_name": clean_scalar(mention.get("normalized_name")),
                     "chunk_ids": chunk_ids,
-                    "chunk_refs": [f"{file_version_id}::{chunk_id}" for chunk_id in chunk_ids],
                     "source_file_ids": [file_id],
                     "source_file_version_ids": [file_version_id],
-                    "source_file_scopes": [file_scope(file_id, file_version_id)],
                     "neighbor_tokens": dedupe_keep_order(mention.get("neighbor_tokens") or []),
                     "evidence_json": json_dumps(evidence),
                     "cluster_id": mapped_cluster_id,
@@ -531,8 +589,8 @@ def upsert_mentions(session: Any, *, data: dict[str, Any], cluster_mapping: dict
                 rr.file_version_id = $file_version_id,
                 rr.source_file_ids = [$file_id],
                 rr.source_file_version_ids = [$file_version_id],
-                rr.source_file_scopes = [$scope],
                 rr.updated_at = $updated_at
+            REMOVE rr.source_file_scopes
             WITH m, row
             UNWIND row.props.chunk_ids AS chunk_id
             MATCH (c:Chunk {{chunk_uid: $file_version_id + '::' + chunk_id}})
@@ -541,13 +599,12 @@ def upsert_mentions(session: Any, *, data: dict[str, Any], cluster_mapping: dict
                 ei.file_version_id = $file_version_id,
                 ei.source_file_ids = [$file_id],
                 ei.source_file_version_ids = [$file_version_id],
-                ei.source_file_scopes = [$scope],
                 ei.updated_at = $updated_at
+            REMOVE ei.source_file_scopes
             """,
             rows=rows,
             file_id=file_id,
             file_version_id=file_version_id,
-            scope=file_scope(file_id, file_version_id),
             updated_at=now,
         ).consume()
 
@@ -572,14 +629,12 @@ def upsert_mention_relations(session: Any, *, data: dict[str, Any], file_id: str
                     "file_version_id": file_version_id,
                     "source_file_ids": [file_id],
                     "source_file_version_ids": [file_version_id],
-                    "source_file_scopes": [file_scope(file_id, file_version_id)],
                     "relation_type": code,
                     "relation_type_code": code,
                     "relation_type_zh": relation_type_zh(rel.get("relation_type")),
                     "relation_level": "mention",
                     "cross_chunk": clean_scalar(rel.get("cross_chunk")),
                     "involved_chunk_ids": split_semicolon(rel.get("involved_chunk_ids")),
-                    "involved_chunk_refs": [f"{file_version_id}::{chunk_id}" for chunk_id in split_semicolon(rel.get("involved_chunk_ids"))],
                     "evidence_json": json_dumps(evidence),
                     "polarity": clean_scalar(rel.get("polarity")) or "positive",
                     "certainty": clean_scalar(rel.get("certainty")) or "certain",
@@ -595,6 +650,7 @@ def upsert_mention_relations(session: Any, *, data: dict[str, Any], file_id: str
             MATCH (b:Mention {{mention_id: row.target_id}})
             MERGE (a)-[r:{cypher_ident('MENTION_' + code)} {{relation_id: row.relation_id}}]->(b)
             SET r += row.props
+            REMOVE r.source_file_scopes, r.involved_chunk_refs
             """,
             rows=rows,
         ).consume()
@@ -607,38 +663,37 @@ def upsert_cluster_relation(
     relation_type: str,
     source_id: str,
     target_id: str,
-    relation_key: str,
+    relation_id: str,
     props: dict[str, Any],
 ) -> None:
     rel_type = cypher_ident("CLUSTERED_" + relation_type)
     existing = session.run(
         f"""
-        MATCH (:EntityCluster {{cluster_id: $source_id}})-[r:{rel_type} {{relation_key: $relation_key}}]->(:EntityCluster {{cluster_id: $target_id}})
+        MATCH (:EntityCluster {{cluster_id: $source_id}})-[r:{rel_type} {{relation_id: $relation_id}}]->(:EntityCluster {{cluster_id: $target_id}})
         RETURN r LIMIT 1
         """,
         source_id=source_id,
         target_id=target_id,
-        relation_key=relation_key,
+        relation_id=relation_id,
     ).single()
     if existing:
         current = dict(existing["r"])
         props["source_file_ids"] = merge_list(current.get("source_file_ids"), props["source_file_ids"])
         props["source_file_version_ids"] = merge_list(current.get("source_file_version_ids"), props["source_file_version_ids"])
-        props["source_file_scopes"] = merge_list(current.get("source_file_scopes"), props["source_file_scopes"])
         props["involved_chunk_ids"] = merge_list(current.get("involved_chunk_ids"), props["involved_chunk_ids"])
-        props["involved_chunk_refs"] = merge_list(current.get("involved_chunk_refs"), props["involved_chunk_refs"])
         props["source_relation_ids"] = merge_list(current.get("source_relation_ids"), props["source_relation_ids"])
         props["evidence_json"] = json_dumps(merge_json_evidence(current.get("evidence_json"), parse_json_list(props["evidence_json"])))
     session.run(
         f"""
         MATCH (a:EntityCluster {{cluster_id: $source_id}})
         MATCH (b:EntityCluster {{cluster_id: $target_id}})
-        MERGE (a)-[r:{rel_type} {{relation_key: $relation_key}}]->(b)
+        MERGE (a)-[r:{rel_type} {{relation_id: $relation_id}}]->(b)
         SET r += $props
+        REMOVE r.relation_key, r.source_file_scopes, r.involved_chunk_refs
         """,
         source_id=source_id,
         target_id=target_id,
-        relation_key=relation_key,
+        relation_id=relation_id,
         props=props,
     ).consume()
 
@@ -664,24 +719,21 @@ def upsert_cluster_relations(
             continue
         polarity = clean_scalar(rel.get("polarity")) or "positive"
         certainty = clean_scalar(rel.get("certainty")) or "certain"
-        relation_key = f"{source_id}|{code}|{target_id}|{polarity}|{certainty}"
+        relation_id = f"{source_id}|{code}|{target_id}|{polarity}|{certainty}"
         involved_chunk_ids = split_semicolon(rel.get("involved_chunk_ids"))
         evidence = enrich_evidence(rel.get("evidence") or [], file_id=file_id, file_version_id=file_version_id)
         props = {
-            "relation_id": relation_key,
-            "relation_key": relation_key,
+            "relation_id": relation_id,
             "file_id": file_id,
             "file_version_id": file_version_id,
             "source_file_ids": [file_id],
             "source_file_version_ids": [file_version_id],
-            "source_file_scopes": [file_scope(file_id, file_version_id)],
             "relation_type": code,
             "relation_type_code": code,
             "relation_type_zh": relation_type_zh(rel.get("relation_type")),
             "relation_level": "clustered",
             "cross_chunk": clean_scalar(rel.get("cross_chunk")),
             "involved_chunk_ids": involved_chunk_ids,
-            "involved_chunk_refs": [f"{file_version_id}::{chunk_id}" for chunk_id in involved_chunk_ids],
             "evidence_json": json_dumps(evidence),
             "source_relation_ids": dedupe_keep_order(rel.get("source_relation_ids") or [f"{file_version_id}#clustered#{index}"]),
             "polarity": polarity,
@@ -693,7 +745,7 @@ def upsert_cluster_relations(
             relation_type=code,
             source_id=source_id,
             target_id=target_id,
-            relation_key=relation_key,
+            relation_id=relation_id,
             props=props,
         )
         count += 1
