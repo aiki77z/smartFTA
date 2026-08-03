@@ -1,0 +1,96 @@
+{
+  "rows": 213,
+  "error_rows": 0,
+  "main_metrics": {
+    "entity_strict_span_type": {
+      "tp": 164,
+      "fp": 990,
+      "fn": 935,
+      "precision": 0.14211438474870017,
+      "recall": 0.1492265696087352,
+      "f1": 0.14558366622281405
+    },
+    "entity_loose_span_type": {
+      "tp": 610,
+      "fp": 641,
+      "fn": 587,
+      "precision": 0.4876099120703437,
+      "recall": 0.5096073517126148,
+      "f1": 0.4983660130718954
+    },
+    "entity_normalized": {
+      "tp": 579,
+      "fp": 394,
+      "fn": 383,
+      "precision": 0.5950668036998972,
+      "recall": 0.6018711018711018,
+      "f1": 0.5984496124031007
+    },
+    "entity_mention_type": {
+      "tp": 586,
+      "fp": 376,
+      "fn": 376,
+      "precision": 0.6091476091476091,
+      "recall": 0.6091476091476091,
+      "f1": 0.6091476091476091
+    },
+    "entity_evidence_exact": {
+      "tp": 163,
+      "fp": 991,
+      "fn": 936,
+      "precision": 0.1412478336221837,
+      "recall": 0.1483166515013649,
+      "f1": 0.14469596094096762
+    },
+    "entity_evidence_text_type": {
+      "tp": 616,
+      "fp": 398,
+      "fn": 414,
+      "precision": 0.6074950690335306,
+      "recall": 0.5980582524271845,
+      "f1": 0.6027397260273972
+    },
+    "relation_strict_triple": {
+      "tp": 263,
+      "fp": 299,
+      "fn": 362,
+      "precision": 0.4679715302491103,
+      "recall": 0.4208,
+      "f1": 0.44313395113732096
+    }
+  },
+  "secondary_metrics": {
+    "relation_triple_with_polarity_certainty": {
+      "tp": 240,
+      "fp": 322,
+      "fn": 386,
+      "precision": 0.42704626334519574,
+      "recall": 0.38338658146964855,
+      "f1": 0.40404040404040403
+    },
+    "logic_group": {
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0
+    }
+  },
+  "counts": {
+    "pred_entity_spans": 1251,
+    "gold_entity_spans": 1197,
+    "pred_normalized_entities": 973,
+    "gold_normalized_entities": 962,
+    "pred_mentions": 962,
+    "gold_mentions": 962,
+    "pred_evidence_exact": 1154,
+    "gold_evidence_exact": 1099,
+    "pred_evidence_text_type": 1014,
+    "gold_evidence_text_type": 1030,
+    "pred_relations": 562,
+    "gold_relations": 625,
+    "pred_logic_groups": 0,
+    "gold_logic_groups": 1
+  }
+}

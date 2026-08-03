@@ -1,0 +1,194 @@
+{
+  "rows": 213,
+  "error_rows": 0,
+  "main_metrics": {
+    "entity_strict_span_type": {
+      "tp": 112,
+      "fp": 1115,
+      "fn": 987,
+      "precision": 0.09127954360228199,
+      "recall": 0.10191082802547771,
+      "f1": 0.09630266552020636
+    },
+    "entity_loose_span_type": {
+      "tp": 542,
+      "fp": 770,
+      "fn": 655,
+      "precision": 0.41310975609756095,
+      "recall": 0.4527986633249791,
+      "f1": 0.43204463929852527
+    },
+    "entity_normalized": {
+      "tp": 559,
+      "fp": 435,
+      "fn": 403,
+      "precision": 0.562374245472837,
+      "recall": 0.581081081081081,
+      "f1": 0.5715746421267893
+    },
+    "entity_mention_type": {
+      "tp": 571,
+      "fp": 420,
+      "fn": 391,
+      "precision": 0.5761856710393541,
+      "recall": 0.5935550935550935,
+      "f1": 0.5847414234511008
+    },
+    "entity_evidence_exact": {
+      "tp": 107,
+      "fp": 1120,
+      "fn": 992,
+      "precision": 0.08720456397718011,
+      "recall": 0.09736123748862602,
+      "f1": 0.09200343938091142
+    },
+    "entity_evidence_text_type": {
+      "tp": 590,
+      "fp": 419,
+      "fn": 440,
+      "precision": 0.5847373637264618,
+      "recall": 0.5728155339805825,
+      "f1": 0.5787150564001962
+    },
+    "relation_strict_triple": {
+      "tp": 227,
+      "fp": 327,
+      "fn": 398,
+      "precision": 0.40974729241877256,
+      "recall": 0.3632,
+      "f1": 0.3850720949957591
+    }
+  },
+  "secondary_metrics": {
+    "relation_triple_with_polarity_certainty": {
+      "tp": 188,
+      "fp": 366,
+      "fn": 438,
+      "precision": 0.33935018050541516,
+      "recall": 0.3003194888178914,
+      "f1": 0.31864406779661014
+    },
+    "logic_group": {
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0
+    },
+    "entity_normalized_hybrid": {
+      "tp": 582,
+      "fp": 452,
+      "fn": 380,
+      "precision": 0.562862669245648,
+      "recall": 0.604989604989605,
+      "f1": 0.5831663326653306
+    },
+    "entity_normalized_soft": {
+      "soft_tp": 583.999637770321,
+      "pred": 1034,
+      "gold": 962,
+      "precision": 0.5647965549035986,
+      "recall": 0.6070682305304792,
+      "f1": 0.5851699777257725
+    },
+    "entity_normalized_semantic_details": {
+      "threshold": 0.85,
+      "soft_floor": 0.7,
+      "soft_ceiling": 0.9,
+      "extractable_gold": 886,
+      "abstractive_gold": 76,
+      "exact_matches": 560,
+      "semantic_matches": 22
+    },
+    "entity_normalized_semantic_all": {
+      "tp": 653,
+      "fp": 381,
+      "fn": 309,
+      "precision": 0.6315280464216635,
+      "recall": 0.6787941787941788,
+      "f1": 0.6543086172344691
+    },
+    "entity_normalized_semantic_all_soft": {
+      "soft_tp": 665.9340870162498,
+      "pred": 1034,
+      "gold": 962,
+      "precision": 0.6440368346385394,
+      "recall": 0.6922391756925673,
+      "f1": 0.6672686242647793
+    },
+    "entity_normalized_semantic_all_details": {
+      "threshold": 0.85,
+      "soft_floor": 0.7,
+      "soft_ceiling": 0.9,
+      "extractable_gold": 886,
+      "abstractive_gold": 76,
+      "exact_matches": 560,
+      "semantic_matches": 93
+    },
+    "relation_semantic_triple": {
+      "tp": 270,
+      "fp": 284,
+      "fn": 355,
+      "precision": 0.48736462093862815,
+      "recall": 0.432,
+      "f1": 0.4580152671755725
+    },
+    "relation_semantic_triple_soft": {
+      "soft_tp": 332.8603802850885,
+      "pred": 554,
+      "gold": 625,
+      "precision": 0.6008310113449251,
+      "recall": 0.5325766084561416,
+      "f1": 0.5646486518831019
+    },
+    "relation_semantic_triple_details": {
+      "threshold": 0.85,
+      "soft_floor": 0.7,
+      "soft_ceiling": 0.9,
+      "exact_matches": 227,
+      "semantic_matches": 43,
+      "with_attrs": false
+    },
+    "relation_semantic_triple_with_polarity_certainty": {
+      "tp": 225,
+      "fp": 329,
+      "fn": 401,
+      "precision": 0.40613718411552346,
+      "recall": 0.35942492012779553,
+      "f1": 0.38135593220338987
+    },
+    "relation_semantic_triple_with_polarity_certainty_soft": {
+      "soft_tp": 283.230230400026,
+      "pred": 554,
+      "gold": 626,
+      "precision": 0.5112459032491444,
+      "recall": 0.4524444575080288,
+      "f1": 0.48005123796614585
+    },
+    "relation_semantic_triple_with_polarity_certainty_details": {
+      "threshold": 0.85,
+      "soft_floor": 0.7,
+      "soft_ceiling": 0.9,
+      "exact_matches": 188,
+      "semantic_matches": 37,
+      "with_attrs": true
+    }
+  },
+  "counts": {
+    "pred_entity_spans": 1312,
+    "gold_entity_spans": 1197,
+    "pred_normalized_entities": 994,
+    "gold_normalized_entities": 962,
+    "pred_mentions": 991,
+    "gold_mentions": 962,
+    "pred_evidence_exact": 1227,
+    "gold_evidence_exact": 1099,
+    "pred_evidence_text_type": 1009,
+    "gold_evidence_text_type": 1030,
+    "pred_relations": 554,
+    "gold_relations": 625,
+    "pred_logic_groups": 0,
+    "gold_logic_groups": 1
+  }
+}
