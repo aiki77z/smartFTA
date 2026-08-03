@@ -342,39 +342,71 @@ function buildLayout(nodes, edges) {
     overlaysByParent.set(parentId, list)
   })
 
-  const overlaySlots = []
-  const reserveOverlayPosition = (cx, cy) => {
-    let nextCy = cy
-    let guard = 0
-    while (
-      overlaySlots.some((slot) => Math.abs(slot.cx - cx) < 150 && Math.abs(slot.cy - nextCy) < 68) &&
-      guard < 12
-    ) {
-      nextCy += 72
-      guard += 1
-    }
-    overlaySlots.push({ cx, cy: nextCy })
-    return { cx, cy: nextCy }
+  const placedRects = Array.from(adjustedCenters.entries())
+    .filter(([id]) => !overlayNodeIds.has(id))
+    .map(([id, c]) => ({
+      id,
+      cx: c.cx,
+      cy: c.cy,
+      w: EVENT_NODE_W + 34,
+      h: 74,
+    }))
+  const rectOverlapArea = (a, b) => {
+    const dx = Math.max(0, (a.w + b.w) / 2 - Math.abs(a.cx - b.cx))
+    const dy = Math.max(0, (a.h + b.h) / 2 - Math.abs(a.cy - b.cy))
+    return dx * dy
+  }
+  const chooseOverlayPosition = (node, parent, localIndex) => {
+    const kind = node?.meta?.overlayKind
+    const preferredSide = kind === 'triggerRule' ? -1 : 1
+    const candidates = []
+    const baseDistances = [210, 280, 360, 450]
+    const yOffsets = [0, -88, 88, -168, 168, -252, 252]
+    baseDistances.forEach((distance, ringIndex) => {
+      yOffsets.forEach((dy) => {
+        candidates.push({ cx: parent.cx + preferredSide * distance, cy: parent.cy + dy })
+        candidates.push({ cx: parent.cx - preferredSide * distance, cy: parent.cy + dy })
+      })
+      candidates.push({ cx: parent.cx, cy: parent.cy - 170 - ringIndex * 95 })
+      candidates.push({ cx: parent.cx, cy: parent.cy + 170 + ringIndex * 95 })
+    })
+    const shift = (localIndex % 3) * 34
+    const scored = candidates.map((candidate) => {
+      const shifted = { cx: candidate.cx, cy: candidate.cy + shift }
+      const rect = { ...shifted, w: EVENT_NODE_W + 30, h: 70 }
+      const overlap = placedRects.reduce((sum, other) => sum + rectOverlapArea(rect, other), 0)
+      const distance = Math.hypot(shifted.cx - parent.cx, shifted.cy - parent.cy)
+      const sidePenalty =
+        Math.sign(shifted.cx - parent.cx || preferredSide) === preferredSide ? 0 : 80
+      const verticalPenalty = Math.abs(shifted.cy - parent.cy) * 0.12
+      return {
+        ...shifted,
+        score: overlap * 1000 + distance + sidePenalty + verticalPenalty,
+      }
+    })
+    scored.sort((a, b) => a.score - b.score)
+    const best = scored[0] || { cx: parent.cx + preferredSide * 260, cy: parent.cy }
+    placedRects.push({
+      id: node.id,
+      cx: best.cx,
+      cy: best.cy,
+      w: EVENT_NODE_W + 30,
+      h: 70,
+    })
+    return { cx: best.cx, cy: best.cy }
   }
 
-  overlaysByParent.forEach((list, parentId) => {
-    const parent = adjustedCenters.get(parentId)
-    const maintenance = list.filter((n) => n?.meta?.overlayKind === 'maintenance')
-    const triggerRules = list.filter((n) => n?.meta?.overlayKind === 'triggerRule')
-    const placeSide = (items, side) => {
-      const xOffset = side === 'right' ? 245 : -245
-      const gapY = 76
-      const startY = parent.cy - ((items.length - 1) * gapY) / 2
-      items.forEach((item, idx) => {
-        adjustedCenters.set(
-          item.id,
-          reserveOverlayPosition(parent.cx + xOffset, startY + idx * gapY),
-        )
-      })
-    }
-    placeSide(maintenance, 'right')
-    placeSide(triggerRules, 'left')
-  })
+  Array.from(overlaysByParent.entries())
+    .sort(([a], [b]) => (adjustedCenters.get(a)?.cy || 0) - (adjustedCenters.get(b)?.cy || 0))
+    .forEach(([parentId, list]) => {
+      const parent = adjustedCenters.get(parentId)
+      list
+        .slice()
+        .sort((a, b) => String(a?.meta?.overlayKind || '').localeCompare(String(b?.meta?.overlayKind || '')))
+        .forEach((item, idx) => {
+          adjustedCenters.set(item.id, chooseOverlayPosition(item, parent, idx))
+        })
+    })
 
   const rfNodes = nodes.map((n) => {
     const c = adjustedCenters.get(n.id) || centerMap.get(n.id)

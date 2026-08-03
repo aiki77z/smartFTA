@@ -623,7 +623,7 @@ function buildKnowledgeOverlayGraph(graphData, { showMaintenance, showTriggerRul
       source: nodeId,
       target: parentNode.id,
       relation: relationType,
-      type: 'default',
+      type: 'simplebezier',
       style: {
         stroke: kind === 'maintenance' ? '#ea580c' : '#7c3aed',
         strokeWidth: 2,
