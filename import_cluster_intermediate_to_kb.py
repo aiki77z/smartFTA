@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from env_loader import load_local_env
+from top_event_catalog_utils import (
+    build_top_event_embedding_fields,
+    build_top_event_semantic_text,
+    load_top_event_embedding_env,
+    normalize_catalog_name,
+)
 
 try:
     from neo4j import GraphDatabase
@@ -552,7 +558,15 @@ def import_top_event_catalog(data: dict[str, Any], *, file_id: str, file_version
             continue
         aliases = dedupe_keep_order(cluster.get("aliases") or [])
         source_chunk_ids = split_semicolon(cluster.get("chunk_ids")) if isinstance(cluster.get("chunk_ids"), str) else dedupe_keep_order(cluster.get("chunk_ids") or [])
-        normalized_name = re.sub(r"\s+", "", canonical_name)
+        normalized_name = normalize_catalog_name(canonical_name)
+        normalized_aliases = [normalize_catalog_name(alias) for alias in aliases if alias and alias != canonical_name]
+        semantic_text = build_top_event_semantic_text(
+            canonical_name,
+            normalized_name=normalized_name,
+            aliases=[alias for alias in aliases if alias != canonical_name] + normalized_aliases,
+        )
+        existing = db["top_event_catalog"].find_one({"_id": top_event_doc_id(file_version_id, normalized_name)}) or {}
+        embedding_payload = build_top_event_embedding_fields(semantic_text, existing=existing)
         doc = {
             "_id": top_event_doc_id(file_version_id, normalized_name),
             "file_id": file_id,
@@ -563,12 +577,12 @@ def import_top_event_catalog(data: dict[str, Any], *, file_id: str, file_version
             "display_name": canonical_name,
             "normalized_name": normalized_name,
             "aliases": [alias for alias in aliases if alias != canonical_name],
-            "normalized_aliases": [re.sub(r"\s+", "", alias) for alias in aliases if alias and alias != canonical_name],
+            "normalized_aliases": normalized_aliases,
             "source_chunk_ids": source_chunk_ids,
             "graph_node_id": clean_scalar(cluster.get("cluster_id")),
             "mention_count": int(cluster.get("mention_count") or len(cluster.get("mention_ids") or [])),
             "evidence_json": json_dumps(cluster.get("evidence") or []),
-            "semantic_text": "；".join(dedupe_keep_order([canonical_name] + aliases)),
+            **embedding_payload,
             "updated_at": now,
         }
         db["top_event_catalog"].update_one(
@@ -594,7 +608,7 @@ def main() -> None:
     parser.add_argument("--no-clear-mongo", action="store_true")
     args = parser.parse_args()
 
-    load_local_env(args.env_file, override=True)
+    load_top_event_embedding_env(args.env_file)
     path = Path(args.intermediate_json)
     data = json.loads(path.read_text(encoding="utf-8"))
     file_id = clean_scalar(args.file_id) or clean_scalar(data.get("file_id"))

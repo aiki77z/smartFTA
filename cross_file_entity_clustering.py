@@ -24,6 +24,12 @@ from import_cluster_intermediate_to_kb import (
     relation_type_zh,
     split_semicolon,
 )
+from top_event_catalog_utils import (
+    build_top_event_embedding_fields,
+    build_top_event_semantic_text,
+    load_top_event_embedding_env,
+    normalize_catalog_name,
+)
 
 try:
     from neo4j import GraphDatabase
@@ -779,6 +785,14 @@ def upsert_top_event_catalog(
             existing.get("source_file_version_ids") or ([existing.get("file_version_id")] if existing.get("file_version_id") else []),
             [file_version_id],
         )
+        normalized_name = normalize_catalog_name(clean_scalar(existing.get("normalized_name")) or canonical)
+        normalized_aliases = merge_list(existing.get("normalized_aliases"), [normalize_catalog_name(alias) for alias in aliases])
+        semantic_text = build_top_event_semantic_text(
+            clean_scalar(existing.get("name")) or canonical,
+            normalized_name=normalized_name,
+            aliases=merge_list(existing.get("aliases"), aliases) + normalized_aliases,
+        )
+        embedding_payload = build_top_event_embedding_fields(semantic_text, existing=existing)
         doc = {
             "_id": f"cluster::{mapped_cluster_id}",
             "graph_node_id": mapped_cluster_id,
@@ -791,13 +805,13 @@ def upsert_top_event_catalog(
             "is_active": True,
             "name": clean_scalar(existing.get("name")) or canonical,
             "display_name": clean_scalar(existing.get("display_name")) or canonical,
-            "normalized_name": normalize_name(clean_scalar(existing.get("normalized_name")) or canonical),
+            "normalized_name": normalized_name,
             "aliases": merge_list(existing.get("aliases"), aliases),
-            "normalized_aliases": merge_list(existing.get("normalized_aliases"), [normalize_name(alias) for alias in aliases]),
+            "normalized_aliases": normalized_aliases,
             "source_chunk_ids": merge_list(existing.get("source_chunk_ids"), evidence_chunk_ids(evidence)),
             "chunk_refs": merge_list(existing.get("chunk_refs"), evidence_chunk_refs(evidence, file_version_id)),
             "evidence_json": json_dumps(merge_json_evidence(existing.get("evidence_json"), evidence)),
-            "semantic_text": "；".join(dedupe_keep_order([canonical, *aliases])),
+            **embedding_payload,
             "updated_at": now,
         }
         db.top_event_catalog.update_one(
@@ -847,7 +861,7 @@ def main() -> None:
     if GraphDatabase is None:
         raise RuntimeError("neo4j package is not installed")
 
-    load_local_env(args.env_file, override=True)
+    load_top_event_embedding_env(args.env_file)
     data = json.loads(Path(args.intermediate_json).read_text(encoding="utf-8"))
     file_id = clean_scalar(args.file_id) or clean_scalar(data.get("file_id"))
     if not file_id:
