@@ -17,7 +17,13 @@ import { toPng } from 'html-to-image'
 import 'reactflow/dist/style.css'
 
 const EVENT_NODE_W = 140
-const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '底事件' }
+const TYPE_LABELS = {
+  top: '顶事件',
+  intermediate: '中间事件',
+  basic: '底事件',
+  maintenance: '维修方法',
+  triggerRule: '触发规则',
+}
 const FITVIEW_PADDING = 0.15
 
 function getErrorLevelCategory(errorLevel) {
@@ -173,9 +179,20 @@ const nodeTypes = {
 function buildLayout(nodes, edges) {
   if (!nodes.length) return { rfNodes: [], rfEdges: [] }
 
+  const overlayNodes = nodes.filter((n) => n?.meta?.overlayKind)
+  const mainNodes = nodes.filter((n) => !n?.meta?.overlayKind)
+  const layoutNodes = mainNodes.length ? mainNodes : nodes
+  const overlayNodeIds = new Set(overlayNodes.map((n) => n.id))
+  const layoutEdges = edges.filter(
+    (e) =>
+      !e?.meta?.overlayRelation &&
+      !overlayNodeIds.has(e.source) &&
+      !overlayNodeIds.has(e.target),
+  )
+
   const childrenOf = new Map()
-  nodes.forEach((n) => childrenOf.set(n.id, []))
-  edges.forEach((e) => {
+  layoutNodes.forEach((n) => childrenOf.set(n.id, []))
+  layoutEdges.forEach((e) => {
     if (childrenOf.has(e.target)) {
       childrenOf.get(e.target).push(e.source)
     }
@@ -204,17 +221,17 @@ function buildLayout(nodes, edges) {
   }
 
   // 预先为所有节点计算子树宽度
-  nodes.forEach((n) => {
+  layoutNodes.forEach((n) => {
     getWidth(n.id)
   })
 
-  const allSources = new Set(edges.map((e) => e.source))
+  const allSources = new Set(layoutEdges.map((e) => e.source))
 
   // 根节点选择策略：
   // 1）若存在多个顶事件，优先选“子树宽度最大”的顶事件（通常是主故障树）
   // 2）否则，选没有父节点的事件
   // 3）再否则，退回第一个节点
-  const topNodes = nodes.filter((n) => n.type === 'top')
+  const topNodes = layoutNodes.filter((n) => n.type === 'top')
   let root
   if (topNodes.length > 0) {
     root = topNodes.reduce((best, n) => {
@@ -224,8 +241,8 @@ function buildLayout(nodes, edges) {
     }, topNodes[0])
   } else {
     root =
-      nodes.find((n) => !allSources.has(n.id)) ||
-      nodes[0]
+      layoutNodes.find((n) => !allSources.has(n.id)) ||
+      layoutNodes[0]
   }
 
   const centerMap = new Map()
@@ -250,7 +267,7 @@ function buildLayout(nodes, edges) {
   // 在主树下方按“类型分行、同类型横向排布”的方式尽量分散：
   // 顶事件一排、中间事件一排，底事件一排。
   const placedIds = new Set(centerMap.keys())
-  if (placedIds.size < nodes.length) {
+  if (placedIds.size < layoutNodes.length) {
     let maxCy = 0
     centerMap.forEach((c) => {
       if (c.cy > maxCy) maxCy = c.cy
@@ -263,7 +280,7 @@ function buildLayout(nodes, edges) {
       other: [],
     }
 
-    nodes.forEach((n) => {
+    layoutNodes.forEach((n) => {
       if (centerMap.has(n.id)) return
       if (n.type === 'top') rows.top.push(n)
       else if (n.type === 'intermediate') rows.intermediate.push(n)
@@ -316,6 +333,49 @@ function buildLayout(nodes, edges) {
     adjustedCenters.set(id, { cx: offsetCx, cy: c.cy })
   })
 
+  const overlaysByParent = new Map()
+  overlayNodes.forEach((n) => {
+    const parentId = n?.meta?.overlayForNodeId
+    if (!parentId || !adjustedCenters.has(parentId)) return
+    const list = overlaysByParent.get(parentId) || []
+    list.push(n)
+    overlaysByParent.set(parentId, list)
+  })
+
+  const overlaySlots = []
+  const reserveOverlayPosition = (cx, cy) => {
+    let nextCy = cy
+    let guard = 0
+    while (
+      overlaySlots.some((slot) => Math.abs(slot.cx - cx) < 150 && Math.abs(slot.cy - nextCy) < 68) &&
+      guard < 12
+    ) {
+      nextCy += 72
+      guard += 1
+    }
+    overlaySlots.push({ cx, cy: nextCy })
+    return { cx, cy: nextCy }
+  }
+
+  overlaysByParent.forEach((list, parentId) => {
+    const parent = adjustedCenters.get(parentId)
+    const maintenance = list.filter((n) => n?.meta?.overlayKind === 'maintenance')
+    const triggerRules = list.filter((n) => n?.meta?.overlayKind === 'triggerRule')
+    const placeSide = (items, side) => {
+      const xOffset = side === 'right' ? 245 : -245
+      const gapY = 76
+      const startY = parent.cy - ((items.length - 1) * gapY) / 2
+      items.forEach((item, idx) => {
+        adjustedCenters.set(
+          item.id,
+          reserveOverlayPosition(parent.cx + xOffset, startY + idx * gapY),
+        )
+      })
+    }
+    placeSide(maintenance, 'right')
+    placeSide(triggerRules, 'left')
+  })
+
   const rfNodes = nodes.map((n) => {
     const c = adjustedCenters.get(n.id) || centerMap.get(n.id)
     const isGate = n.type === 'gate'
@@ -342,10 +402,15 @@ function buildLayout(nodes, edges) {
       id: e.id || `${e.source}-${e.target}`,
       source: rfSource,
       target: rfTarget,
-      type: isFromGate ? 'smoothstep' : 'straight',
-      pathOptions: isFromGate ? { borderRadius: 0 } : undefined,
+      type: e.type || (isFromGate ? 'smoothstep' : 'straight'),
+      pathOptions:
+        e.type === 'step'
+          ? { borderRadius: 0 }
+          : isFromGate
+            ? { borderRadius: 0 }
+            : undefined,
       animated: false,
-      style: { strokeWidth: 2, stroke: '#64748b' },
+      style: { strokeWidth: 2, stroke: '#64748b', ...(e.style || {}) },
       data: {
         rawEdge: e,
         meta: e.meta || {},
@@ -357,8 +422,7 @@ function buildLayout(nodes, edges) {
   return { rfNodes, rfEdges }
 }
 
-function FitViewButton({ resetLayout, onResetViewFlag }) {
-  const { fitView } = useReactFlow()
+function FitViewButton({ resetLayout, onResetViewFlag, onFitMainView }) {
   return (
     <Panel position="top-right">
       <button
@@ -368,12 +432,7 @@ function FitViewButton({ resetLayout, onResetViewFlag }) {
           resetLayout()
           onResetViewFlag?.()
           setTimeout(() => {
-            fitView({
-              padding: FITVIEW_PADDING,
-              duration: 350,
-              maxZoom: 1.5,
-              minZoom: 0.1,
-            })
+            onFitMainView?.()
           }, 50)
         }}
       >
@@ -566,18 +625,29 @@ function CanvasInner({
   const [miniMapOpen, setMiniMapOpen] = useState(true)
   const { getNodes, fitView } = useReactFlow()
 
+  const fitVisibleView = useCallback(() => {
+    const nodesForView = getNodes()
+    fitView({
+      nodes: nodesForView.map((node) => ({ id: node.id })),
+      padding: FITVIEW_PADDING,
+      duration: 350,
+      maxZoom: 1.5,
+      minZoom: 0.1,
+    })
+  }, [fitView, getNodes])
+
   useEffect(() => {
     /* eslint-disable react-hooks/set-state-in-effect */
     setNodes(init.rfNodes)
     setEdges(init.rfEdges)
     if (!userAdjustedView) {
       setTimeout(
-        () => fitView({ padding: FITVIEW_PADDING, duration: 350 }),
+        () => fitVisibleView(),
         80,
       )
     }
     /* eslint-enable react-hooks/set-state-in-effect */
-  }, [init, fitView, userAdjustedView])
+  }, [init, fitVisibleView, userAdjustedView])
 
   const exportImage = useCallback(async () => {
     const currentNodes = getNodes()
@@ -706,6 +776,7 @@ function CanvasInner({
               setEdges(init.rfEdges)
             }}
             onResetViewFlag={() => setUserAdjustedView(false)}
+            onFitMainView={fitVisibleView}
           />
           <LegendPanel viewMode={viewMode} position={legendPosition} />
         </>

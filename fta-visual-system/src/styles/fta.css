@@ -2850,6 +2850,54 @@
   color: #374151;
 }
 
+.fta-node--maintenance {
+  background: #fff7ed;
+  border: 3px solid #ea580c;
+  color: #9a3412;
+  border-radius: 0;
+  font-size: 16px;
+}
+
+.fta-node--triggerRule {
+  background: #f5f3ff;
+  border: 3px solid #7c3aed;
+  color: #5b21b6;
+  border-radius: 0;
+  font-size: 16px;
+}
+
+.fta-node--maintenance .fta-node__type-tag {
+  background: #ea580c;
+  color: #fff;
+}
+
+.fta-node--triggerRule .fta-node__type-tag {
+  background: #7c3aed;
+  color: #fff;
+}
+
+.fta-layout--dark .fta-node--maintenance {
+  background: #431407;
+  border-color: #fb923c;
+  color: #ffedd5;
+}
+
+.fta-layout--dark .fta-node--triggerRule {
+  background: #2e1065;
+  border-color: #a78bfa;
+  color: #ede9fe;
+}
+
+.fta-layout--dark .fta-node--maintenance .fta-node__type-tag {
+  background: #fb923c;
+  color: #1f2937;
+}
+
+.fta-layout--dark .fta-node--triggerRule .fta-node__type-tag {
+  background: #a78bfa;
+  color: #1f2937;
+}
+
 .fta-assistant-markdown {
   display: block;
   white-space: normal;

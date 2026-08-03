@@ -67,7 +67,13 @@ import '../styles/fta.css'
 import '../styles/fta-error-level.css'
 import '../styles/fta-probability.css'
 
-const TYPE_LABELS = { top: '顶事件', intermediate: '中间事件', basic: '底事件' }
+const TYPE_LABELS = {
+  top: '顶事件',
+  intermediate: '中间事件',
+  basic: '底事件',
+  maintenance: '维修方法',
+  triggerRule: '触发规则',
+}
 const EVENT_TYPES = ['top', 'intermediate', 'basic']
 // 当快照 JSON 文本过长时，/fta-viewer?snapshot=... 可能触发 Vite 431（Request Header Fields Too Large）
 // 这里先用“文本长度”做前置限制，避免高保真导出直接失败。
@@ -552,6 +558,148 @@ function normalizeToGraph(raw) {
   return { nodes: [], edges: [] }
 }
 
+function splitReadableItems(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((x) => (typeof x === 'string' ? x : x?.name || x?.text || x?.label || ''))
+      .map((x) => String(x || '').trim())
+      .filter(Boolean)
+  }
+  return String(value || '')
+    .split(/[；;\n\r]+/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+}
+
+function makeOverlayNodeId(kind, eventNodeId, index) {
+  return `overlay-${kind}-${eventNodeId}-${index}`
+}
+
+function buildKnowledgeOverlayGraph(graphData, { showMaintenance, showTriggerRules } = {}) {
+  if (!graphData || (!showMaintenance && !showTriggerRules)) return graphData
+  const nodes = [...(graphData.nodes || [])]
+  const edges = [...(graphData.edges || [])]
+  const existingNodeIds = new Set(nodes.map((n) => String(n.id)))
+  const existingEdgeIds = new Set(edges.map((e) => String(e.id)))
+
+  const addOverlay = ({ kind, parentNode, label, relationType, relationCode, index, attachment }) => {
+    const cleanLabel = String(label || '').trim()
+    if (!cleanLabel) return
+    const nodeId = makeOverlayNodeId(kind, parentNode.id, index)
+    if (!existingNodeIds.has(nodeId)) {
+      existingNodeIds.add(nodeId)
+      nodes.push({
+        id: nodeId,
+        label: cleanLabel,
+        type: kind === 'maintenance' ? 'maintenance' : 'triggerRule',
+        position: { x: 0, y: 0 },
+        gate: '',
+        meta: {
+          overlayKind: kind,
+          overlayForNodeId: parentNode.id,
+          attachment: attachment || null,
+          event: {
+            id: nodeId,
+            name: cleanLabel,
+            description: cleanLabel,
+            errorLevel: '',
+            priority: 0,
+            probability: null,
+            showProbability: null,
+            rule: kind === 'triggerRule' ? cleanLabel : '',
+            rules: [],
+            investigateMethod: kind === 'maintenance' ? cleanLabel : '',
+            documents: attachment?.documents || parentNode.meta?.event?.documents || [],
+          },
+        },
+      })
+    }
+
+    const edgeId = `${nodeId}-${parentNode.id}`
+    if (existingEdgeIds.has(edgeId)) return
+    existingEdgeIds.add(edgeId)
+    edges.push({
+      id: edgeId,
+      source: nodeId,
+      target: parentNode.id,
+      relation: relationType,
+      type: 'default',
+      style: {
+        stroke: kind === 'maintenance' ? '#ea580c' : '#7c3aed',
+        strokeWidth: 2,
+      },
+      meta: {
+        overlayRelation: true,
+        overlayKind: kind,
+        relation: {
+          relation_type: relationType,
+          relation_type_code: relationCode,
+          polarity: 'positive',
+          certainty: 'certain',
+          source_label: cleanLabel,
+          target_label: parentNode.label,
+          evidence: attachment?.evidence || [],
+          evidence_texts: attachment?.evidence_texts || [cleanLabel],
+          documents: attachment?.documents || parentNode.meta?.event?.documents || [],
+        },
+      },
+    })
+  }
+
+  for (const node of graphData.nodes || []) {
+    if (!node || node.type === 'gate' || node.meta?.overlayKind) continue
+    const event = node.meta?.event || {}
+    if (showMaintenance) {
+      const attachments = Array.isArray(event.kgAttachments?.maintenance) ? event.kgAttachments.maintenance : []
+      const methods = attachments.length
+        ? attachments
+        : splitReadableItems(
+            event.maintenance_methods ||
+              node.meta?.raw?.maintenance_methods ||
+              node.meta?.raw?.graph_props?.maintenance_methods ||
+              event.investigateMethod,
+          ).map((name) => ({ name }))
+      methods.slice(0, 4).forEach((method, idx) => {
+        addOverlay({
+          kind: 'maintenance',
+          parentNode: node,
+          label: method.name || method,
+          relationType: '故障处理',
+          relationCode: 'HANDLED_BY',
+          index: idx,
+          attachment: method,
+        })
+      })
+    }
+    if (showTriggerRules) {
+      const attachments = Array.isArray(event.kgAttachments?.triggerRules) ? event.kgAttachments.triggerRules : []
+      const ruleItems = attachments.length
+        ? attachments
+        : [
+            ...(
+              Array.isArray(event.rules)
+                ? event.rules.map((rule) => formatTriggerRuleNaturalLanguage(rule)).filter(Boolean)
+                : []
+            ),
+            ...splitReadableItems(event.trigger_rule_names || node.meta?.raw?.trigger_rule_names || event.rule),
+          ].filter(Boolean).map((name) => ({ name }))
+      ruleItems.slice(0, 4).forEach((rule, idx) => {
+        addOverlay({
+          kind: 'triggerRule',
+          parentNode: node,
+          label: rule.name || rule,
+          relationType: '规则触发',
+          relationCode: 'TRIGGERED_BY_RULE',
+          index: idx,
+          attachment: rule,
+        })
+      })
+    }
+  }
+
+  return { nodes, edges }
+}
+
 function extractTreeDataForBackend({ rawJsonText, graphData, parsedInfo }) {
   // 优先使用 rawJsonText 中已有的 nodeList/linkList，避免丢字段
   try {
@@ -702,6 +850,8 @@ function FaultTreePage() {
   )
   const [graphData, setGraphData] = useState(initialState.graph)
   const [viewMode, setViewMode] = useState('type')
+  const [showMaintenanceOverlay, setShowMaintenanceOverlay] = useState(false)
+  const [showTriggerRuleOverlay, setShowTriggerRuleOverlay] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [backendTreeId, setBackendTreeId] = useState(treeIdFromQuery || '')
@@ -3128,6 +3278,15 @@ function FaultTreePage() {
     [graphData.nodes.length],
   )
 
+  const displayGraphData = useMemo(
+    () =>
+      buildKnowledgeOverlayGraph(graphData, {
+        showMaintenance: showMaintenanceOverlay,
+        showTriggerRules: showTriggerRuleOverlay,
+      }),
+    [graphData, showMaintenanceOverlay, showTriggerRuleOverlay],
+  )
+
   const hiResDisabled = hiResSnapshotText.length > MAX_HIRES_SNAPSHOT_JSON_LEN
 
   const selectedMeta = selectedNode?.data?.meta
@@ -3744,6 +3903,22 @@ function FaultTreePage() {
               >
                 概率视图
               </button>
+              <button
+                type="button"
+                className={`fta-btn-xs${showMaintenanceOverlay ? ' primary' : ' ghost'}`}
+                onClick={() => setShowMaintenanceOverlay((v) => !v)}
+                title="仅在画布中展示维修方法节点，不影响故障树JSON、校验和保存"
+              >
+                维修方法节点
+              </button>
+              <button
+                type="button"
+                className={`fta-btn-xs${showTriggerRuleOverlay ? ' primary' : ' ghost'}`}
+                onClick={() => setShowTriggerRuleOverlay((v) => !v)}
+                title="仅在画布中展示触发规则节点，不影响故障树JSON、校验和保存"
+              >
+                触发规则节点
+              </button>
             </div>
           </div>
           <div className="fta-canvas-stack">
@@ -3757,7 +3932,7 @@ function FaultTreePage() {
                   className={`fta-canvas-wrapper${exporting ? ' fta-canvas-exporting' : ''}`}
                 >
                   <FaultTreeCanvas
-                    graphData={graphData}
+                    graphData={displayGraphData}
                     onNodeSelect={handleNodeSelect}
                     onNodeContextMenu={handleNodeContextMenu}
                     onPaneContextMenu={handlePaneContextMenu}
@@ -3797,7 +3972,7 @@ function FaultTreePage() {
                         ) : (
                           <EdgeInfoPanel
                             selectedEdge={selectedEdge}
-                            graphData={graphData}
+                            graphData={displayGraphData}
                             onClose={() => setSelectedEdge(null)}
                             onOpenChunks={(ids, activeId) =>
                               openChunkPanel(ids, activeId)
@@ -4171,6 +4346,111 @@ function NodeInfoPanel({
     setRulesError('')
   }, [selectedNode.id, selectedNode.data.label, selectedMeta?.event?.description, selectedMeta?.event?.rules])
   /* eslint-enable react-hooks/set-state-in-effect */
+
+  if (selectedMeta?.overlayKind) {
+    return (
+      <div className="fta-node-panel">
+        <div className="fta-node-panel-header">
+          <div style={{ flex: 1 }}>
+            <div className="fta-node-panel-title">{selectedNode.data.label}</div>
+            <div className="fta-node-panel-subtitle">
+              类型：{TYPE_LABELS[selectedNode.data.type] || selectedNode.data.type} · 展示层节点
+            </div>
+          </div>
+          <button
+            type="button"
+            className="fta-btn ghost fta-node-panel-close-btn"
+            title="关闭"
+            aria-label="关闭"
+            onClick={onClose}
+          >
+            <IconClose />
+          </button>
+        </div>
+        <div className="fta-node-panel-body">
+          <InfoRow label="节点含义" value={selectedNode.data.label} />
+          <InfoRow label="关联事件" value={selectedMeta.overlayForNodeId || ''} />
+          <InfoRow
+            label="说明"
+            value="该节点仅用于知识图谱视图展示，不参与故障树结构校验、AI校验、保存和导出。证据片段与文档溯源请点击它和故障事件之间的关系边查看。"
+          />
+        </div>
+      </div>
+    )
+  }
+
+  if (selectedMeta?.overlayKind && selectedMeta?.__legacyOverlayPanel) {
+    const evidenceTexts = []
+    const overlayDocuments = []
+    return (
+      <div className="fta-node-panel">
+        <div className="fta-node-panel-header">
+          <div style={{ flex: 1 }}>
+            <div className="fta-node-panel-title">{selectedNode.data.label}</div>
+            <div className="fta-node-panel-subtitle">
+              类型：{TYPE_LABELS[selectedNode.data.type] || selectedNode.data.type} · 展示层节点
+            </div>
+          </div>
+          <button
+            type="button"
+            className="fta-btn ghost fta-node-panel-close-btn"
+            title="关闭"
+            aria-label="关闭"
+            onClick={onClose}
+          >
+            <IconClose />
+          </button>
+        </div>
+        <div className="fta-node-panel-body">
+          <InfoRow label="节点含义" value={selectedNode.data.label} />
+          <InfoRow label="关联事件" value={selectedMeta.overlayForNodeId || ''} />
+          <InfoRow
+            label="说明"
+            value="该节点仅用于知识图谱视图展示，不参与故障树结构校验、AI校验、保存和导出。"
+          />
+          <div className="fta-node-panel-row">
+            <span className="fta-node-panel-label">证据片段</span>
+            <div className="fta-node-panel-value" style={{ width: '100%' }}>
+              {!evidenceTexts.length && <div style={{ opacity: 0.7 }}>（空）</div>}
+              {evidenceTexts.map((text, idx) => (
+                <div key={`overlay-evidence-${idx}`} className="fta-doc-tag fta-evidence-text">
+                  {text}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="fta-node-panel-row">
+            <span className="fta-node-panel-label">文档溯源</span>
+            <div className="fta-node-panel-value" style={{ width: '100%' }}>
+              {!overlayDocuments.length && <div style={{ opacity: 0.7 }}>（空）</div>}
+              {overlayDocuments.map((doc, idx) => (
+                <button
+                  type="button"
+                  key={`${makeChunkRefKey(doc)}-${idx}`}
+                  className="fta-doc-card fta-doc-card--clickable"
+                  onClick={() => onOpenChunks?.(overlayDocuments, doc)}
+                  title="点击查看原始 chunk 内容"
+                >
+                  <div className="fta-doc-card-row">
+                    <span className="fta-doc-card-label">chunk_id</span>
+                    <span className="fta-doc-card-value">{doc.chunk_id || '（空）'}</span>
+                  </div>
+                  <div className="fta-doc-card-row">
+                    <span className="fta-doc-card-label">chunk_name</span>
+                    <span className="fta-doc-card-value">{doc.chunk_name || '（空）'}</span>
+                  </div>
+                  <div className="fta-doc-card-row">
+                    <span className="fta-doc-card-label">section_path</span>
+                    <span className="fta-doc-card-value">{doc.section_path || '（空）'}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="fta-node-panel">
