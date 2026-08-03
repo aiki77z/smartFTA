@@ -205,6 +205,8 @@ def import_to_neo4j(data: dict[str, Any], *, file_id: str, file_version_id: str,
                     "mention_id": mention_id,
                     "file_id": file_id,
                     "file_version_id": file_version_id,
+                    "source_file_ids": [file_id],
+                    "source_file_version_ids": [file_version_id],
                     "sample_id": clean_scalar(mention.get("sample_id")),
                     "chapter_id": clean_scalar(mention.get("chapter_id")),
                     "source_type": clean_scalar(mention.get("source_type")),
@@ -236,8 +238,8 @@ def import_to_neo4j(data: dict[str, Any], *, file_id: str, file_version_id: str,
                 "entity_type": cluster_entity_type_code,
                 "props": {
                     "cluster_id": cluster_id,
-                    "file_id": file_id,
-                    "file_version_id": file_version_id,
+                    "source_file_ids": [file_id],
+                    "source_file_version_ids": [file_version_id],
                     "entity_type": cluster_entity_type_code,
                     "entity_type_code": cluster_entity_type_code,
                     "entity_type_zh": cluster_entity_type_zh,
@@ -269,7 +271,18 @@ def import_to_neo4j(data: dict[str, Any], *, file_id: str, file_version_id: str,
             session.run(
                 """
                 MATCH (n)
-                WHERE n.file_id = $file_id AND coalesce(n.file_version_id, '') = $file_version_id
+                WHERE (
+                    n.file_id = $file_id
+                    AND coalesce(n.file_version_id, '') = $file_version_id
+                )
+                OR (
+                    n:EntityCluster
+                    AND $file_version_id IN (
+                        CASE WHEN 'source_file_version_ids' IN keys(n) THEN n['source_file_version_ids']
+                             WHEN 'file_version_id' IN keys(n) THEN [n['file_version_id']]
+                             ELSE [] END
+                    )
+                )
                 DETACH DELETE n
                 """,
                 file_id=file_id,
@@ -301,6 +314,18 @@ def import_to_neo4j(data: dict[str, Any], *, file_id: str, file_version_id: str,
         ).consume()
         merge_node_rows(session, mention_rows, base_label="Mention", id_key="mention_id", extra_label_key="entity_type")
         merge_node_rows(session, cluster_rows, base_label="EntityCluster", id_key="cluster_id", extra_label_key="entity_type")
+        session.run(
+            """
+            MATCH (e:EntityCluster)
+            WHERE $file_version_id IN (
+                CASE WHEN 'source_file_version_ids' IN keys(e) THEN e['source_file_version_ids']
+                     WHEN 'file_version_id' IN keys(e) THEN [e['file_version_id']]
+                     ELSE [] END
+            )
+            REMOVE e.file_id, e.file_version_id
+            """,
+            file_version_id=file_version_id,
+        ).consume()
         session.run(
             """
             UNWIND $rows AS row
@@ -353,6 +378,8 @@ def import_to_neo4j(data: dict[str, Any], *, file_id: str, file_version_id: str,
                         "relation_id": clean_scalar(rel.get("relation_id")),
                         "file_id": file_id,
                         "file_version_id": file_version_id,
+                        "source_file_ids": [file_id],
+                        "source_file_version_ids": [file_version_id],
                         "relation_type": relation_code,
                         "relation_type_code": relation_code,
                         "relation_type_zh": relation_zh,
@@ -399,6 +426,8 @@ def import_to_neo4j(data: dict[str, Any], *, file_id: str, file_version_id: str,
                         "relation_id": relation_id,
                         "file_id": file_id,
                         "file_version_id": file_version_id,
+                        "source_file_ids": [file_id],
+                        "source_file_version_ids": [file_version_id],
                         "relation_type": relation_code,
                         "relation_type_code": relation_code,
                         "relation_type_zh": relation_zh,

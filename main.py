@@ -17,13 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from env_loader import load_local_env
-from import_relations_to_neo4j import (
-    GraphDatabase,
-    clear_graph,
-    ensure_constraints,
-    import_rows,
-    load_json,
-)
 from maintenance_cases import import_maintenance_cases
 from work_order_import import import_work_order_file, profile_work_order_file
 from pr_docx_import import import_pr_docx, profile_pr_docx_file
@@ -32,10 +25,10 @@ from knowledge_store import mark_file_version_import_failed, reserve_file_versio
 
 ROOT_DIR = Path(__file__).parent.resolve()
 load_local_env(ROOT_DIR / ".env", override=True)
-RUN_SCRIPT = ROOT_DIR / "run.py"
+V2_RUN_SCRIPT = ROOT_DIR / "kb_pipeline_v2.py"
 DEFAULT_GENERATE_FTA_BASE_URL = os.getenv("GENERATE_FTA_BASE_URL", "http://127.0.0.1:8000")
 
-app = FastAPI(title="知识库构建与关系抽取服务", version="1.2.0")
+app = FastAPI(title="Knowledge Base Construction Service", version="2.0.0")
 
 logging.basicConfig(
     level=os.getenv("KB_LOG_LEVEL", "INFO").upper(),
@@ -248,6 +241,19 @@ def _build_artifacts_for_dir(pdf_stem: str, result_dir: Path) -> Dict[str, str]:
     }
 
 
+def _build_v2_artifacts(file_id: str, result_dir: Path) -> Dict[str, str]:
+    rd = Path(result_dir).expanduser().resolve()
+    return {
+        "result_dir": str(rd),
+        "chunks_json": str(rd / f"{file_id}_chunks.json"),
+        "llm_csv": str(rd / f"{file_id}.csv"),
+        "raw_llm_jsonl": str(rd / f"{file_id}_raw_llm.jsonl"),
+        "cluster_intermediate_json": str(rd / "entity_clustering" / "cluster_intermediate.json"),
+        "cross_file_diagnostics_jsonl": str(rd / "cross_file_diagnostics.jsonl"),
+        "summary_json": str(rd / f"{file_id}_kb_pipeline_summary.json"),
+    }
+
+
 def _next_version_dir(output_root: Path, file_id: str) -> Path:
     base_dir = output_root / file_id
     max_version = 0
@@ -330,74 +336,82 @@ def _build_generate_fta_contract(
 
 
 def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
-    pdf_stem = _resolve_pdf_stem(request.pdf_path, request.pdf_stem, request.import_only_dir)
-    display_file_name = _resolve_import_display_file_name(request, pdf_stem)
-    artifacts = _build_artifacts(pdf_stem, request.output_dir, request.import_only_dir)
+    file_id = _resolve_pdf_stem(request.pdf_path, request.pdf_stem, request.import_only_dir)
+    file_version_id = (request.file_version_id or f"{file_id}_v1").strip()
+    display_file_name = _resolve_import_display_file_name(request, file_id)
+    result_dir = Path(request.output_dir).expanduser().resolve() / file_id / file_version_id
+    artifacts = _build_v2_artifacts(file_id, result_dir)
     started_at = time.time()
 
     def _mark_reserved_failed(error: object) -> None:
-        if request.file_version_id:
-            mark_file_version_import_failed(request.file_version_id, str(error))
+        if file_version_id:
+            mark_file_version_import_failed(file_version_id, str(error))
 
-    # 使用 -u / PYTHONUNBUFFERED 关闭子进程 stdout 缓冲，确保阶段识别与前端进度能实时推进
-    cmd = [sys.executable, "-u", str(RUN_SCRIPT)]
-    if request.pdf_path:
-        cmd.extend(["--pdf", request.pdf_path])
-    if request.pdf_stem:
-        cmd.extend(["--pdf-stem", request.pdf_stem])
-    if request.file_version_id:
-        cmd.extend(["--file-version-id", request.file_version_id])
     if request.import_only_dir:
-        cmd.extend(["--import-only-dir", request.import_only_dir])
-    else:
-        cmd.extend(["--output-dir", request.output_dir, "--chunk-size", str(request.chunk_size)])
+        msg = "V2 pipeline does not support import_only_dir; pass pdf_path/input file instead."
+        _mark_reserved_failed(msg)
+        _set_job(job_id, {"status": "failed", "stage": "failed", "progress": 100, "error": msg, "message": msg, "finished_at": time.time()})
+        return
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(V2_RUN_SCRIPT),
+        "--env-file",
+        str(ROOT_DIR / ".env"),
+        "--input-file",
+        str(request.pdf_path),
+        "--output-dir",
+        str(request.output_dir),
+        "--file-id",
+        file_id,
+        "--file-version-id",
+        file_version_id,
+        "--file-name",
+        display_file_name,
+        "--chunk-size",
+        str(request.chunk_size),
+        "--source-type",
+        request.source_type,
+        "--file-format",
+        request.file_format or (Path(str(request.pdf_path)).suffix.lower().lstrip(".") or "pdf"),
+        "--chunk-type",
+        request.chunk_type,
+        "--workers",
+        os.getenv("KB_V2_LLM_WORKERS", "1"),
+        "--embedding-backend",
+        os.getenv("KB_V2_EMBEDDING_BACKEND", "none"),
+        "--refinement-merge-mode",
+        os.getenv("KB_V2_REFINEMENT_MERGE_MODE", "single"),
+    ]
     if request.skip_mineru:
         cmd.append("--skip-mineru")
     if request.skip_clean:
         cmd.append("--skip-clean")
-    if request.skip_entity:
-        cmd.append("--skip-entity")
-    if request.skip_relation:
-        cmd.append("--skip-relation")
-    if request.print_raw_text:
-        cmd.append("--print-raw-text")
-    if request.source_type:
-        cmd.extend(["--source-type", request.source_type])
-    if request.file_format:
-        cmd.extend(["--file-format", request.file_format])
-    if request.chunk_type:
-        cmd.extend(["--chunk-type", request.chunk_type])
-    if request.source_record_type:
-        cmd.extend(["--source-record-type", request.source_record_type])
-    if request.source_record_id:
-        cmd.extend(["--source-record-id", request.source_record_id])
+    if request.skip_entity or request.skip_relation:
+        cmd.append("--skip-llm")
+    if not request.sync_to_generate_fta:
+        cmd.append("--skip-cross-file-import")
 
     _set_job(
         job_id,
         {
             "job_id": job_id,
-            "type": "pipeline",
+            "type": "pipeline_v2",
             "status": "running",
             "started_at": started_at,
             "request": request.model_dump(),
-            "pdf_stem": pdf_stem,
-            "file_id": pdf_stem,
-            "file_version_id": request.file_version_id,
+            "pdf_stem": file_id,
+            "file_id": file_id,
+            "file_version_id": file_version_id,
             "version_no": (
-                int(request.file_version_id.rsplit("_v", 1)[1])
-                if request.file_version_id and request.file_version_id.rsplit("_v", 1)[1].isdigit()
+                int(file_version_id.rsplit("_v", 1)[1])
+                if "_v" in file_version_id and file_version_id.rsplit("_v", 1)[1].isdigit()
                 else None
             ),
             "artifacts": artifacts,
-            "integration": _build_generate_fta_contract(
-                artifacts,
-                request.generate_fta_base_url,
-                request.clear_graph_before_import,
-                pdf_stem=pdf_stem,
-                file_name=display_file_name,
-                file_version_id=_resolve_sync_file_version_id(request, artifacts),
-            ),
             "command": cmd,
+            "sync_status": "handled_by_v2_pipeline",
         },
     )
 
@@ -406,33 +420,29 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
     env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
 
-    # 实时输出：逐行读取 run.py 的 stdout，并将阶段/进度同步到 job（便于前端展示“进行到哪一步”）
     stage_progress_map = {
-        "queued": 0,
         "prepare": 3,
-        "parse": 22,
-        "chunk": 40,
-        "entity": 62,
-        "relation": 78,
-        "pipeline_done": 85,
-        "syncing": 92,
+        "parse": 12,
+        "chunk": 35,
+        "entity": 55,
+        "relation": 75,
+        "syncing": 90,
         "success": 100,
         "failed": 100,
-        "completed_with_sync_error": 100,
     }
 
-    def _update_stage(stage: str, message: str):
+    def _update_stage(stage: str, message: str, progress: Optional[int] = None):
         _set_job(
             job_id,
             {
                 "stage": stage,
-                "progress": stage_progress_map.get(stage, 0),
+                "progress": stage_progress_map.get(stage, 0) if progress is None else progress,
                 "message": message,
             },
         )
 
-    _update_stage("prepare", "准备启动流水线…")
-
+    _update_stage("prepare", "Starting KB V2 pipeline")
+    out_lines: list[str] = []
     try:
         proc = subprocess.Popen(
             cmd,
@@ -447,170 +457,69 @@ def _run_pipeline_job(job_id: str, request: PipelineJobRequest):
         )
     except Exception as exc:
         _mark_reserved_failed(exc)
-        # 启动子进程失败（例如找不到 python / 权限 / 路径问题）
-        _set_job(
-            job_id,
-            {
-                "status": "failed",
-                "stage": "failed",
-                "progress": 100,
-                "sync_status": "skipped",
-                "error": f"无法启动流水线进程: {exc}",
-                "message": "无法启动流水线进程",
-                "finished_at": time.time(),
-            },
-        )
+        _set_job(job_id, {"status": "failed", "stage": "failed", "progress": 100, "error": f"Failed to start KB V2 pipeline: {exc}", "message": "Failed to start KB V2 pipeline", "finished_at": time.time()})
         return
-    out_lines = []
+
     if proc.stdout is not None:
         for line in proc.stdout:
             text = (line or "").rstrip("\n")
             out_lines.append(text)
-            # 若子脚本明确打印“错误: ...”，立刻把错误同步到 job，避免前端长期停留在 prepare/parse 阶段
-            if text.startswith("错误:"):
-                _update_stage("failed", text[:260])
-            # 阶段识别：run.py 固定打印 “=== 步骤X: ... ===”
-            if "=== 步骤1: PDF 转 Markdown" in text:
-                _update_stage("parse", "解析文件：PDF 转 Markdown / 清理 Markdown")
-            elif "=== 步骤1.5: 清理 Markdown" in text:
-                _update_stage("parse", "解析文件：PDF 转 Markdown / 清理 Markdown")
-            elif "=== 步骤2: Markdown 分块" in text:
-                _update_stage("chunk", "步骤2：文本分块")
-            elif "=== 步骤3: 实体提取" in text:
-                _update_stage("entity", "步骤3：实体提取")
-            elif "=== 步骤4: 关系提取" in text:
-                _update_stage("relation", "步骤4：关系提取")
-            elif "=== 流水线执行完成 ===" in text:
-                _update_stage("pipeline_done", "流水线已完成，准备同步到故障树后端…")
+            if text.startswith("KB_STAGE="):
+                marker = text.split("=", 1)[1]
+                stage, _, message = marker.partition("|")
+                stage = stage.strip() or "prepare"
+                message = message.strip() or stage
+                _update_stage(stage, message)
+            elif text.startswith("[") and "/" in text and "]" in text:
+                head = text.split("]", 1)[0].strip("[")
+                left, _, right = head.partition("/")
+                if left.strip().isdigit() and right.strip().isdigit() and int(right.strip() or "0") > 0:
+                    done = int(left.strip())
+                    total = int(right.strip())
+                    progress = 55 + int(min(1.0, max(0.0, done / total)) * 18)
+                    _update_stage("entity", f"LLM extraction progress: {done}/{total}", progress)
+            elif "llm_extraction" in text:
+                _update_stage("relation", "LLM extraction finished; preparing clustering")
+            elif "cluster_entities.py" in text:
+                _update_stage("relation", "File-internal entity clustering")
+            elif "cross_file_entity_clustering.py" in text:
+                _update_stage("syncing", "Cross-file clustering and graph import")
 
     return_code = proc.wait()
     stdout_text = "\n".join(out_lines)
-
     finished_at = time.time()
-    base_patch = {
-        "finished_at": finished_at,
-        "duration_seconds": round(finished_at - started_at, 3),
-        "return_code": return_code,
-        "stdout": stdout_text,
-        "stderr": "",
-    }
+    base_patch = {"finished_at": finished_at, "duration_seconds": round(finished_at - started_at, 3), "return_code": return_code, "stdout": stdout_text, "stderr": "", "artifacts": artifacts}
 
     if return_code != 0:
-        tail_lines = stdout_text.splitlines()[-60:]
-        tail = "\n".join(tail_lines).strip()
-        msg = f"流水线失败（return_code={return_code}）。请查看 stdout；末尾摘要：{tail[:2000]}"
+        tail = "\n".join(stdout_text.splitlines()[-60:]).strip()
+        msg = f"KB V2 pipeline failed (return_code={return_code}). Tail: {tail[:2000]}"
         _mark_reserved_failed(msg)
-        _set_job(
-            job_id,
-            {
-                **base_patch,
-                "status": "failed",
-                "stage": "failed",
-                "progress": 100,
-                "sync_status": "skipped",
-                "error": msg,
-                "message": msg,
-            },
-        )
+        _set_job(job_id, {**base_patch, "status": "failed", "stage": "failed", "progress": 100, "sync_status": "skipped", "error": msg, "message": msg})
         return
 
-    # 版本化产物：优先使用 run.py 输出的 VERSION_DIR，避免同步阶段找不到 chunks 文件
-    version_dir = _extract_version_dir_from_stdout(stdout_text)
-    if not version_dir:
-        version_dir = _latest_version_dir(Path(request.output_dir).expanduser().resolve(), pdf_stem)
-    if version_dir:
-        artifacts = _build_artifacts_for_dir(pdf_stem, version_dir)
+    summary = None
+    summary_path = Path(artifacts["summary_json"])
+    if summary_path.exists():
         try:
-            _set_job(
-                job_id,
-                {
-                    "artifacts": artifacts,
-                    "integration": _build_generate_fta_contract(
-                        artifacts,
-                        request.generate_fta_base_url,
-                        request.clear_graph_before_import,
-                        pdf_stem=pdf_stem,
-                        file_name=display_file_name,
-                        file_version_id=_resolve_sync_file_version_id(request, artifacts),
-                    ),
-                },
-            )
-        except Exception:
-            pass
-
-    # 同步前做一次文件存在性校验，给出更明确的错误
-    try:
-        chunks_path = Path(artifacts["chunks_json"]).expanduser().resolve()
-        if not chunks_path.exists():
-            raise RuntimeError(f"chunks_json 不存在: {chunks_path}")
-    except Exception as exc:
-        msg = str(exc)
-        _mark_reserved_failed(msg)
-        _set_job(
-            job_id,
-            {
-                **base_patch,
-                "status": "failed",
-                "stage": "failed",
-                "progress": 100,
-                "sync_status": "skipped",
-                "error": msg,
-                "message": msg,
-            },
-        )
-        return
-
-    if not request.sync_to_generate_fta:
-        _set_job(job_id, {**base_patch, "status": "success", "stage": "success", "progress": 100, "sync_status": "skipped"})
-        return
-
-    _update_stage("syncing", "同步到故障树后端（导入 chunks/entities/relations）…")
-    _set_job(job_id, {**base_patch, "status": "syncing", "sync_status": "running"})
-    try:
-        sync_response = import_knowledge_artifacts_payload(
-            {
-                "chunks_file": artifacts["chunks_json"],
-                "entities_file": None if request.skip_entity else artifacts["entities_merged_json"],
-                "relations_file": None if request.skip_relation else artifacts["relations_jsonl"],
-                "clear_graph": request.clear_graph_before_import,
-                "import_relations": not request.skip_relation,
-                "source": f"knowledge_base_construction:{job_id}",
-                "file_id": pdf_stem,
-                "file_name": display_file_name,
-                "file_version_id": _resolve_sync_file_version_id(request, artifacts),
-            }
-        )
-        _set_job(
-            job_id,
-            {
-                "status": "success",
-                "stage": "success",
-                "progress": 100,
-                "sync_status": "success",
-                "sync_response": sync_response,
-            },
-        )
-    except Exception as exc:
-        # 将同步异常写入 job.message/error，便于前端“导入图谱”阶段直接显示原因
-        sync_err = str(exc)
-        _mark_reserved_failed(sync_err)
-        try:
-            logger.exception("sync to generate-fta failed job=%s err=%s", job_id, sync_err)
-        except Exception:
-            # ignore logging failures
-            pass
-        _set_job(
-            job_id,
-            {
-                "status": "completed_with_sync_error",
-                "stage": "completed_with_sync_error",
-                "progress": 100,
-                "sync_status": "failed",
-                "sync_error": sync_err,
-                "error": sync_err,
-                "message": f"同步到故障树后端失败：{sync_err}",
-            },
-        )
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            artifacts.update(summary.get("artifacts") or {})
+        except Exception as exc:
+            summary = {"summary_read_error": str(exc)}
+    sync_response = {
+        "mode": "kb_pipeline_v2",
+        "file": {
+            "file_id": file_id,
+            "file_version_id": file_version_id,
+            "file_name": display_file_name,
+            "version_no": (
+                int(file_version_id.rsplit("_v", 1)[1])
+                if "_v" in file_version_id and file_version_id.rsplit("_v", 1)[1].isdigit()
+                else None
+            ),
+        },
+        "summary": summary,
+    }
+    _set_job(job_id, {**base_patch, "status": "success", "stage": "success", "progress": 100, "sync_status": "success", "sync_response": sync_response, "summary": summary, "artifacts": artifacts, "message": "KB V2 pipeline finished"})
 
 
 @app.get("/")
@@ -624,7 +533,7 @@ def root():
             "run_upload": "/api/kb/jobs/run-upload",
             "import_maintenance_cases": "/api/knowledge/import-maintenance-cases",
             "get_job": "/api/kb/jobs/{job_id}",
-            "import_relations_to_neo4j": "/api/kb/neo4j/import",
+            "import_kb_v2_artifacts": "/api/integration/import-knowledge-artifacts",
             "profile_work_orders": "/api/knowledge/profile",
             "import_work_orders": "/api/knowledge/import-work-orders",
         },
@@ -765,63 +674,44 @@ async def import_maintenance_cases_upload(
 @app.post("/api/kb/jobs/run")
 def run_pipeline_job(request: PipelineJobRequest):
     if request.import_only_dir:
-        import_only_dir = Path(request.import_only_dir).expanduser().resolve()
-        if not import_only_dir.exists():
-            raise HTTPException(status_code=400, detail=f"导入目录不存在: {import_only_dir}")
-        try:
-            pdf_stem = _resolve_pdf_stem(request.pdf_path, request.pdf_stem, str(import_only_dir))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        normalized_request = request.model_copy(
-            update={
-                "import_only_dir": str(import_only_dir),
-                "pdf_stem": pdf_stem,
-                "pdf_path": str(Path(request.pdf_path).expanduser().resolve()) if request.pdf_path else None,
-            }
-        )
-    else:
-        if not request.pdf_path:
-            raise HTTPException(status_code=400, detail="生成模式下必须提供 pdf_path")
-        pdf_path = Path(request.pdf_path).expanduser().resolve()
-        if not pdf_path.exists():
-            raise HTTPException(status_code=400, detail=f"PDF 文件不存在: {pdf_path}")
-        normalized_request = request.model_copy(
-            update={"pdf_path": str(pdf_path), "pdf_stem": request.pdf_stem or Path(pdf_path).stem}
-        )
+        raise HTTPException(status_code=400, detail="V2 pipeline does not support import_only_dir; pass pdf_path/input file instead.")
+    if not request.pdf_path:
+        raise HTTPException(status_code=400, detail="pdf_path is required.")
+    input_path = Path(request.pdf_path).expanduser().resolve()
+    if not input_path.exists():
+        raise HTTPException(status_code=400, detail=f"Input file does not exist: {input_path}")
+    if not V2_RUN_SCRIPT.exists():
+        raise HTTPException(status_code=500, detail="kb_pipeline_v2.py was not found; cannot start KB V2 pipeline.")
 
-    if not RUN_SCRIPT.exists():
-        raise HTTPException(status_code=500, detail="找不到 run.py，无法启动知识库构建流水线")
-
-    pdf_stem = _resolve_pdf_stem(normalized_request.pdf_path, normalized_request.pdf_stem, normalized_request.import_only_dir)
-    display_file_name = _resolve_import_display_file_name(normalized_request, pdf_stem)
-    artifacts = _build_artifacts(pdf_stem, normalized_request.output_dir, normalized_request.import_only_dir)
+    normalized_request = request.model_copy(
+        update={"pdf_path": str(input_path), "pdf_stem": request.pdf_stem or input_path.stem}
+    )
+    file_id = _resolve_pdf_stem(normalized_request.pdf_path, normalized_request.pdf_stem, None)
+    file_version_id = normalized_request.file_version_id or f"{file_id}_v1"
+    display_file_name = _resolve_import_display_file_name(normalized_request, file_id)
+    result_dir = Path(normalized_request.output_dir).expanduser().resolve() / file_id / file_version_id
+    artifacts = _build_v2_artifacts(file_id, result_dir)
     job_id = f"kb_{uuid.uuid4().hex[:12]}"
 
-    # 先写入“已创建/排队中”的 job，前端无需等待轮询即可显示初始状态
     _set_job(
         job_id,
         {
             "job_id": job_id,
-            "type": "pipeline",
+            "type": "pipeline_v2",
             "status": "queued",
             "stage": "queued",
             "progress": 0,
-            "message": "任务已创建，等待启动…",
+            "message": "Job created; waiting to start KB V2 pipeline.",
             "created_at": time.time(),
             "request": normalized_request.model_dump(),
-            "pdf_stem": pdf_stem,
+            "pdf_stem": file_id,
+            "file_id": file_id,
+            "file_version_id": file_version_id,
             "artifacts": artifacts,
-            "integration": _build_generate_fta_contract(
-                artifacts,
-                normalized_request.generate_fta_base_url,
-                normalized_request.clear_graph_before_import,
-                pdf_stem=pdf_stem,
-                file_name=display_file_name,
-                file_version_id=_resolve_sync_file_version_id(normalized_request, artifacts),
-            ),
+            "integration": {"mode": "kb_pipeline_v2", "note": "V2 pipeline writes directly to MongoDB and Neo4j."},
         },
     )
-    logger.info("enqueue job=%s pdf_stem=%s import_only_dir=%s", job_id, pdf_stem, normalized_request.import_only_dir or "")
+    logger.info("enqueue v2 job=%s file_id=%s file_version_id=%s", job_id, file_id, file_version_id)
     thread = threading.Thread(target=_run_pipeline_job, args=(job_id, normalized_request), daemon=True)
     thread.start()
     return _get_job(job_id)
@@ -1146,35 +1036,8 @@ def get_pipeline_job(job_id: str):
 
 
 @app.post("/api/kb/neo4j/import")
-def import_relations_to_neo4j_api(request: Neo4jImportRequest):
-    file_path = Path(request.file_path).expanduser().resolve()
-    if not file_path.exists():
-        raise HTTPException(status_code=400, detail=f"关系文件不存在: {file_path}")
-
-    rows = load_json(
-        file_path,
-        file_id=request.file_id,
-        file_version_id=request.file_version_id,
-        file_name=request.file_name,
-        is_active=True,
+def deprecated_neo4j_import_api(request: Neo4jImportRequest):
+    raise HTTPException(
+        status_code=410,
+        detail="This legacy relation import endpoint has been replaced by kb_pipeline_v2.py and cross_file_entity_clustering.py.",
     )
-    if not rows:
-        raise HTTPException(status_code=400, detail="关系文件中没有可导入的数据")
-
-    driver = GraphDatabase.driver(request.uri, auth=(request.user, request.password))
-    try:
-        driver.verify_connectivity()
-        ensure_constraints(driver, request.database)
-        if request.clear:
-            clear_graph(driver, request.database)
-        relation_count = import_rows(driver, request.database, rows, request.batch_size)
-    finally:
-        driver.close()
-
-    return {
-        "file_path": str(file_path),
-        "database": request.database,
-        "rows": len(rows),
-        "relations": relation_count,
-        "status": "success",
-    }

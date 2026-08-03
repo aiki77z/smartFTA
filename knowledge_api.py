@@ -7,21 +7,12 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
+from import_cluster_intermediate_to_kb import import_to_neo4j, import_top_event_catalog
 from import_chunks import _load_chunks
-from import_relations_to_neo4j import (
-    GraphDatabase,
-    ensure_constraints,
-    import_entities,
-    import_rows,
-    load_entities,
-    load_json,
-)
 from knowledge_store import (
     activate_file_version,
     archive_file,
     assert_chunk_artifacts_align_with_file_version,
-    assert_relation_artifacts_align_with_file_version,
     assert_source_record_artifacts_align_with_file_version,
     create_file_version_record,
     get_chunk_by_id,
@@ -30,13 +21,13 @@ from knowledge_store import (
     import_work_orders as import_work_orders_to_db,
     list_all_chunks,
     mark_file_version_import_failed,
-    rebuild_top_event_catalog_for_file_version,
 )
 
 
 class KnowledgeArtifactsImportRequest(BaseModel):
     chunks_file: str
-    entities_file: str
+    cluster_intermediate_file: Optional[str] = None
+    entities_file: Optional[str] = None
     relations_file: Optional[str] = None
     clear_graph: bool = False
     source: str = "knowledge_base_construction"
@@ -120,51 +111,45 @@ def _expected_source_record_type(records: List[Dict[str, Any]], fallback: str) -
     return fallback
 
 
-def _import_graph_artifacts(
-    entities_file: Path,
-    relations_file: Optional[Path],
+def _load_cluster_intermediate(file_path: Path) -> Dict[str, Any]:
+    if not file_path.exists():
+        raise ValueError(f"cluster_intermediate_file does not exist: {file_path}")
+    data = json.loads(file_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("cluster_intermediate_file must contain a JSON object")
+    required_keys = {"mentions", "clusters", "raw_relations", "clustered_relations"}
+    missing = [key for key in sorted(required_keys) if key not in data]
+    if missing:
+        raise ValueError(f"cluster_intermediate_file is missing required keys: {', '.join(missing)}")
+    return data
+
+
+def _import_cluster_intermediate_artifact(
+    cluster_intermediate_file: Path,
     *,
     file_id: str,
     file_version_id: str,
     file_name: str,
-    import_relations: bool,
+    clear_scope: bool = True,
 ) -> Dict[str, Any]:
-    entity_rows = load_entities(
-        entities_file,
+    data = _load_cluster_intermediate(cluster_intermediate_file)
+    neo4j_result = import_to_neo4j(
+        data,
         file_id=file_id,
         file_version_id=file_version_id,
-        is_active=True,
+        file_name=file_name,
+        clear_scope=clear_scope,
     )
-    if not entity_rows:
-        raise ValueError(f"No valid entities were extracted: {entities_file}")
-
-    relation_rows = []
-    if import_relations and relations_file:
-        relation_rows = load_json(
-            relations_file,
-            file_id=file_id,
-            file_version_id=file_version_id,
-            file_name=file_name,
-            is_active=True,
-        )
-        assert_relation_artifacts_align_with_file_version(
-            relation_rows,
-            file_id=file_id,
-            file_version_id=file_version_id,
-        )
-
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        driver.verify_connectivity()
-        ensure_constraints(driver, NEO4J_DATABASE)
-        entity_count = import_entities(driver, NEO4J_DATABASE, entity_rows)
-        relation_count = import_rows(driver, NEO4J_DATABASE, relation_rows, batch_size=200) if relation_rows else 0
-    finally:
-        driver.close()
+    catalog_result = import_top_event_catalog(
+        data,
+        file_id=file_id,
+        file_version_id=file_version_id,
+        file_name=file_name,
+        clear_scope=clear_scope,
+    )
     return {
-        "entities": entity_count,
-        "relations": relation_count,
-        "relation_rows": len(relation_rows),
+        "neo4j": neo4j_result,
+        "mongo": catalog_result,
         "status": "success",
     }
 
@@ -172,15 +157,22 @@ def _import_graph_artifacts(
 def import_knowledge_artifacts_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     req = KnowledgeArtifactsImportRequest(**payload)
     chunks_path = Path(req.chunks_file).expanduser().resolve()
-    entities_path = Path(req.entities_file).expanduser().resolve() if req.entities_file else None
-    relations_path = Path(req.relations_file).expanduser().resolve() if req.relations_file else None
+    cluster_intermediate_path = (
+        Path(req.cluster_intermediate_file).expanduser().resolve() if req.cluster_intermediate_file else None
+    )
 
     if not chunks_path.exists():
         raise ValueError(f"chunks_file does not exist: {chunks_path}")
-    if not entities_path or not entities_path.exists():
-        raise ValueError(f"entities_file does not exist: {entities_path}")
-    if req.import_relations and relations_path and not relations_path.exists():
-        raise ValueError(f"relations_file does not exist: {relations_path}")
+    if not cluster_intermediate_path:
+        legacy_parts = [name for name, value in [("entities_file", req.entities_file), ("relations_file", req.relations_file)] if value]
+        legacy_hint = f" Received legacy fields: {', '.join(legacy_parts)}." if legacy_parts else ""
+        raise ValueError(
+            "KB v2 import requires cluster_intermediate_file generated by entity_clustering/cluster_entities.py "
+            "or kb_pipeline_v2.py. Legacy entities_file/relations_file graph import is no longer supported."
+            + legacy_hint
+        )
+    if not cluster_intermediate_path.exists():
+        raise ValueError(f"cluster_intermediate_file does not exist: {cluster_intermediate_path}")
     if req.clear_graph:
         raise ValueError("Versioned KB mode forbids clear_graph=true. Archive old file versions instead.")
 
@@ -195,7 +187,7 @@ def import_knowledge_artifacts_payload(payload: Dict[str, Any]) -> Dict[str, Any
             explicit_file_name=req.file_name,
             chunks=chunks,
             chunks_path=chunks_path,
-            relations_path=relations_path,
+            relations_path=None,
         )
         resolved_file_id, resolved_file_version_id = _derive_file_identity_from_chunks(
             chunks,
@@ -214,8 +206,7 @@ def import_knowledge_artifacts_payload(payload: Dict[str, Any]) -> Dict[str, Any
             metadata={
                 "artifacts": {
                     "chunks_file": str(chunks_path),
-                    "entities_file": str(entities_path) if entities_path else None,
-                    "relations_file": str(relations_path) if relations_path else None,
+                    "cluster_intermediate_file": str(cluster_intermediate_path),
                 }
             },
         )
@@ -264,18 +255,17 @@ def import_knowledge_artifacts_payload(payload: Dict[str, Any]) -> Dict[str, Any
                 is_active=True,
             )
 
-        graph_result = _import_graph_artifacts(
-            entities_path,
-            relations_path,
+        graph_result = _import_cluster_intermediate_artifact(
+            cluster_intermediate_path,
             file_id=file_version["file_id"],
             file_version_id=file_version["file_version_id"],
             file_name=file_version["file_name"],
-            import_relations=req.import_relations,
+            clear_scope=True,
         )
 
-        catalog_entries = rebuild_top_event_catalog_for_file_version(file_version["file_version_id"])
-        if not catalog_entries:
-            raise ValueError("Neo4j contains no FaultPhenomenon entities for the imported file version")
+        catalog_count = int((graph_result.get("mongo") or {}).get("top_event_catalog") or 0)
+        if catalog_count <= 0:
+            raise ValueError("cluster_intermediate_file contains no FaultEvent clusters for top_event_catalog")
         activate_file_version(file_version["file_id"], file_version["file_version_id"])
 
         return {
@@ -291,12 +281,11 @@ def import_knowledge_artifacts_payload(payload: Dict[str, Any]) -> Dict[str, Any
                 "work_orders": work_order_count,
                 "maintenance_cases": maintenance_case_count,
                 "graph": graph_result,
-                "top_event_catalog": len(catalog_entries),
+                "top_event_catalog": catalog_count,
             },
             "artifacts": {
                 "chunks_file": str(chunks_path),
-                "entities_file": str(entities_path) if entities_path else None,
-                "relations_file": str(relations_path) if relations_path else None,
+                "cluster_intermediate_file": str(cluster_intermediate_path),
             },
             "next": {
                 "preview_top_events": "http://localhost:8000/api/batch/preview-top-events",

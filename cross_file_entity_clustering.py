@@ -164,12 +164,19 @@ def load_existing_clusters(session: Any, *, exclude_file_version_id: str = "") -
     rows = session.run(
         """
         MATCH (e:EntityCluster)
+        WITH e,
+          CASE WHEN 'source_file_ids' IN keys(e) THEN e['source_file_ids']
+               WHEN 'file_id' IN keys(e) THEN [e['file_id']]
+               ELSE [] END AS source_file_ids,
+          CASE WHEN 'source_file_version_ids' IN keys(e) THEN e['source_file_version_ids']
+               WHEN 'file_version_id' IN keys(e) THEN [e['file_version_id']]
+               ELSE [] END AS source_file_version_ids
         WHERE $exclude_file_version_id = ''
-           OR NOT coalesce(e.source_file_version_ids, [e.file_version_id]) = [$exclude_file_version_id]
+           OR NOT source_file_version_ids = [$exclude_file_version_id]
         RETURN
           e.cluster_id AS cluster_id,
-          e.file_id AS file_id,
-          e.file_version_id AS file_version_id,
+          source_file_ids[0] AS file_id,
+          source_file_version_ids[0] AS file_version_id,
           e.entity_type AS entity_type,
           e.entity_type_zh AS entity_type_zh,
           e.canonical_name AS canonical_name,
@@ -178,8 +185,8 @@ def load_existing_clusters(session: Any, *, exclude_file_version_id: str = "") -
           coalesce(e.mention_ids, []) AS mention_ids,
           coalesce(e.neighbor_tokens, []) AS neighbor_tokens,
           coalesce(e.merge_reasons, []) AS merge_reasons,
-          coalesce(e.source_file_ids, CASE WHEN e.file_id IS NULL THEN [] ELSE [e.file_id] END) AS source_file_ids,
-          coalesce(e.source_file_version_ids, CASE WHEN e.file_version_id IS NULL THEN [] ELSE [e.file_version_id] END) AS source_file_version_ids,
+          source_file_ids AS source_file_ids,
+          source_file_version_ids AS source_file_version_ids,
           coalesce(e.source_file_scopes, []) AS source_file_scopes,
           coalesce(e.chunk_refs, []) AS chunk_refs,
           coalesce(e.evidence_json, '[]') AS evidence_json
@@ -384,8 +391,6 @@ def upsert_entity_cluster(
     ).single()
     props = {
         "cluster_id": mapped_cluster_id,
-        "file_id": file_id,
-        "file_version_id": file_version_id,
         "entity_type": code,
         "entity_type_code": code,
         "entity_type_zh": zh,
@@ -427,6 +432,7 @@ def upsert_entity_cluster(
         f"""
         MERGE (e:EntityCluster:{label} {{cluster_id: $cluster_id}})
         SET e += $props
+        REMOVE e.file_id, e.file_version_id
         """,
         cluster_id=mapped_cluster_id,
         props=props,
