@@ -630,6 +630,23 @@ def _sanitize_fault_tree_documents(tree: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(doc, dict):
                     docs.append({field: doc.get(field, "") for field in _ALLOWED_DOCUMENT_FIELDS})
             next_event["documents"] = _dedupe_document_refs(docs)
+            attachments = next_event.get("kgAttachments")
+            if isinstance(attachments, dict):
+                next_attachments = {}
+                for key, items in attachments.items():
+                    cleaned_items = []
+                    for item in items or []:
+                        if not isinstance(item, dict):
+                            continue
+                        next_item = dict(item)
+                        item_docs = []
+                        for doc in next_item.get("documents") or []:
+                            if isinstance(doc, dict):
+                                item_docs.append({field: doc.get(field, "") for field in _ALLOWED_DOCUMENT_FIELDS})
+                        next_item["documents"] = _dedupe_document_refs(item_docs)
+                        cleaned_items.append(next_item)
+                    next_attachments[key] = cleaned_items
+                next_event["kgAttachments"] = next_attachments
             next_node["event"] = next_event
         sanitized_nodes.append(next_node)
     out["nodeList"] = sanitized_nodes
@@ -713,6 +730,18 @@ def _post_process_generated_tree(
         next_relation["documents"] = _dedupe_document_refs(docs)
         return next_relation
 
+    def hydrate_kg_attachment(attachment: Dict[str, Any], kind: str, fallback_file_version_id: str = "") -> Dict[str, Any]:
+        if not isinstance(attachment, dict):
+            return {}
+        item = dict(attachment)
+        item["kind"] = kind
+        item["evidence"] = [x for x in _parse_json_list_safe(item.get("evidence") or item.get("evidence_json")) if isinstance(x, dict)]
+        item["evidence_texts"] = _dedupe_values([x.get("text") for x in item["evidence"] if x.get("text")])
+        relation_docs = hydrate_relation_documents(item, fallback_file_version_id=fallback_file_version_id).get("documents") or []
+        item["documents"] = _dedupe_document_refs(relation_docs)
+        item.pop("evidence_json", None)
+        return item
+
     node_list = tree.get("nodeList") or []
     if not node_list:
         node_list = []
@@ -794,6 +823,20 @@ def _post_process_generated_tree(
             if not documents:
                 documents = _match_documents_for_event(name, evidence_chunks, limit=2)
             merged["documents"] = _dedupe_document_refs(documents)
+            maintenance_attachments = [
+                hydrate_kg_attachment(item, "maintenance", fallback_file_version_id=file_version_id or "")
+                for item in graph_props.get("maintenance_attachments") or []
+                if isinstance(item, dict)
+            ]
+            trigger_rule_attachments = [
+                hydrate_kg_attachment(item, "triggerRule", fallback_file_version_id=file_version_id or "")
+                for item in graph_props.get("trigger_rule_attachments") or []
+                if isinstance(item, dict)
+            ]
+            merged["kgAttachments"] = {
+                "maintenance": [item for item in maintenance_attachments if item],
+                "triggerRules": [item for item in trigger_rule_attachments if item],
+            }
             event = merged
 
         normalized_nodes.append(

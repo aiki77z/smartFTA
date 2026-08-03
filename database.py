@@ -70,8 +70,12 @@ def _dedupe_keep_order(values: Optional[List[Any]]) -> List[Any]:
     for value in values or []:
         if value in (None, ""):
             continue
-        if value not in seen:
-            seen.add(value)
+        if isinstance(value, (dict, list)):
+            key = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            key = value
+        if key not in seen:
+            seen.add(key)
             result.append(value)
     return result
 
@@ -1288,15 +1292,34 @@ def expand_local_fault_subgraph(
                 for chunk_ref in merged_refs:
                     documents.append({"chunk_id": chunk_ref})
                 target_node["documents"] = documents
+                attachment = {
+                    "name": support_name,
+                    "graph_node_id": support_node.get("graph_node_id"),
+                    "relation_type": rel.get("relation_type"),
+                    "relation_type_code": rel.get("relation_type_code"),
+                    "relation_id": rel.get("relation_id"),
+                    "evidence_json": rel.get("evidence_json") or "[]",
+                    "evidence": _parse_json_list(rel.get("evidence_json")),
+                    "source_chunk_ids": rel.get("source_chunk_ids") or [],
+                    "source_chunk_refs": merged_refs,
+                    "source_file_version_ids": rel.get("source_file_version_ids") or [],
+                    "documents": [{"chunk_id": chunk_ref} for chunk_ref in merged_refs],
+                }
 
                 if row.get("rel_type") == "CLUSTERED_HANDLED_BY":
                     methods = _dedupe_keep_order((target_node.get("maintenance_methods") or []) + [support_name])
                     target_node["maintenance_methods"] = methods
+                    target_node["maintenance_attachments"] = _dedupe_keep_order(
+                        (target_node.get("maintenance_attachments") or []) + [attachment]
+                    )
                     if not target_node.get("investigateMethod"):
                         target_node["investigateMethod"] = "；".join(methods[:3])
                 elif row.get("rel_type") == "CLUSTERED_TRIGGERED_BY_RULE":
                     rule_names = _dedupe_keep_order((target_node.get("trigger_rule_names") or []) + [support_name])
                     target_node["trigger_rule_names"] = rule_names
+                    target_node["trigger_rule_attachments"] = _dedupe_keep_order(
+                        (target_node.get("trigger_rule_attachments") or []) + [attachment]
+                    )
                     target_node["rule"] = target_node.get("rule") or "；".join(rule_names[:3])
                     existing_rules = target_node.get("rules") if isinstance(target_node.get("rules"), list) else []
                     if not existing_rules:
