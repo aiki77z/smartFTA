@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, List, Optional
@@ -61,20 +62,44 @@ from database import (
     upsert_top_event_catalog_entry,
     versions_col,
 )
+from agent_runtime.artifact_store import put_agent_artifact
 from agent_runtime.event_store import append_agent_event, list_agent_events
 from agent_runtime.policies import (
+    ARTIFACT_FINAL_TREE,
+    ARTIFACT_SCOPE,
+    ERROR_INVALID_CANDIDATE_REF,
     ERROR_CONFIRMATION_NOT_FOUND,
     ERROR_INVALID_REQUEST,
     ERROR_INVALID_RUN_STATE,
     ERROR_RUN_NOT_FOUND,
+    ERROR_WORKFLOW_FAILED,
+    EVENT_AGENT_MESSAGE,
+    EVENT_ARTIFACT_CREATED,
+    EVENT_CONFIRMATION_REQUIRED,
     EVENT_CONFIRMATION_RECEIVED,
     EVENT_RUN_CREATED,
+    EVENT_RUN_COMPLETED,
+    EVENT_RUN_FAILED,
+    EVENT_SCOPE_RESOLVED,
+    EVENT_STAGE_STARTED,
     RUN_STATUS_QUEUED,
     RUN_STATUS_RUNNING,
     RUN_STATUS_WAITING_CONFIRMATION,
+    RUN_STATUS_COMPLETED,
+    RUN_STATUS_FAILED,
+    STAGE_DONE,
+    STAGE_GENERATION,
     STAGE_RETRIEVAL,
+    STAGE_SCOPE,
 )
-from agent_runtime.run_store import create_agent_run, get_agent_run, update_agent_run
+from agent_runtime.run_store import (
+    claim_agent_confirmation,
+    create_agent_run,
+    get_agent_run,
+    list_agent_runs_by_status,
+    make_scope_key,
+    update_agent_run,
+)
 from agent_runtime.schemas import AgentConfirmRequest, AgentRunRequest
 from diff_analyzer import analyze_and_store, corrections_col, generate_change_description
 from generator import (
@@ -97,6 +122,8 @@ MAX_TOP_EVENT_CANDIDATE_LIMIT = 15
 single_generation_queue: Queue[str] = Queue()
 batch_generation_queue: Queue[str] = Queue()
 generation_worker_threads: List[threading.Thread] = []
+agent_run_monitor_threads: Dict[str, threading.Thread] = {}
+agent_run_monitor_lock = threading.Lock()
 
 
 class GraphCypherQueryRequest(BaseModel):
@@ -239,6 +266,7 @@ def _startup_recover_orphan_running_jobs():
         n = fail_orphan_running_generation_items_after_restart()
         if n:
             _console_log(f"[scheduler] startup: marked {n} orphan running job item(s) as failed (server restart)")
+        _recover_agent_run_workers()
     except Exception as exc:
         _console_log(f"[scheduler] startup recovery failed: {exc}")
 
@@ -291,7 +319,12 @@ def _agent_run_response(run: Dict[str, Any], events: Optional[List[Dict[str, Any
         "current_stage": run.get("current_stage"),
         "progress": run.get("progress") or {"completed": 0, "total": 0},
         "selected_file_version_ids": run.get("selected_file_version_ids") or [],
+        "scope_key": run.get("scope_key"),
         "session_id": run.get("session_id"),
+        "project_id": run.get("project_id"),
+        "canvas_id": run.get("canvas_id"),
+        "generation_job_id": run.get("generation_job_id"),
+        "generation_job_item_id": run.get("generation_job_item_id"),
         "tree_id": run.get("tree_id"),
         "tree_version": run.get("tree_version"),
         "execution_mode": run.get("execution_mode"),
@@ -299,11 +332,389 @@ def _agent_run_response(run: Dict[str, Any], events: Optional[List[Dict[str, Any
         "result": run.get("result"),
         "error": run.get("error"),
         "last_event_seq": int(run.get("last_event_seq") or 0),
+        "next_event_seq": int(run.get("last_event_seq") or 0),
         "events": events or [],
         "created_at": run.get("created_at"),
         "updated_at": run.get("updated_at"),
         "poll_url": f"/api/agent/run/{run.get('run_id')}",
     }
+
+
+def _agent_response_mode(run: Dict[str, Any]) -> str:
+    status = str(run.get("status") or "")
+    if status == RUN_STATUS_WAITING_CONFIRMATION:
+        return "need_confirmation"
+    if status == RUN_STATUS_COMPLETED:
+        return "completed"
+    if status == RUN_STATUS_FAILED:
+        return "failed"
+    return "queued"
+
+
+def _agent_stage_from_legacy(stage: Any) -> str:
+    text = str(stage or "").lower()
+    if any(key in text for key in ("retriev", "recall", "graph")):
+        return STAGE_RETRIEVAL
+    return STAGE_GENERATION
+
+
+def _append_agent_artifact(
+    run_id: str,
+    artifact_type: str,
+    content: Dict[str, Any],
+    *,
+    producer: str,
+) -> Dict[str, Any]:
+    artifact = put_agent_artifact(
+        run_id=run_id,
+        artifact_type=artifact_type,
+        content=content,
+        metadata={"producer": producer},
+    )
+    append_agent_event(
+        run_id,
+        EVENT_ARTIFACT_CREATED,
+        stage=artifact_type,
+        message=f"Artifact created: {artifact_type}",
+        payload={"artifact_id": artifact.get("artifact_id"), "type": artifact_type},
+    )
+    return artifact
+
+
+def _mark_agent_run_failed(run_id: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    run = update_agent_run(
+        run_id,
+        {
+            "status": RUN_STATUS_FAILED,
+            "current_stage": STAGE_DONE,
+            "error": {
+                "code": ERROR_WORKFLOW_FAILED,
+                "message": message,
+                "retryable": False,
+                "details": details or {},
+            },
+            "finished_at": datetime.utcnow(),
+        },
+    )
+    append_agent_event(
+        run_id,
+        EVENT_RUN_FAILED,
+        stage=STAGE_DONE,
+        message=message,
+        payload=details or {},
+    )
+    return run or get_agent_run(run_id) or {}
+
+
+def _complete_agent_run_from_generation_result(run_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    tree_id = result.get("tree_id")
+    tree_version = result.get("version") or result.get("tree_version")
+    if tree_id and tree_version is None:
+        meta = get_tree_meta(tree_id) or {}
+        tree_version = meta.get("current_version")
+    if not tree_id or tree_version is None:
+        return _mark_agent_run_failed(
+            run_id,
+            "Generation completed without a persisted tree version.",
+            details={"result": {key: value for key, value in result.items() if key != "tree_data"}},
+        )
+
+    tree_version = int(tree_version)
+    artifact = _append_agent_artifact(
+        run_id,
+        ARTIFACT_FINAL_TREE,
+        {
+            "tree_id": tree_id,
+            "tree_version": tree_version,
+            "generation_job_id": result.get("job_id"),
+            "generation_job_item_id": result.get("item_id"),
+        },
+        producer="LegacyGenerationAdapter",
+    )
+    run = update_agent_run(
+        run_id,
+        {
+            "status": RUN_STATUS_COMPLETED,
+            "current_stage": STAGE_DONE,
+            "progress": {"completed": 100, "total": 100},
+            "tree_id": tree_id,
+            "tree_version": tree_version,
+            "result": {
+                "mode": result.get("mode") or "generated",
+                "tree_id": tree_id,
+                "tree_version": tree_version,
+                "final_tree_artifact_id": artifact.get("artifact_id"),
+            },
+            "error": None,
+            "finished_at": datetime.utcnow(),
+        },
+    )
+    append_agent_event(
+        run_id,
+        EVENT_RUN_COMPLETED,
+        stage=STAGE_DONE,
+        message="Agent run completed.",
+        payload={"tree_id": tree_id, "tree_version": tree_version, "artifact_id": artifact.get("artifact_id")},
+    )
+    return run or get_agent_run(run_id) or {}
+
+
+def _monitor_agent_generation_run(run_id: str, item_id: str) -> None:
+    try:
+        while True:
+            run = get_agent_run(run_id)
+            if not run or run.get("status") in {RUN_STATUS_COMPLETED, RUN_STATUS_FAILED}:
+                return
+            item = get_generation_job_item(item_id)
+            if not item:
+                _mark_agent_run_failed(run_id, "Bound generation job item was not found.", details={"item_id": item_id})
+                return
+
+            last_legacy_seq = int(run.get("last_generation_job_event_seq") or 0)
+            for legacy_event in item.get("events") or []:
+                legacy_seq = int(legacy_event.get("seq") or 0)
+                if legacy_seq <= last_legacy_seq:
+                    continue
+                append_agent_event(
+                    run_id,
+                    EVENT_AGENT_MESSAGE,
+                    stage=_agent_stage_from_legacy(legacy_event.get("stage") or item.get("stage")),
+                    message=str(legacy_event.get("text") or legacy_event.get("message") or "Generation progress updated."),
+                    payload={"generation_job_item_id": item_id, "legacy_event": legacy_event},
+                )
+                last_legacy_seq = legacy_seq
+
+            status = str(item.get("status") or "")
+            fields: Dict[str, Any] = {
+                "generation_job_id": item.get("job_id"),
+                "generation_job_item_id": item_id,
+                "last_generation_job_event_seq": last_legacy_seq,
+                "current_stage": _agent_stage_from_legacy(item.get("stage")),
+                "progress": {"completed": int(item.get("progress") or 0), "total": 100},
+            }
+            if item.get("tree_id"):
+                fields["tree_id"] = item.get("tree_id")
+            if item.get("version") is not None:
+                fields["tree_version"] = int(item.get("version"))
+            update_agent_run(run_id, fields)
+
+            if status == "success":
+                _complete_agent_run_from_generation_result(
+                    run_id,
+                    {
+                        "mode": "generated",
+                        "job_id": item.get("job_id"),
+                        "item_id": item_id,
+                        "tree_id": item.get("tree_id"),
+                        "version": item.get("version"),
+                    },
+                )
+                return
+            if status == "failed":
+                _mark_agent_run_failed(
+                    run_id,
+                    str(item.get("error") or "Generation job failed."),
+                    details={"generation_job_id": item.get("job_id"), "generation_job_item_id": item_id},
+                )
+                return
+            time.sleep(0.6)
+    finally:
+        with agent_run_monitor_lock:
+            agent_run_monitor_threads.pop(run_id, None)
+
+
+def _start_agent_generation_monitor(run_id: str, item_id: str) -> None:
+    with agent_run_monitor_lock:
+        current = agent_run_monitor_threads.get(run_id)
+        if current and current.is_alive():
+            return
+        thread = threading.Thread(
+            target=_monitor_agent_generation_run,
+            args=(run_id, item_id),
+            daemon=True,
+            name=f"agent-run-monitor-{run_id[-6:]}",
+        )
+        agent_run_monitor_threads[run_id] = thread
+        thread.start()
+
+
+def _launch_agent_legacy_generation(run_id: str, catalog: Dict[str, Any]) -> Dict[str, Any]:
+    run = get_agent_run(run_id)
+    if not run:
+        return {}
+    options = run.get("options") or {}
+    requested_top_event = run.get("requested_top_event") or run.get("prompt")
+    requirements = run.get("requirements") or ""
+    graph_node_id = run.get("graph_node_id") or _graph_node_id_from_catalog(catalog)
+    async_mode = run.get("execution_mode") != "sync"
+    try:
+        append_agent_event(
+            run_id,
+            EVENT_STAGE_STARTED,
+            stage=STAGE_GENERATION,
+            message="Starting existing fault-tree generation workflow.",
+        )
+        result = _queue_single_generation(
+            prompt=run.get("prompt") or "",
+            requested_top_event=requested_top_event,
+            requirements=requirements,
+            catalog=catalog,
+            graph_node_id_override=graph_node_id,
+            selected_file_version_ids=run.get("selected_file_version_ids") or [],
+            async_mode=async_mode,
+            part_details=options.get("part_details") if isinstance(options, dict) else None,
+        )
+    except Exception as exc:
+        return _mark_agent_run_failed(run_id, f"Failed to start generation: {exc}")
+
+    if result.get("mode") in {"generated", "reuse"}:
+        return _complete_agent_run_from_generation_result(run_id, result)
+
+    item_id = result.get("item_id")
+    if not item_id:
+        return _mark_agent_run_failed(run_id, "Generation did not return a job item.", details={"result": result})
+    updated = update_agent_run(
+        run_id,
+        {
+            "status": RUN_STATUS_RUNNING,
+            "current_stage": STAGE_GENERATION,
+            "generation_job_id": result.get("job_id"),
+            "generation_job_item_id": item_id,
+            "progress": {"completed": 0, "total": 100},
+            "result": {"mode": result.get("mode") or "queued"},
+        },
+    )
+    _start_agent_generation_monitor(run_id, item_id)
+    return updated or get_agent_run(run_id) or {}
+
+
+def _run_agent_scope(run_id: str) -> Dict[str, Any]:
+    run = get_agent_run(run_id)
+    if not run:
+        return {}
+    try:
+        update_agent_run(
+            run_id,
+            {"status": RUN_STATUS_RUNNING, "current_stage": STAGE_SCOPE, "started_at": run.get("started_at") or datetime.utcnow()},
+        )
+        append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_SCOPE, message="Resolving top event and knowledge scope.")
+        options = run.get("options") or {}
+        resolution = _resolve_prompt_top_event(
+            prompt=run.get("prompt") or "",
+            selected_file_version_ids=run.get("selected_file_version_ids") or [],
+            candidate_limit=options.get("candidate_limit") if isinstance(options, dict) else None,
+        )
+        scope_ids = resolution.get("selected_file_version_ids") or []
+        scope_fields: Dict[str, Any] = {
+            "requested_top_event": resolution.get("requested_top_event"),
+            "requirements": resolution.get("requirements") or "",
+            "selected_file_version_ids": scope_ids,
+            "scope_key": make_scope_key(scope_ids),
+        }
+        if resolution.get("status") == "exact_match":
+            scope_fields.update(
+                {
+                    "resolved_top_event": resolution.get("resolved_top_event"),
+                    "normalized_top_event": resolution.get("normalized_top_event"),
+                    "graph_node_id": resolution.get("graph_node_id"),
+                }
+            )
+        _append_agent_artifact(run_id, ARTIFACT_SCOPE, resolution, producer="ScopeAgent")
+
+        if resolution.get("status") != "exact_match":
+            candidates = []
+            for index, candidate in enumerate(resolution.get("candidates") or [], start=1):
+                candidates.append({"candidate_ref": f"cand_{run_id[-8:]}_{index}", **dict(candidate)})
+            if not candidates:
+                return _mark_agent_run_failed(run_id, "Top-event resolution returned no candidates.")
+            confirmation = {
+                "confirmation_id": f"confirm_{uuid.uuid4().hex[:12]}",
+                "type": "top_event",
+                "status": "waiting",
+                "resume_stage": STAGE_RETRIEVAL,
+                "candidates": candidates,
+            }
+            updated = update_agent_run(
+                run_id,
+                {
+                    **scope_fields,
+                    "status": RUN_STATUS_WAITING_CONFIRMATION,
+                    "current_stage": STAGE_SCOPE,
+                    "confirmation": confirmation,
+                },
+            )
+            append_agent_event(
+                run_id,
+                EVENT_CONFIRMATION_REQUIRED,
+                stage=STAGE_SCOPE,
+                message="Top-event confirmation is required.",
+                payload={"confirmation_id": confirmation["confirmation_id"], "candidate_count": len(candidates)},
+            )
+            return updated or get_agent_run(run_id) or {}
+
+        updated = update_agent_run(run_id, {**scope_fields, "status": RUN_STATUS_RUNNING, "current_stage": STAGE_RETRIEVAL})
+        append_agent_event(
+            run_id,
+            EVENT_SCOPE_RESOLVED,
+            stage=STAGE_RETRIEVAL,
+            message="Top event and knowledge scope resolved.",
+            payload={"resolved_top_event": resolution.get("resolved_top_event"), "scope_key": make_scope_key(scope_ids)},
+        )
+        return _launch_agent_legacy_generation(run_id, resolution.get("catalog_entry") or {})
+    except Exception as exc:
+        return _mark_agent_run_failed(run_id, f"Scope resolution failed: {exc}")
+
+
+def _catalog_from_confirmed_candidate(run: Dict[str, Any], candidate_ref: str) -> Dict[str, Any]:
+    confirmation = run.get("confirmation") or {}
+    candidate = next(
+        (item for item in confirmation.get("candidates") or [] if item.get("candidate_ref") == candidate_ref),
+        None,
+    )
+    if not candidate:
+        raise ValueError("Selected candidate does not belong to this run.")
+    return _resolve_confirmed_top_event(
+        confirmed_top_event=candidate.get("name"),
+        confirmed_normalized_top_event=candidate.get("normalized_name"),
+        confirmed_graph_node_id=candidate.get("graph_node_id"),
+        selected_file_version_ids=run.get("selected_file_version_ids") or [],
+    )
+
+
+def _start_agent_scope_thread(run_id: str) -> None:
+    thread = threading.Thread(target=_run_agent_scope, args=(run_id,), daemon=True, name=f"agent-run-scope-{run_id[-6:]}")
+    thread.start()
+
+
+def _catalog_from_resolved_run(run: Dict[str, Any]) -> Dict[str, Any]:
+    return _resolve_confirmed_top_event(
+        confirmed_top_event=run.get("resolved_top_event"),
+        confirmed_normalized_top_event=run.get("normalized_top_event"),
+        confirmed_graph_node_id=run.get("graph_node_id"),
+        selected_file_version_ids=run.get("selected_file_version_ids") or [],
+    )
+
+
+def _recover_agent_run_workers() -> None:
+    for run in list_agent_runs_by_status([RUN_STATUS_QUEUED, RUN_STATUS_RUNNING]):
+        run_id = run.get("run_id")
+        if not run_id:
+            continue
+        item_id = run.get("generation_job_item_id")
+        if item_id:
+            _start_agent_generation_monitor(run_id, item_id)
+            continue
+        confirmation = run.get("confirmation") or {}
+        try:
+            if confirmation.get("status") == "confirmed" and confirmation.get("selected_candidate_ref"):
+                catalog = _catalog_from_confirmed_candidate(run, confirmation["selected_candidate_ref"])
+                _launch_agent_legacy_generation(run_id, catalog)
+            elif run.get("resolved_top_event"):
+                _launch_agent_legacy_generation(run_id, _catalog_from_resolved_run(run))
+            else:
+                _start_agent_scope_thread(run_id)
+        except Exception as exc:
+            _mark_agent_run_failed(run_id, f"Failed to recover agent run: {exc}")
 
 
 @app.post("/api/agent/run")
@@ -318,6 +729,8 @@ def api_agent_run(req: AgentRunRequest, response: Response):
             prompt=prompt,
             selected_file_version_ids=ids,
             session_id=req.session_id,
+            project_id=req.project_id,
+            canvas_id=req.canvas_id,
             tree_id=req.tree_id,
             tree_version=req.tree_version,
             execution_mode="sync" if req.sync else "async",
@@ -345,7 +758,13 @@ def api_agent_run(req: AgentRunRequest, response: Response):
             f"Failed to create agent run: {exc}",
             retryable=True,
         )
-    if run.get("status") == RUN_STATUS_QUEUED and run.get("execution_mode") == "async":
+    if run.get("execution_mode") == "sync":
+        run = _run_agent_scope(run["run_id"])
+        events = list_agent_events(run["run_id"])
+        return {"mode": _agent_response_mode(run), **_agent_run_response(run, events)}
+
+    _start_agent_scope_thread(run["run_id"])
+    if run.get("status") == RUN_STATUS_QUEUED:
         response.status_code = 202
     return {
         "mode": "queued",
@@ -364,10 +783,9 @@ def api_agent_run_status(
         return _agent_error_response(404, ERROR_RUN_NOT_FOUND, f"Agent run not found: {run_id}")
     events = list_agent_events(run_id, after_event_seq=after_event_seq)
     payload = _agent_run_response(run, events)
-    if not include_tree_data and isinstance(payload.get("result"), dict):
-        result = dict(payload["result"])
-        result.pop("tree_data", None)
-        payload["result"] = result
+    if include_tree_data and payload.get("tree_id") and payload.get("tree_version") is not None:
+        version_doc = get_version(payload["tree_id"], int(payload["tree_version"]))
+        payload["tree_data"] = (version_doc or {}).get("tree_data")
     return payload
 
 
@@ -377,6 +795,13 @@ def api_agent_run_confirm(run_id: str, req: AgentConfirmRequest):
     if not run:
         return _agent_error_response(404, ERROR_RUN_NOT_FOUND, f"Agent run not found: {run_id}")
     if run.get("status") != RUN_STATUS_WAITING_CONFIRMATION:
+        existing_confirmation = run.get("confirmation") or {}
+        if (
+            existing_confirmation.get("confirmation_id") == req.confirmation_id
+            and existing_confirmation.get("status") == "confirmed"
+            and existing_confirmation.get("selected_candidate_ref") == req.candidate_ref
+        ):
+            return {"mode": _agent_response_mode(run), **_agent_run_response(run, [])}
         return _agent_error_response(
             409,
             ERROR_INVALID_RUN_STATE,
@@ -390,19 +815,59 @@ def api_agent_run_confirm(run_id: str, req: AgentConfirmRequest):
             ERROR_CONFIRMATION_NOT_FOUND,
             f"Confirmation not found: {req.confirmation_id}",
         )
-    updated = update_agent_run(
+    if confirmation.get("type") != req.confirmation_type:
+        return _agent_error_response(
+            422,
+            ERROR_INVALID_CANDIDATE_REF,
+            f"Confirmation type does not match: {req.confirmation_type}",
+        )
+    candidate = next(
+        (item for item in confirmation.get("candidates") or [] if item.get("candidate_ref") == req.candidate_ref),
+        None,
+    )
+    if not candidate:
+        return _agent_error_response(
+            422,
+            ERROR_INVALID_CANDIDATE_REF,
+            f"Candidate does not belong to confirmation: {req.candidate_ref}",
+        )
+    try:
+        catalog = _catalog_from_confirmed_candidate(run, req.candidate_ref)
+    except ValueError as exc:
+        return _agent_error_response(422, ERROR_INVALID_CANDIDATE_REF, str(exc))
+    except Exception as exc:
+        return _agent_error_response(500, ERROR_WORKFLOW_FAILED, f"Failed to resolve selected candidate: {exc}")
+
+    confirmed = {
+        **confirmation,
+        "status": "confirmed",
+        "selected_candidate_ref": req.candidate_ref,
+        "note": req.note,
+    }
+    updated = claim_agent_confirmation(
         run_id,
-        {
+        confirmation_id=req.confirmation_id,
+        candidate_ref=req.candidate_ref,
+        fields={
             "status": RUN_STATUS_RUNNING,
             "current_stage": STAGE_RETRIEVAL,
-            "confirmation": {
-                **confirmation,
-                "status": "confirmed",
-                "selected_candidate_ref": req.candidate_ref,
-                "note": req.note,
-            },
+            "confirmation": confirmed,
+            "resolved_top_event": catalog.get("name"),
+            "normalized_top_event": catalog.get("normalized_name"),
+            "graph_node_id": _graph_node_id_from_catalog(catalog),
         },
     )
+    if not updated:
+        latest = get_agent_run(run_id)
+        latest_confirmation = (latest or {}).get("confirmation") or {}
+        if (
+            latest
+            and latest_confirmation.get("confirmation_id") == req.confirmation_id
+            and latest_confirmation.get("status") == "confirmed"
+            and latest_confirmation.get("selected_candidate_ref") == req.candidate_ref
+        ):
+            return {"mode": _agent_response_mode(latest), **_agent_run_response(latest, [])}
+        return _agent_error_response(409, ERROR_INVALID_RUN_STATE, "Confirmation was already handled.")
     event = append_agent_event(
         run_id,
         EVENT_CONFIRMATION_RECEIVED,
@@ -410,7 +875,12 @@ def api_agent_run_confirm(run_id: str, req: AgentConfirmRequest):
         message="Confirmation received.",
         payload={"confirmation_id": req.confirmation_id, "candidate_ref": req.candidate_ref},
     )
-    return _agent_run_response(updated or get_agent_run(run_id) or run, [event])
+    updated = get_agent_run(run_id) or updated
+    launched = _launch_agent_legacy_generation(run_id, catalog)
+    events = [event]
+    if launched.get("execution_mode") == "sync":
+        events = list_agent_events(run_id)
+    return {"mode": _agent_response_mode(launched), **_agent_run_response(launched, events)}
 
 
 @app.post("/api/graph/cypher")

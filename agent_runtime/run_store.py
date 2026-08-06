@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from pymongo import ReturnDocument
+
 from database import agent_runs_col
 
 from .policies import CONTRACT_VERSION, RUN_STATUS_QUEUED, STAGE_CREATED
@@ -40,6 +42,8 @@ def create_agent_run(
     prompt: str,
     selected_file_version_ids: Optional[List[Any]] = None,
     session_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    canvas_id: Optional[str] = None,
     tree_id: Optional[str] = None,
     tree_version: Optional[int] = None,
     execution_mode: str = "async",
@@ -57,6 +61,16 @@ def create_agent_run(
         "selected_file_version_ids": scope_ids,
         "scope_key": make_scope_key(scope_ids),
         "session_id": str(session_id).strip() if session_id else None,
+        "project_id": str(project_id).strip() if project_id else None,
+        "canvas_id": str(canvas_id).strip() if canvas_id else None,
+        "requested_top_event": None,
+        "resolved_top_event": None,
+        "normalized_top_event": None,
+        "graph_node_id": None,
+        "requirements": "",
+        "generation_job_id": None,
+        "generation_job_item_id": None,
+        "last_generation_job_event_seq": 0,
         "tree_id": str(tree_id).strip() if tree_id else None,
         "tree_version": tree_version,
         "execution_mode": execution_mode,
@@ -92,4 +106,40 @@ def update_agent_run(run_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, 
     payload["updated_at"] = _now()
     agent_runs_col.update_one({"_id": run_id}, {"$set": payload})
     return get_agent_run(run_id)
+
+
+def list_agent_runs_by_status(statuses: List[str], limit: int = 200) -> List[Dict[str, Any]]:
+    values = [str(status or "").strip() for status in statuses if str(status or "").strip()]
+    if not values:
+        return []
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    cursor = agent_runs_col.find({"status": {"$in": values}}).sort("updated_at", 1).limit(safe_limit)
+    return [_strip_mongo_id(doc) or {} for doc in cursor]
+
+
+def claim_agent_confirmation(
+    run_id: str,
+    *,
+    confirmation_id: str,
+    candidate_ref: str,
+    fields: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim a pending confirmation for one candidate snapshot."""
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return None
+    payload = dict(fields or {})
+    payload["updated_at"] = _now()
+    doc = agent_runs_col.find_one_and_update(
+        {
+            "_id": run_id,
+            "status": "waiting_confirmation",
+            "confirmation.confirmation_id": confirmation_id,
+            "confirmation.status": "waiting",
+            "confirmation.candidates.candidate_ref": candidate_ref,
+        },
+        {"$set": payload},
+        return_document=ReturnDocument.AFTER,
+    )
+    return _strip_mongo_id(doc)
 

@@ -12,6 +12,8 @@ class AgentRunRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     selected_file_version_ids: List[str] = Field(default_factory=list)
     session_id: Optional[str] = None
+    project_id: Optional[str] = None
+    canvas_id: Optional[str] = None
     tree_id: Optional[str] = None
     tree_version: Optional[int] = None
     max_depth: Optional[int] = Field(default=None, ge=1, le=20)
@@ -23,6 +25,7 @@ class AgentConfirmRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     confirmation_id: str = Field(..., min_length=1)
+    confirmation_type: str = Field(default="top_event", min_length=1)
     candidate_ref: str = Field(..., min_length=1)
     note: Optional[str] = None
 
