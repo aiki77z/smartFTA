@@ -56,6 +56,43 @@ class GnrClient:
             extra=extra,
         )
 
+    def poll_agent_run(
+        self,
+        *,
+        run_id: str,
+        after_event_seq: int = 0,
+        include_tree_data: bool = False,
+    ) -> Dict[str, Any]:
+        run_id = str(run_id or "").strip()
+        if not run_id:
+            raise ValueError("run_id is required")
+        return self._get_json(
+            f"/api/agent/run/{urllib.parse.quote(run_id)}",
+            {
+                "after_event_seq": max(0, int(after_event_seq or 0)),
+                "include_tree_data": "true" if include_tree_data else "false",
+            },
+        )
+
+    def confirm_agent_run(
+        self,
+        *,
+        run_id: str,
+        confirmation_id: str,
+        candidate_ref: str,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        run_id = str(run_id or "").strip()
+        if not run_id:
+            raise ValueError("run_id is required")
+        body: Dict[str, Any] = {
+            "confirmation_id": confirmation_id,
+            "candidate_ref": candidate_ref,
+        }
+        if note:
+            body["note"] = note
+        return self._post_json(f"/api/agent/run/{urllib.parse.quote(run_id)}/confirm", body)
+
     def validate_tree(self, *, tree_data: Any) -> Dict[str, Any]:
         return self._post_json("/api/tree/validate", {"tree_data": tree_data})
 
