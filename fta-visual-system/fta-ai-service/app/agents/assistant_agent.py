@@ -139,6 +139,8 @@ class AssistantAgent:
             prompt=message,
             selected_file_version_ids=scope_ids,
             session_id=session_id,
+            project_id=req.project_id,
+            canvas_id=req.canvas_id,
         )
         trace.append(self._step("GenerationDispatchAgent", "success", {
             "response_mode": result.get("mode"),
@@ -799,9 +801,17 @@ class AssistantAgent:
             "project_id": req.project_id,
             "canvas_id": req.canvas_id,
             "current_tree_id": result.get("tree_id") or req.current_tree_id,
+            "current_tree_version": result.get("tree_version") if result.get("tree_version") is not None else previous_memory.get("current_tree_version"),
             "current_top_event": tree_summary.get("top_event") or result.get("resolved_top_event"),
             "selected_file_version_ids": scope_ids,
             "source_scope_key": "|".join(sorted(scope_ids)),
+            "agent_run_id": result.get("run_id") or previous_memory.get("agent_run_id"),
+            "pending_confirmation": (
+                result.get("confirmation")
+                if result.get("mode") == "need_confirmation"
+                else (None if intent == "generate_tree" else previous_memory.get("pending_confirmation"))
+            ),
+            "last_generation_result": result if intent == "generate_tree" else previous_memory.get("last_generation_result"),
             "workspace_kb_epoch": req.workspace_kb_epoch,
             "last_user_intent": intent,
             "last_assistant_message": assistant_message,

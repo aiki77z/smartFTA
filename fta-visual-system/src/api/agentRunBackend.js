@@ -62,6 +62,8 @@ export function createAgentRun({
   prompt,
   selectedFileVersionIds,
   sessionId,
+  projectId,
+  canvasId,
   treeId,
   treeVersion,
   maxDepth,
@@ -76,6 +78,8 @@ export function createAgentRun({
     sync: Boolean(sync),
   }
   if (sessionId) body.session_id = String(sessionId)
+  if (projectId) body.project_id = String(projectId)
+  if (canvasId) body.canvas_id = String(canvasId)
   if (treeId) body.tree_id = String(treeId)
   if (treeVersion !== undefined && treeVersion !== null) body.tree_version = Number(treeVersion)
   if (maxDepth !== undefined && maxDepth !== null) body.max_depth = Number(maxDepth)
@@ -99,6 +103,7 @@ export function getAgentRun({
 export function confirmAgentRun({
   runId,
   confirmationId,
+  confirmationType = 'top_event',
   candidateRef,
   note,
   signal,
@@ -108,6 +113,7 @@ export function confirmAgentRun({
     method: 'POST',
     body: {
       confirmation_id: String(confirmationId || ''),
+      confirmation_type: String(confirmationType || 'top_event'),
       candidate_ref: String(candidateRef || ''),
       ...(note ? { note: String(note) } : null),
     },

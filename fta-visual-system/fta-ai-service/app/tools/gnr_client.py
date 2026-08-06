@@ -36,6 +36,8 @@ class GnrClient:
         prompt: str,
         selected_file_version_ids: List[str],
         session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        canvas_id: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if FTA_GNR_AGENT_RUN_PATH:
@@ -46,6 +48,10 @@ class GnrClient:
             }
             if session_id:
                 body["session_id"] = session_id
+            if project_id:
+                body["project_id"] = project_id
+            if canvas_id:
+                body["canvas_id"] = canvas_id
             if extra:
                 body.update(extra)
             return self._post_json(FTA_GNR_AGENT_RUN_PATH, body)
@@ -80,6 +86,7 @@ class GnrClient:
         run_id: str,
         confirmation_id: str,
         candidate_ref: str,
+        confirmation_type: str = "top_event",
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
         run_id = str(run_id or "").strip()
@@ -87,6 +94,7 @@ class GnrClient:
             raise ValueError("run_id is required")
         body: Dict[str, Any] = {
             "confirmation_id": confirmation_id,
+            "confirmation_type": confirmation_type,
             "candidate_ref": candidate_ref,
         }
         if note:
