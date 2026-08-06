@@ -38,6 +38,11 @@ chunks_col = db["chunks"]
 top_event_catalog_col = db["top_event_catalog"]
 generation_jobs_col = db["generation_jobs"]
 generation_job_items_col = db["generation_job_items"]
+agent_runs_col = db["agent_runs"]
+agent_events_col = db["agent_events"]
+agent_artifacts_col = db["agent_artifacts"]
+correction_episodes_col = db["correction_episodes"]
+repair_patterns_col = db["repair_patterns"]
 
 TOP_EVENT_PRIORITY_HINTS = ("故障", "异常", "报警", "停机", "失败", "超时", "触发", "中断")
 TOP_EVENT_NEGATIVE_HINTS = ("接线错误", "接口松动", "参数错误", "过流", "过热", "损坏", "松动")
@@ -1591,11 +1596,28 @@ def _ensure_indexes():
         (generation_job_items_col, [("job_id", ASCENDING), ("status", ASCENDING)]),
         (generation_job_items_col, [("normalized_top_event", ASCENDING), ("status", ASCENDING)]),
         (generation_job_items_col, [("source_scope_key", ASCENDING), ("normalized_top_event", ASCENDING), ("status", ASCENDING)]),
+        (agent_runs_col, [("status", ASCENDING), ("updated_at", DESCENDING)]),
+        (agent_runs_col, [("session_id", ASCENDING), ("updated_at", DESCENDING)]),
+        (agent_runs_col, [("scope_key", ASCENDING), ("updated_at", DESCENDING)]),
+        (agent_events_col, [("run_id", ASCENDING), ("created_at", ASCENDING)]),
+        (agent_artifacts_col, [("run_id", ASCENDING), ("type", ASCENDING), ("version", ASCENDING)]),
+        (correction_episodes_col, [("scope_key", ASCENDING), ("created_at", DESCENDING)]),
+        (repair_patterns_col, [("status", ASCENDING), ("issue_code", ASCENDING), ("scope_key", ASCENDING)]),
     ]
 
     for collection, keys in index_specs:
         try:
             collection.create_index(keys)
+        except Exception:
+            pass
+    unique_index_specs = [
+        (agent_runs_col, [("run_id", ASCENDING)]),
+        (agent_events_col, [("run_id", ASCENDING), ("event_seq", ASCENDING)]),
+        (agent_artifacts_col, [("artifact_id", ASCENDING)]),
+    ]
+    for collection, keys in unique_index_specs:
+        try:
+            collection.create_index(keys, unique=True)
         except Exception:
             pass
 

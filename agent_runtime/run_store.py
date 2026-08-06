@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from database import agent_runs_col
+
+from .policies import CONTRACT_VERSION, RUN_STATUS_QUEUED, STAGE_CREATED
+
+
+def _now() -> datetime:
+    return datetime.utcnow()
+
+
+def _strip_mongo_id(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not doc:
+        return None
+    out = dict(doc)
+    out.pop("_id", None)
+    return out
+
+
+def _dedupe_keep_order(values: Optional[List[Any]]) -> List[str]:
+    result: List[str] = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def make_scope_key(selected_file_version_ids: Optional[List[Any]]) -> str:
+    return "|".join(_dedupe_keep_order(selected_file_version_ids))
+
+
+def create_agent_run(
+    *,
+    task_type: str,
+    prompt: str,
+    selected_file_version_ids: Optional[List[Any]] = None,
+    session_id: Optional[str] = None,
+    tree_id: Optional[str] = None,
+    tree_version: Optional[int] = None,
+    execution_mode: str = "async",
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    run_id = f"run_{uuid4().hex[:12]}"
+    now = _now()
+    scope_ids = _dedupe_keep_order(selected_file_version_ids)
+    doc = {
+        "_id": run_id,
+        "run_id": run_id,
+        "contract_version": CONTRACT_VERSION,
+        "task_type": str(task_type or "generate_fault_tree"),
+        "prompt": str(prompt or ""),
+        "selected_file_version_ids": scope_ids,
+        "scope_key": make_scope_key(scope_ids),
+        "session_id": str(session_id).strip() if session_id else None,
+        "tree_id": str(tree_id).strip() if tree_id else None,
+        "tree_version": tree_version,
+        "execution_mode": execution_mode,
+        "status": RUN_STATUS_QUEUED,
+        "current_stage": STAGE_CREATED,
+        "progress": {"completed": 0, "total": 0},
+        "confirmation": None,
+        "last_event_seq": 0,
+        "result": None,
+        "error": None,
+        "options": options or {},
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+    }
+    agent_runs_col.insert_one(doc)
+    return _strip_mongo_id(doc) or {}
+
+
+def get_agent_run(run_id: str) -> Optional[Dict[str, Any]]:
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return None
+    return _strip_mongo_id(agent_runs_col.find_one({"_id": run_id}))
+
+
+def update_agent_run(run_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return None
+    payload = dict(fields or {})
+    payload["updated_at"] = _now()
+    agent_runs_col.update_one({"_id": run_id}, {"$set": payload})
+    return get_agent_run(run_id)
+

@@ -12,8 +12,9 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
@@ -60,6 +61,21 @@ from database import (
     upsert_top_event_catalog_entry,
     versions_col,
 )
+from agent_runtime.event_store import append_agent_event, list_agent_events
+from agent_runtime.policies import (
+    ERROR_CONFIRMATION_NOT_FOUND,
+    ERROR_INVALID_REQUEST,
+    ERROR_INVALID_RUN_STATE,
+    ERROR_RUN_NOT_FOUND,
+    EVENT_CONFIRMATION_RECEIVED,
+    EVENT_RUN_CREATED,
+    RUN_STATUS_QUEUED,
+    RUN_STATUS_RUNNING,
+    RUN_STATUS_WAITING_CONFIRMATION,
+    STAGE_RETRIEVAL,
+)
+from agent_runtime.run_store import create_agent_run, get_agent_run, update_agent_run
+from agent_runtime.schemas import AgentConfirmRequest, AgentRunRequest
 from diff_analyzer import analyze_and_store, corrections_col, generate_change_description
 from generator import (
     build_top_event_normalized_candidates,
@@ -243,6 +259,158 @@ def _dedupe_keep_order(values: Optional[List[str]]) -> List[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _agent_error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+    details: Optional[Dict[str, Any]] = None,
+):
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+                "details": details,
+            }
+        },
+    )
+
+
+def _agent_run_response(run: Dict[str, Any], events: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    return {
+        "contract_version": run.get("contract_version"),
+        "run_id": run.get("run_id"),
+        "task_type": run.get("task_type"),
+        "status": run.get("status"),
+        "current_stage": run.get("current_stage"),
+        "progress": run.get("progress") or {"completed": 0, "total": 0},
+        "selected_file_version_ids": run.get("selected_file_version_ids") or [],
+        "session_id": run.get("session_id"),
+        "tree_id": run.get("tree_id"),
+        "tree_version": run.get("tree_version"),
+        "execution_mode": run.get("execution_mode"),
+        "confirmation": run.get("confirmation"),
+        "result": run.get("result"),
+        "error": run.get("error"),
+        "last_event_seq": int(run.get("last_event_seq") or 0),
+        "events": events or [],
+        "created_at": run.get("created_at"),
+        "updated_at": run.get("updated_at"),
+        "poll_url": f"/api/agent/run/{run.get('run_id')}",
+    }
+
+
+@app.post("/api/agent/run")
+def api_agent_run(req: AgentRunRequest, response: Response):
+    prompt = str(req.prompt or "").strip()
+    if not prompt:
+        return _agent_error_response(400, ERROR_INVALID_REQUEST, "prompt is required")
+    ids = _dedupe_keep_order(req.selected_file_version_ids)
+    try:
+        run = create_agent_run(
+            task_type=req.task_type,
+            prompt=prompt,
+            selected_file_version_ids=ids,
+            session_id=req.session_id,
+            tree_id=req.tree_id,
+            tree_version=req.tree_version,
+            execution_mode="sync" if req.sync else "async",
+            options={
+                **(req.options or {}),
+                **({"max_depth": req.max_depth} if req.max_depth is not None else {}),
+            },
+        )
+        event = append_agent_event(
+            run["run_id"],
+            EVENT_RUN_CREATED,
+            stage=run.get("current_stage"),
+            message="Agent run created.",
+            payload={
+                "task_type": run.get("task_type"),
+                "selected_file_version_ids": ids,
+                "execution_mode": run.get("execution_mode"),
+            },
+        )
+        run = get_agent_run(run["run_id"]) or run
+    except Exception as exc:
+        return _agent_error_response(
+            500,
+            ERROR_INVALID_REQUEST,
+            f"Failed to create agent run: {exc}",
+            retryable=True,
+        )
+    if run.get("status") == RUN_STATUS_QUEUED and run.get("execution_mode") == "async":
+        response.status_code = 202
+    return {
+        "mode": "queued",
+        **_agent_run_response(run, [event]),
+    }
+
+
+@app.get("/api/agent/run/{run_id}")
+def api_agent_run_status(
+    run_id: str,
+    after_event_seq: int = 0,
+    include_tree_data: bool = False,
+):
+    run = get_agent_run(run_id)
+    if not run:
+        return _agent_error_response(404, ERROR_RUN_NOT_FOUND, f"Agent run not found: {run_id}")
+    events = list_agent_events(run_id, after_event_seq=after_event_seq)
+    payload = _agent_run_response(run, events)
+    if not include_tree_data and isinstance(payload.get("result"), dict):
+        result = dict(payload["result"])
+        result.pop("tree_data", None)
+        payload["result"] = result
+    return payload
+
+
+@app.post("/api/agent/run/{run_id}/confirm")
+def api_agent_run_confirm(run_id: str, req: AgentConfirmRequest):
+    run = get_agent_run(run_id)
+    if not run:
+        return _agent_error_response(404, ERROR_RUN_NOT_FOUND, f"Agent run not found: {run_id}")
+    if run.get("status") != RUN_STATUS_WAITING_CONFIRMATION:
+        return _agent_error_response(
+            409,
+            ERROR_INVALID_RUN_STATE,
+            f"Agent run is not waiting for confirmation: {run.get('status')}",
+            details={"status": run.get("status")},
+        )
+    confirmation = run.get("confirmation") or {}
+    if confirmation.get("confirmation_id") != req.confirmation_id:
+        return _agent_error_response(
+            404,
+            ERROR_CONFIRMATION_NOT_FOUND,
+            f"Confirmation not found: {req.confirmation_id}",
+        )
+    updated = update_agent_run(
+        run_id,
+        {
+            "status": RUN_STATUS_RUNNING,
+            "current_stage": STAGE_RETRIEVAL,
+            "confirmation": {
+                **confirmation,
+                "status": "confirmed",
+                "selected_candidate_ref": req.candidate_ref,
+                "note": req.note,
+            },
+        },
+    )
+    event = append_agent_event(
+        run_id,
+        EVENT_CONFIRMATION_RECEIVED,
+        stage=STAGE_RETRIEVAL,
+        message="Confirmation received.",
+        payload={"confirmation_id": req.confirmation_id, "candidate_ref": req.candidate_ref},
+    )
+    return _agent_run_response(updated or get_agent_run(run_id) or run, [event])
 
 
 @app.post("/api/graph/cypher")
