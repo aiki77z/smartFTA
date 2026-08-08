@@ -1,2 +1,0 @@
-"""Baseline utilities for smartFTA."""
-
