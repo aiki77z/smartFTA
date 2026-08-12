@@ -1900,6 +1900,93 @@ def get_version(tree_id: str, version: int = None) -> dict:
     return versions_col.find_one({"tree_id": tree_id, "version": version}, {"_id": 0})
 
 
+def upsert_correction_episode(episode: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(episode or {})
+    tree_id = _normalize_identifier(payload.get("tree_id"))
+    ai_version = payload.get("ai_version")
+    expert_version = payload.get("expert_version")
+    if not tree_id or ai_version is None or expert_version is None:
+        raise ValueError("tree_id, ai_version, and expert_version are required")
+
+    try:
+        ai_version = int(ai_version)
+        expert_version = int(expert_version)
+    except Exception as exc:
+        raise ValueError("ai_version and expert_version must be integers") from exc
+
+    episode_id = _normalize_identifier(payload.get("episode_id"))
+    if not episode_id:
+        episode_id = f"ce_{tree_id}_{ai_version}_{expert_version}"
+    now = _now()
+    payload.update(
+        {
+            "_id": episode_id,
+            "episode_id": episode_id,
+            "tree_id": tree_id,
+            "ai_version": ai_version,
+            "expert_version": expert_version,
+            "updated_at": now,
+        }
+    )
+    payload.setdefault("created_at", now)
+    payload.setdefault("status", "expert_confirmed")
+    set_payload = dict(payload)
+    set_payload.pop("_id", None)
+    created_at = set_payload.pop("created_at", now)
+    correction_episodes_col.update_one(
+        {"_id": episode_id},
+        {"$set": set_payload, "$setOnInsert": {"created_at": created_at}},
+        upsert=True,
+    )
+    return _strip_mongo_id(correction_episodes_col.find_one({"_id": episode_id})) or {}
+
+
+def list_correction_episodes(
+    *,
+    tree_id: Optional[str] = None,
+    scope_key: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {}
+    if tree_id:
+        query["tree_id"] = _normalize_identifier(tree_id)
+    if scope_key:
+        query["scope_key"] = _normalize_identifier(scope_key)
+    if status:
+        query["status"] = _normalize_identifier(status)
+    cursor = (
+        correction_episodes_col.find(query, {"_id": 0})
+        .sort("created_at", DESCENDING)
+        .limit(max(1, min(int(limit or 50), 500)))
+    )
+    return list(cursor)
+
+
+def list_active_repair_patterns(
+    *,
+    issue_codes: Optional[List[Any]] = None,
+    scope_key: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {"status": "active"}
+    cleaned_codes = _dedupe_keep_order([_normalize_identifier(code).upper() for code in issue_codes or []])
+    if cleaned_codes:
+        query["issue_code"] = {"$in": cleaned_codes}
+    if scope_key:
+        query["$or"] = [
+            {"scope_key": _normalize_identifier(scope_key)},
+            {"scope_key": ""},
+            {"scope_key": {"$exists": False}},
+        ]
+    cursor = (
+        repair_patterns_col.find(query, {"_id": 0})
+        .sort("updated_at", DESCENDING)
+        .limit(max(1, min(int(limit or 50), 500)))
+    )
+    return list(cursor)
+
+
 def rollback_version(tree_id: str, target_version: int):
     target = versions_col.find_one({"tree_id": tree_id, "version": target_version})
     if not target:
