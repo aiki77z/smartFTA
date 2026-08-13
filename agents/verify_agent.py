@@ -4,8 +4,8 @@ from typing import Any, Dict, Optional
 
 from agent_runtime.artifact_store import put_agent_artifact
 from agent_runtime.event_store import append_agent_event
-from agent_runtime.policies import ARTIFACT_VALIDATION_REPORT, EVENT_VALIDATION_DONE, STAGE_VALIDATION
-from tools.validator_tools import normalize_validation_report
+from agent_runtime.policies import ARTIFACT_VALIDATION_REPORT, EVENT_VALIDATION_DONE, STAGE_VALIDATE
+from tools.validator_tools import normalize_validation_report, supplement_structural_issues
 from validator import validate_full
 
 
@@ -25,6 +25,7 @@ class VerifyAgent:
     ) -> Dict[str, Any]:
         tree_data = _extract_tree_data(draft_tree_artifact)
         raw_report = validate_full(tree_data, skip_semantic=skip_semantic, include_meta=True)
+        raw_report = supplement_structural_issues(tree_data, raw_report)
         report = normalize_validation_report(
             raw_report,
             scope_key=scope_key,
@@ -46,7 +47,7 @@ class VerifyAgent:
             append_agent_event(
                 run_id,
                 EVENT_VALIDATION_DONE,
-                stage=STAGE_VALIDATION,
+                stage=STAGE_VALIDATE,
                 message=_validation_message(report),
                 payload={
                     "artifact_id": artifact.get("artifact_id"),

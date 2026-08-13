@@ -159,3 +159,132 @@ def normalize_validation_report(
     if raw.get("meta"):
         report["meta"] = raw.get("meta")
     return report
+
+
+def supplement_structural_issues(tree_data: Dict[str, Any], raw_report: Dict[str, Any]) -> Dict[str, Any]:
+    """Add stable local structural issues that external validators may collapse."""
+
+    report = dict(raw_report or {})
+    issues = list(report.get("issues") or [])
+    existing = {
+        (
+            str(issue.get("code") or issue.get("issue_code") or "").upper(),
+            tuple(_as_list(issue.get("node_id") or issue.get("node_ids") or issue.get("node_name"))),
+            tuple(_as_list(issue.get("link_id") or issue.get("link_ids"))),
+        )
+        for issue in issues
+        if isinstance(issue, dict)
+    }
+
+    def add_issue(issue: Dict[str, Any]) -> None:
+        key = (
+            str(issue.get("code") or "").upper(),
+            tuple(_as_list(issue.get("node_id") or issue.get("node_ids") or issue.get("node_name"))),
+            tuple(_as_list(issue.get("link_id") or issue.get("link_ids"))),
+        )
+        if key not in existing:
+            existing.add(key)
+            issues.append(issue)
+
+    if not isinstance(tree_data, dict):
+        report["issues"] = issues
+        return _recount_raw_report(report)
+
+    node_list = tree_data.get("nodeList") or []
+    link_list = tree_data.get("linkList") or []
+    if not isinstance(node_list, list) or not isinstance(link_list, list):
+        report["issues"] = issues
+        return _recount_raw_report(report)
+
+    seen_node_ids = set()
+    all_node_ids = set()
+    for index, node in enumerate(node_list):
+        if not isinstance(node, dict):
+            add_issue(
+                {
+                    "level": "ERROR",
+                    "code": "INVALID_NODE",
+                    "message": "nodeList contains a non-object node",
+                    "node_id": f"node_index_{index}",
+                    "source": "c_structural_precheck",
+                }
+            )
+            continue
+        node_id = str(node.get("id") or "").strip()
+        if not node_id:
+            add_issue(
+                {
+                    "level": "ERROR",
+                    "code": "MISSING_NODE_ID",
+                    "message": "node is missing id",
+                    "node_id": f"node_index_{index}",
+                    "node_name": str(node.get("name") or ""),
+                    "source": "c_structural_precheck",
+                }
+            )
+            continue
+        if node_id in seen_node_ids:
+            add_issue(
+                {
+                    "level": "ERROR",
+                    "code": "DUPLICATE_NODE_ID",
+                    "message": f"duplicate node id: {node_id}",
+                    "node_id": node_id,
+                    "node_name": str(node.get("name") or ""),
+                    "source": "c_structural_precheck",
+                }
+            )
+        seen_node_ids.add(node_id)
+        all_node_ids.add(node_id)
+
+    for index, link in enumerate(link_list):
+        if not isinstance(link, dict):
+            add_issue(
+                {
+                    "level": "ERROR",
+                    "code": "INVALID_LINK",
+                    "message": "linkList contains a non-object link",
+                    "link_id": f"link_index_{index}",
+                    "source": "c_structural_precheck",
+                }
+            )
+            continue
+        source_id = str(link.get("sourceId") or "").strip()
+        target_id = str(link.get("targetId") or "").strip()
+        if not source_id or not target_id:
+            add_issue(
+                {
+                    "level": "ERROR",
+                    "code": "MISSING_LINK_ENDPOINT",
+                    "message": "link is missing sourceId or targetId",
+                    "link_id": str(link.get("id") or f"link_index_{index}"),
+                    "source": "c_structural_precheck",
+                }
+            )
+            continue
+        if source_id not in all_node_ids or target_id not in all_node_ids:
+            add_issue(
+                {
+                    "level": "ERROR",
+                    "code": "BROKEN_LINK",
+                    "message": "link points to a missing node",
+                    "link_id": str(link.get("id") or f"link_index_{index}"),
+                    "source": "c_structural_precheck",
+                }
+            )
+
+    report["issues"] = issues
+    return _recount_raw_report(report)
+
+
+def _recount_raw_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    issues = [issue for issue in (report.get("issues") or []) if isinstance(issue, dict)]
+    error_count = sum(1 for issue in issues if _as_severity(issue.get("level") or issue.get("severity")) == "error")
+    warning_count = sum(1 for issue in issues if _as_severity(issue.get("level") or issue.get("severity")) == "warning")
+    info_count = len(issues) - error_count - warning_count
+    report["issues"] = issues
+    report["error_count"] = error_count
+    report["warning_count"] = warning_count
+    report["info_count"] = info_count
+    report["passed"] = error_count == 0
+    return report

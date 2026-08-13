@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from database import (
     correction_episodes_col,
     list_active_repair_patterns as db_list_active_repair_patterns,
+    upsert_repair_pattern,
     upsert_correction_episode,
 )
 
@@ -143,3 +144,120 @@ def list_recent_correction_episodes(
         query["status"] = status
     cursor = correction_episodes_col.find(query, {"_id": 0}).sort("created_at", -1).limit(max(1, int(limit or 20)))
     return list(cursor)
+
+
+def derive_repair_patterns_from_episode(
+    episode: Dict[str, Any],
+    *,
+    activate_expert_confirmed: bool = True,
+) -> List[Dict[str, Any]]:
+    status = str((episode or {}).get("status") or "")
+    expert_confirmed = status == "expert_confirmed"
+    patterns = []
+    for diff in (episode or {}).get("diffs") or []:
+        if not isinstance(diff, dict):
+            continue
+        operation = _operation_from_diff(diff)
+        if not operation:
+            continue
+        pattern = {
+            "issue_code": _issue_code_from_diff(diff),
+            "operation": operation,
+            "scope_key": str((episode or {}).get("scope_key") or ""),
+            "status": "active" if expert_confirmed and activate_expert_confirmed else "pending",
+            "source": "correction_episode",
+            "episode_id": (episode or {}).get("episode_id"),
+            "tree_id": (episode or {}).get("tree_id"),
+            "top_event": (episode or {}).get("top_event"),
+            "signature": _pattern_signature(diff),
+            "description": _pattern_description(diff),
+            "success_count": 1 if expert_confirmed else 0,
+            "failure_count": 0,
+            "operations": [_operation_payload_from_diff(diff, operation)],
+            "updated_at": _now(),
+        }
+        patterns.append(upsert_repair_pattern(pattern))
+    return patterns
+
+
+def _operation_from_diff(diff: Dict[str, Any]) -> str:
+    mapping = {
+        "gate_changed": "replace_gate",
+        "link_added": "add_edge",
+        "link_deleted": "remove_edge",
+        "name_edited": "update_node",
+        "node_added": "add_node",
+        "node_deleted": "remove_node",
+    }
+    return mapping.get(str(diff.get("type") or ""))
+
+
+def _issue_code_from_diff(diff: Dict[str, Any]) -> str:
+    mapping = {
+        "gate_changed": "WRONG_GATE",
+        "link_added": "MISSING_EDGE",
+        "link_deleted": "REDUNDANT_PATH",
+        "name_edited": "INACCURATE_NODE_NAME",
+        "node_added": "MISSING_NODE",
+        "node_deleted": "REDUNDANT_NODE",
+    }
+    return mapping.get(str(diff.get("type") or ""), "EXPERT_CORRECTION")
+
+
+def _operation_payload_from_diff(diff: Dict[str, Any], operation: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "op": operation,
+        "source": "repair_patterns",
+        "reason_issue_code": _issue_code_from_diff(diff),
+    }
+    if operation == "replace_gate":
+        payload["node_name"] = diff.get("node_name")
+        payload["gate"] = diff.get("to_gate") or "OR"
+    elif operation == "update_node":
+        payload["node_name"] = diff.get("node_name") or diff.get("from_name")
+        payload["fields"] = {"name": diff.get("to_name")}
+    elif operation == "remove_node":
+        payload["node_name"] = diff.get("node_name")
+    elif operation == "add_edge":
+        payload["from_node"] = diff.get("from_node")
+        payload["to_node"] = diff.get("to_node")
+    elif operation == "remove_edge":
+        payload["from_node"] = diff.get("from_node")
+        payload["to_node"] = diff.get("to_node")
+    elif operation == "add_node":
+        payload["node"] = {
+            "name": diff.get("node_name"),
+            "type": diff.get("node_type") or "basic_event",
+            "gate": diff.get("gate"),
+        }
+    return payload
+
+
+def _pattern_signature(diff: Dict[str, Any]) -> str:
+    compact = {
+        "type": diff.get("type"),
+        "node_type": diff.get("node_type"),
+        "node_name": diff.get("node_name"),
+        "from_gate": diff.get("from_gate"),
+        "to_gate": diff.get("to_gate"),
+        "from_node": diff.get("from_node"),
+        "to_node": diff.get("to_node"),
+    }
+    return json.dumps(compact, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _pattern_description(diff: Dict[str, Any]) -> str:
+    diff_type = str(diff.get("type") or "")
+    if diff_type == "gate_changed":
+        return f"Expert changed gate on {diff.get('node_name')} to {diff.get('to_gate')}"
+    if diff_type == "name_edited":
+        return f"Expert renamed {diff.get('from_name')} to {diff.get('to_name')}"
+    if diff_type == "node_added":
+        return f"Expert added node {diff.get('node_name')}"
+    if diff_type == "node_deleted":
+        return f"Expert removed node {diff.get('node_name')}"
+    if diff_type == "link_added":
+        return f"Expert added edge {diff.get('from_node')} -> {diff.get('to_node')}"
+    if diff_type == "link_deleted":
+        return f"Expert removed edge {diff.get('from_node')} -> {diff.get('to_node')}"
+    return "Expert correction pattern"

@@ -735,7 +735,8 @@ def _mark_agent_run_human_review(
 
 def _commit_agent_draft(run_id: str, draft_artifact: Dict[str, Any], validation: Dict[str, Any]) -> Dict[str, Any]:
     run = get_agent_run(run_id) or {}
-    tree_data = (draft_artifact.get("payload") or draft_artifact.get("content") or {}).copy()
+    artifact_content = draft_artifact.get("payload") or draft_artifact.get("content") or {}
+    tree_data = (artifact_content.get("tree_data") or artifact_content).copy()
     tree_data["validation"] = validation
     retrieval = tree_data.get("retrieval") or {}
     tree_id = f"ft_{uuid.uuid4().hex[:8]}"
@@ -872,14 +873,18 @@ def _run_agent_second_phase(run_id: str, catalog: Dict[str, Any]) -> Dict[str, A
                     validation=validation,
                     reason="No reliable repair could be produced; expert review is required.",
                 )
-            current_draft = _append_agent_artifact(
-                run_id,
-                ARTIFACT_TREE_DRAFT,
-                repaired_tree,
-                producer="RepairAgent",
-                parent_artifact_id=current_draft.get("artifact_id"),
-            )
-            append_agent_event(run_id, EVENT_DRAFT_GENERATED, stage=STAGE_REPAIR, message="Repaired draft created.", payload={"artifact_id": current_draft.get("artifact_id"), "repair_patch_artifact_id": (repair.get("payload") or {}).get("artifact_id")})
+            repaired_draft = repair.get("draft_tree_artifact")
+            if isinstance(repaired_draft, dict) and repaired_draft.get("artifact_id"):
+                current_draft = repaired_draft
+            else:
+                current_draft = _append_agent_artifact(
+                    run_id,
+                    ARTIFACT_TREE_DRAFT,
+                    repaired_tree,
+                    producer="RepairAgent",
+                    parent_artifact_id=current_draft.get("artifact_id"),
+                )
+                append_agent_event(run_id, EVENT_DRAFT_GENERATED, stage=STAGE_REPAIR, message="Repaired draft created.", payload={"artifact_id": current_draft.get("artifact_id"), "repair_patch_artifact_id": (repair.get("payload") or {}).get("artifact_id")})
         raise RuntimeError("Unexpected repair workflow exit")
     except Exception as exc:
         return _mark_agent_run_failed(run_id, f"Second-phase workflow failed: {exc}")
