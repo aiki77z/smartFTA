@@ -420,6 +420,7 @@ def fta_edit(req: EditRequest):
 from app.agents.assistant_agent import assistant_agent  # noqa: E402
 from app.memory.session_store import session_store  # noqa: E402
 from app.schemas import (  # noqa: E402
+    AssistantAgentRunConfirmRequest,
     AssistantMessageRequest,
     AssistantMessageResponse,
     AssistantSessionResponse,
@@ -464,4 +465,45 @@ def assistant_truncate_session(session_id: str, req: AssistantTruncateRequest):
         remaining_count=result["remaining_count"],
         messages_path=session_store.session_messages_path(session_id),
     )
+
+
+@app.get("/api/assistant/agent-run/{run_id}", response_model=AssistantMessageResponse)
+def assistant_agent_run_status(
+    run_id: str,
+    session_id: Optional[str] = None,
+    after_event_seq: int = 0,
+    include_tree_data: bool = False,
+):
+    try:
+        return assistant_agent.handle_agent_run_status(
+            run_id=run_id,
+            session_id=session_id,
+            after_event_seq=after_event_seq,
+            include_tree_data=include_tree_data,
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/assistant/agent-run/{run_id}/confirm", response_model=AssistantMessageResponse)
+def assistant_agent_run_confirm(run_id: str, req: AssistantAgentRunConfirmRequest):
+    try:
+        return assistant_agent.confirm_agent_run(
+            run_id=run_id,
+            confirmation_id=req.confirmation_id,
+            candidate_ref=req.candidate_ref,
+            confirmation_type=req.confirmation_type,
+            note=req.note,
+            session_id=req.session_id,
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 

@@ -74,3 +74,11 @@ class AssistantTruncateResponse(BaseModel):
     removed_count: int
     remaining_count: int
     messages_path: Optional[str] = None
+
+
+class AssistantAgentRunConfirmRequest(BaseModel):
+    session_id: Optional[str] = None
+    confirmation_id: str = Field(..., min_length=1)
+    confirmation_type: str = Field(default="top_event", min_length=1)
+    candidate_ref: str = Field(..., min_length=1)
+    note: Optional[str] = None

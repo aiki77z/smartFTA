@@ -6,6 +6,9 @@ function stageLabel(stage) {
     queued: '排队',
     prepare: '准备',
     tree_record: '创建记录',
+    waiting_confirmation: '待确认',
+    review: '人工复核',
+    human_review_required: '人工复核',
     completed: '完成',
     reuse: '复用',
     failed: '失败',
@@ -39,6 +42,7 @@ export default function GenerationTaskPanel({ tasks, onOpenTree }) {
         const pct = Math.max(0, Math.min(100, Number(task.progress) || 0))
         const done = task.status === 'completed' && task.faultTreeId
         const failed = task.status === 'failed'
+        const review = task.status === 'review'
         const queued = task.status === 'queued'
         const running = task.status === 'running'
         const clickable = Boolean(done)
@@ -51,6 +55,7 @@ export default function GenerationTaskPanel({ tasks, onOpenTree }) {
             type="button"
             className={`gen-task-card${clickable ? ' gen-task-card--clickable' : ''}${
               failed ? ' gen-task-card--failed' : ''
+            }${review ? ' gen-task-card--review' : ''
             }`}
             disabled={!clickable}
             onClick={() => {
@@ -63,6 +68,8 @@ export default function GenerationTaskPanel({ tasks, onOpenTree }) {
                 className={`gen-task-dot${
                   failed
                     ? ' gen-task-dot--fail'
+                    : review
+                      ? ' gen-task-dot--review'
                     : done
                       ? ' gen-task-dot--done'
                       : running
@@ -84,17 +91,19 @@ export default function GenerationTaskPanel({ tasks, onOpenTree }) {
               </div>
             </div>
 
-            {queued ? (
+            {queued || review ? (
               <div className="gen-task-row">
-                <span className="gen-task-stage">等待上一任务完成后开始</span>
+                <span className="gen-task-stage">
+                  {queued ? '等待上一任务完成后开始' : '生成结果需要人工复核'}
+                </span>
               </div>
             ) : null}
 
-            {running || (failed && pct > 0 && pct < 100) ? (
+            {running || review || (failed && pct > 0 && pct < 100) ? (
               <>
                 <div className="gen-task-row">
                   <span className="gen-task-stage" title={detail || task.message}>
-                    {running ? detail || '生成中…' : task.message || ''}
+                    {running ? detail || '生成中…' : review ? task.message || '生成结果需要人工复核' : task.message || ''}
                   </span>
                   <span className="gen-task-pct">{pct}%</span>
                 </div>
@@ -105,6 +114,7 @@ export default function GenerationTaskPanel({ tasks, onOpenTree }) {
             ) : null}
 
             {failed && task.error ? <div className="gen-task-err">{task.error}</div> : null}
+            {review && task.error ? <div className="gen-task-err">{task.error}</div> : null}
 
             {clickable ? (
               <div className="gen-task-actions">

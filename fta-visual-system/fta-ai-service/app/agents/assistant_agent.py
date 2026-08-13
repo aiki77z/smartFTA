@@ -787,6 +787,12 @@ class AssistantAgent:
         result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         result = result or {}
+        agent_run_payload = result.get("agent_run") if isinstance(result.get("agent_run"), dict) else {}
+        if not agent_run_payload and isinstance(result, dict) and result.get("run_id"):
+            agent_run_payload = result
+        if not isinstance(agent_run_payload, dict):
+            agent_run_payload = {}
+
         previous_memory = session_store.get_session(session_id)
         recent_messages = session_store.list_messages(session_id, limit=20)
         conversation_summary = conversation_summary_agent.summarize(
@@ -797,21 +803,62 @@ class AssistantAgent:
             latest_assistant_message=assistant_message,
             selected_file_version_ids=scope_ids,
         )
+        agent_run_id = agent_run_payload.get("run_id") or result.get("run_id") or previous_memory.get("agent_run_id")
+        agent_run_status = str(agent_run_payload.get("status") or result.get("status") or "").lower()
+        agent_run_mode = str(agent_run_payload.get("mode") or result.get("mode") or "").lower()
+        agent_run_confirmation = agent_run_payload.get("confirmation") or result.get("confirmation")
+        if agent_run_status in {"completed", "failed", "cancelled"}:
+            pending_confirmation = None
+        elif agent_run_status == "waiting_confirmation" or agent_run_mode == "need_confirmation":
+            pending_confirmation = agent_run_confirmation
+        elif intent == "generate_tree":
+            pending_confirmation = None
+        else:
+            pending_confirmation = previous_memory.get("pending_confirmation")
+
+        last_generation_result = (
+            result
+            if intent == "generate_tree"
+            else previous_memory.get("last_generation_result")
+        )
         patch = {
             "project_id": req.project_id,
             "canvas_id": req.canvas_id,
-            "current_tree_id": result.get("tree_id") or req.current_tree_id,
-            "current_tree_version": result.get("tree_version") if result.get("tree_version") is not None else previous_memory.get("current_tree_version"),
-            "current_top_event": tree_summary.get("top_event") or result.get("resolved_top_event"),
+            "current_tree_id": (
+                agent_run_payload.get("tree_id")
+                or result.get("tree_id")
+                or req.current_tree_id
+            ),
+            "current_tree_version": (
+                agent_run_payload.get("tree_version")
+                if agent_run_payload.get("tree_version") is not None
+                else (
+                    result.get("tree_version")
+                    if result.get("tree_version") is not None
+                    else previous_memory.get("current_tree_version")
+                )
+            ),
+            "current_top_event": (
+                tree_summary.get("top_event")
+                or agent_run_payload.get("resolved_top_event")
+                or result.get("resolved_top_event")
+            ),
             "selected_file_version_ids": scope_ids,
             "source_scope_key": "|".join(sorted(scope_ids)),
-            "agent_run_id": result.get("run_id") or previous_memory.get("agent_run_id"),
-            "pending_confirmation": (
-                result.get("confirmation")
-                if result.get("mode") == "need_confirmation"
-                else (None if intent == "generate_tree" else previous_memory.get("pending_confirmation"))
+            "agent_run_id": agent_run_id,
+            "agent_run_status": agent_run_status or previous_memory.get("agent_run_status"),
+            "agent_run_current_stage": (
+                agent_run_payload.get("current_stage")
+                or result.get("current_stage")
+                or previous_memory.get("agent_run_current_stage")
             ),
-            "last_generation_result": result if intent == "generate_tree" else previous_memory.get("last_generation_result"),
+            "agent_run_last_event_seq": (
+                agent_run_payload.get("last_event_seq")
+                if agent_run_payload.get("last_event_seq") is not None
+                else result.get("last_event_seq", previous_memory.get("agent_run_last_event_seq"))
+            ),
+            "pending_confirmation": pending_confirmation,
+            "last_generation_result": last_generation_result,
             "workspace_kb_epoch": req.workspace_kb_epoch,
             "last_user_intent": intent,
             "last_assistant_message": assistant_message,
@@ -824,6 +871,101 @@ class AssistantAgent:
             ),
         }
         return session_store.upsert_session(session_id, patch)
+
+    def handle_agent_run_status(
+        self,
+        *,
+        run_id: str,
+        session_id: Optional[str] = None,
+        after_event_seq: int = 0,
+        include_tree_data: bool = False,
+    ) -> AssistantMessageResponse:
+        payload = gnr_client.poll_agent_run(
+            run_id=run_id,
+            after_event_seq=after_event_seq,
+            include_tree_data=include_tree_data,
+        )
+        resolved_session_id = session_id or payload.get("session_id") or run_id
+        assistant_message, action = self._agent_run_message_action(payload)
+        memory = self._update_memory(
+            AssistantMessageRequest(session_id=resolved_session_id, message="agent run status"),
+            resolved_session_id,
+            "generate_tree",
+            {},
+            self._normalize_ids(payload.get("selected_file_version_ids") or []),
+            assistant_message,
+            payload,
+        )
+        return AssistantMessageResponse(
+            session_id=resolved_session_id,
+            intent="generate_tree",
+            action=action,
+            assistant_message=assistant_message,
+            result={"agent_run": payload},
+            memory=memory,
+            agent_trace=[self._step("AgentRunPoller", "success", {
+                "run_id": payload.get("run_id") or run_id,
+                "status": payload.get("status"),
+                "current_stage": payload.get("current_stage"),
+                "last_event_seq": payload.get("last_event_seq"),
+            })],
+        )
+
+    def confirm_agent_run(
+        self,
+        *,
+        run_id: str,
+        confirmation_id: str,
+        candidate_ref: str,
+        confirmation_type: str = "top_event",
+        note: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> AssistantMessageResponse:
+        payload = gnr_client.confirm_agent_run(
+            run_id=run_id,
+            confirmation_id=confirmation_id,
+            candidate_ref=candidate_ref,
+            confirmation_type=confirmation_type,
+            note=note,
+        )
+        resolved_session_id = session_id or payload.get("session_id") or run_id
+        assistant_message, action = self._agent_run_message_action(payload)
+        memory = self._update_memory(
+            AssistantMessageRequest(session_id=resolved_session_id, message="agent run confirmation"),
+            resolved_session_id,
+            "generate_tree",
+            {},
+            self._normalize_ids(payload.get("selected_file_version_ids") or []),
+            assistant_message,
+            payload,
+        )
+        return AssistantMessageResponse(
+            session_id=resolved_session_id,
+            intent="generate_tree",
+            action=action,
+            assistant_message=assistant_message,
+            result={"agent_run": payload},
+            memory=memory,
+            agent_trace=[self._step("AgentRunConfirmation", "success", {
+                "run_id": payload.get("run_id") or run_id,
+                "status": payload.get("status"),
+                "confirmation_id": confirmation_id,
+                "candidate_ref": candidate_ref,
+            })],
+        )
+
+    def _agent_run_message_action(self, payload: Dict[str, Any]) -> tuple[str, str]:
+        status = str(payload.get("status") or "").lower()
+        mode = str(payload.get("mode") or "").lower()
+        if status == "waiting_confirmation" or mode == "need_confirmation":
+            return "请选择一个顶事件候选，以继续生成故障树。", "need_top_event_confirmation"
+        if status == "completed" or mode == "completed":
+            return "多智能体故障树生成已完成。", "generation_finished"
+        if status == "human_review_required" or mode == "human_review_required":
+            return "生成结果需要人工复核。", "human_review_required"
+        if status == "failed" or mode == "failed":
+            return "多智能体故障树生成失败。", "generation_failed"
+        return "多智能体故障树生成任务正在执行。", "generation_running"
 
     def _build_conversation_summary(self, intent: str, tree_summary: Dict[str, Any], assistant_message: str) -> str:
         top = tree_summary.get("top_event") or "未确定顶事件"

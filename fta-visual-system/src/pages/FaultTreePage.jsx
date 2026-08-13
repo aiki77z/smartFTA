@@ -24,7 +24,14 @@ import {
   validateTreeSemantic,
   getFtaChunk,
 } from '../api/ftaBackend.js'
-import { editFaultTreeWithAi, sendAssistantAgentMessage, truncateAssistantSession } from '../api/ftaAiEditor.js'
+import {
+  confirmAssistantAgentRun,
+  editFaultTreeWithAi,
+  getAssistantSession,
+  pollAssistantAgentRun,
+  sendAssistantAgentMessage,
+  truncateAssistantSession,
+} from '../api/ftaAiEditor.js'
 import {
   parseRawFtaJson,
   parseTreeDataJson,
@@ -296,6 +303,40 @@ function mergeBackendJobEventsIntoTaskRef(ref, taskId, item, bumpRevision) {
   const prev = ref.current.get(taskId) || []
   const locals = prev.filter((e) => (Number(e.seq) || 0) >= ASSISTANT_LOCAL_EVENT_SEQ_MIN)
   ref.current.set(taskId, [...locals, ...mapped])
+  bumpRevision?.()
+}
+
+function unwrapAssistantAgentRun(resp) {
+  if (!resp || typeof resp !== 'object') return null
+  const run = resp?.result?.agent_run || resp?.agent_run || resp
+  return run && typeof run === 'object' && run.run_id ? run : null
+}
+
+function mapAgentRunEventsToTaskFormat(agentRun) {
+  const evs = Array.isArray(agentRun?.events) ? agentRun.events : []
+  return evs
+    .map((e, idx) => ({
+      seq: Number(e.event_seq ?? e.seq) || idx + 1,
+      ts: e.created_at || e.ts || new Date().toISOString(),
+      agent: e.type || e.agent || 'AgentRun',
+      avatar: String(e.type || e.agent || 'A').slice(0, 1),
+      level: String(e.level || 'INFO').toUpperCase(),
+      text: String(e.message || e.text || e.stage || ''),
+      progress: e.payload?.progress ?? e.progress,
+      stage: String(e.stage || '').toLowerCase(),
+      type: String(e.type || '').toUpperCase(),
+      artifactType: String(e.artifact_type || e.artifactType || e.payload?.artifact_type || '').toLowerCase(),
+    }))
+    .sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0))
+}
+
+function mergeAgentRunEventsIntoTaskRef(ref, taskId, agentRun, bumpRevision) {
+  const mapped = mapAgentRunEventsToTaskFormat(agentRun)
+  if (!mapped.length) return
+  const prev = ref.current.get(taskId) || []
+  const locals = prev.filter((e) => (Number(e.seq) || 0) >= ASSISTANT_LOCAL_EVENT_SEQ_MIN)
+  const bySeq = new Map([...locals, ...mapped].map((e) => [Number(e.seq) || 0, e]))
+  ref.current.set(taskId, [...bySeq.values()].sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0)))
   bumpRevision?.()
 }
 
@@ -1514,6 +1555,131 @@ function FaultTreePage() {
     }
   }, [assistantStoreKey, canvasIdFromQuery, projectIdFromQuery])
 
+  useEffect(() => {
+    let cancelled = false
+    const run = async () => {
+      try {
+        const payload = await getAssistantSession({ sessionId: assistantStoreKey })
+        if (cancelled || !payload || typeof payload !== 'object') return
+        if (Array.isArray(payload.messages) && payload.messages.length) {
+          setAssistantMessages((prev) => {
+            if (prev.length > 1) return prev
+            return payload.messages.slice(-320)
+          })
+        }
+        if (Array.isArray(payload.pending_actions) && payload.pending_actions.length) {
+          const pending = payload.pending_actions.find((p) => p && p.status === 'waiting_user_accept')
+          if (pending && !assistantPending) {
+            setAssistantPending((prev) => prev || pending)
+          }
+        }
+        const memory = payload.memory || {}
+        if (Array.isArray(memory.selected_file_version_ids) && memory.selected_file_version_ids.length) {
+          setSelectedSourceFiles((prev) => (prev.length ? prev : memory.selected_file_version_ids.slice()))
+        }
+        if (memory.current_tree_id && !backendTreeId) {
+          setBackendTreeId(String(memory.current_tree_id))
+        }
+        if (memory.agent_run_id && memory.agent_run_status && !['completed', 'failed', 'cancelled'].includes(String(memory.agent_run_status).toLowerCase())) {
+          setAssistantTasks((prev) => {
+            if (prev.length) return prev
+            const msg = memory.agent_run_status === 'waiting_confirmation'
+              ? '等待确认顶事件候选'
+              : memory.agent_run_status === 'human_review_required'
+                ? '生成结果需要人工复核'
+                : '多智能体生成任务进行中'
+            return [{
+              id: `task-${memory.agent_run_id}`,
+              createdAt: Date.now(),
+              userPrompt: memory.last_assistant_message || '',
+              promptPreview: memory.last_assistant_message || '',
+              title: '多智能体生成故障树',
+              status: memory.agent_run_status === 'human_review_required' ? 'review' : 'running',
+              progress: memory.agent_run_status === 'waiting_confirmation' ? 12 : 35,
+              stage: memory.agent_run_current_stage || memory.agent_run_status || 'running',
+              message: msg,
+              error: null,
+              faultTreeId: memory.current_tree_id || null,
+              jobId: null,
+              itemId: null,
+            }]
+          })
+        }
+        if (
+          memory.agent_run_id &&
+          memory.agent_run_status &&
+          !['completed', 'failed', 'cancelled'].includes(String(memory.agent_run_status).toLowerCase())
+        ) {
+          const runId = String(memory.agent_run_id)
+          const afterSeq = Number(memory.agent_run_last_event_seq || 0)
+          const includeTreeData = String(memory.agent_run_status).toLowerCase() !== 'waiting_confirmation'
+          const finalResp = await pollAssistantAgentRun({
+            runId,
+            sessionId: assistantStoreKey,
+            afterEventSeq: afterSeq,
+            includeTreeData,
+            intervalMs: 1500,
+            onUpdate: (_resp, agentRun) => {
+              if (cancelled) return
+              setAssistantTasks((prev) =>
+                prev.map((t) =>
+                  t.id === `task-${runId}`
+                    ? {
+                        ...t,
+                        status:
+                          agentRun?.status === 'failed'
+                            ? 'failed'
+                            : agentRun?.status === 'human_review_required'
+                              ? 'review'
+                              : String(agentRun?.status || '').toLowerCase() === 'completed'
+                                ? 'completed'
+                                : 'running',
+                        progress:
+                          String(agentRun?.status || '').toLowerCase() === 'waiting_confirmation'
+                            ? 12
+                            : String(agentRun?.status || '').toLowerCase() === 'completed'
+                              ? 100
+                              : t.progress,
+                        stage: agentRun?.current_stage || t.stage,
+                        message:
+                          String(agentRun?.status || '').toLowerCase() === 'waiting_confirmation'
+                            ? '等待确认顶事件候选'
+                            : String(agentRun?.status || '').toLowerCase() === 'human_review_required'
+                              ? '生成结果需要人工复核'
+                              : agentRun?.current_stage || t.message,
+                        faultTreeId: agentRun?.tree_id || t.faultTreeId,
+                      }
+                    : t,
+                ),
+              )
+            },
+          })
+          const finalRun = unwrapAssistantAgentRun(finalResp)
+          if (finalRun?.status === 'completed' && finalRun?.tree_id && !cancelled) {
+            if (finalRun.tree_data) {
+              const verPayload = buildVersionPayloadFromGenerateResponse({
+                tree_id: finalRun.tree_id,
+                tree_version: finalRun.tree_version,
+                tree_data: finalRun.tree_data,
+              })
+              if (verPayload) applyBackendVersionPayload(verPayload)
+            } else {
+              const ver = await getTree({ treeId: finalRun.tree_id })
+              applyBackendVersionPayload(ver)
+            }
+            setBackendTreeId(String(finalRun.tree_id))
+          }
+        }
+      } catch (err) {
+        console.warn('restore assistant session failed:', err)
+      }
+    }
+    run()
+    return () => {
+      cancelled = true
+    }
+  }, [assistantStoreKey, assistantPending, backendTreeId])
+
   // persist assistant state (best-effort) — 画布会话由下方草稿统一持久化
   useEffect(() => {
     if (canvasIdFromQuery) return
@@ -1796,8 +1962,133 @@ function FaultTreePage() {
     }
   }, [])
 
-  const runGenerateTaskFromEmptyCanvas = useCallback(
-    async (prompt, options = {}) => {
+  const runAgentRunGeneration = useCallback(
+    async (prompt, initialResponse) => {
+      const agentRun = unwrapAssistantAgentRun(initialResponse)
+      if (!agentRun?.run_id) {
+        const now = Date.now()
+        const taskId = `task-${now}-${Math.random().toString(36).slice(2, 9)}`
+        const promptPreview = prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt
+        const markTask = (patch) => {
+          setAssistantTasks((prev) =>
+            prev.map((t) => (t.id === taskId ? { ...t, ...patch } : t)),
+          )
+        }
+        setAssistantTasks((prev) => [
+          {
+            id: taskId,
+            createdAt: now,
+            userPrompt: prompt,
+            promptPreview,
+            title: '生成故障树',
+            status: 'running',
+            progress: 8,
+            stage: 'legacy_generate',
+            message: '正在连接旧生成接口',
+            error: null,
+            faultTreeId: null,
+            jobId: null,
+            itemId: null,
+          },
+          ...prev,
+        ].slice(0, 80))
+        assistantTaskEventHistoryRef.current.set(taskId, [])
+        upsertProgressMessage({
+          taskId,
+          agent: '流程控制',
+          avatar: 'P',
+          quote: promptPreview,
+          content: '进度：正在连接旧生成接口',
+        })
+        try {
+          let resp = initialResponse && Object.keys(initialResponse).length
+            ? normalizeGenerateResponse(initialResponse)
+            : null
+          if (!resp) {
+            if (!selectedFileVersionIdsForAssistant.length) {
+              throw new Error('请先在右侧「依据文件」中至少选择 1 个已导入完成的文件（file_version_id）')
+            }
+            const payload = { prompt, selectedFileVersionIds: selectedFileVersionIdsForAssistant }
+            if (
+              exploded3dGlbObjectUrl &&
+              exploded3dPartDetails &&
+              typeof exploded3dPartDetails === 'object' &&
+              Object.keys(exploded3dPartDetails).length > 0
+            ) {
+              payload.partDetails = exploded3dPartDetails
+            }
+            resp = normalizeGenerateResponse(await generateTree(payload))
+          }
+
+          if (resp?.mode === 'queued' && resp?.item_id) {
+            markTask({
+              itemId: resp.item_id,
+              jobId: resp.job_id || null,
+              message: '旧生成任务运行中',
+              progress: 20,
+            })
+            const finalItem = await pollGenerationJobItem({
+              itemId: resp.item_id,
+              onUpdate: (it) => {
+                const p = Math.max(8, Math.min(98, Number(it?.progress) || 20))
+                markTask({ progress: p, message: it?.message || '旧生成任务运行中' })
+                mergeBackendJobEventsIntoTaskRef(assistantTaskEventHistoryRef, taskId, it, () =>
+                  setAssistantTaskEventsRevision((n) => n + 1),
+                )
+              },
+            })
+            if (finalItem?.status !== 'success' || !finalItem?.tree_id) {
+              const msg = finalItem?.error || '旧生成任务失败'
+              markTask({ status: 'failed', progress: 100, stage: 'failed', message: msg, error: msg })
+              return { taskId, error: msg }
+            }
+            resp = { ...resp, tree_id: finalItem.tree_id, tree_version: finalItem.tree_version }
+          }
+
+          if (!resp?.tree_id) {
+            const msg = resp?.mode === 'need_confirmation'
+              ? '旧生成接口返回顶事件确认，当前确认流程需要 agent-run 接口'
+              : '旧生成接口没有返回 tree_id'
+            markTask({ status: 'failed', progress: 100, stage: 'failed', message: msg, error: msg })
+            return { taskId, error: msg }
+          }
+          setBackendTreeId(String(resp.tree_id))
+          if (resp.tree_data) {
+            const verPayload = buildVersionPayloadFromGenerateResponse(resp)
+            if (verPayload) applyBackendVersionPayload(verPayload)
+          } else {
+            const ver = await getTree({ treeId: resp.tree_id })
+            applyBackendVersionPayload(ver)
+          }
+          markTask({
+            status: 'completed',
+            progress: 100,
+            stage: resp.mode === 'reuse' ? 'reuse' : 'completed',
+            message: '生成完成',
+            faultTreeId: resp.tree_id,
+          })
+          upsertProgressMessage({
+            taskId,
+            agent: '流程控制',
+            avatar: 'P',
+            quote: promptPreview,
+            content: `生成完成并加载到画布（tree_id=${resp.tree_id}）。`,
+          })
+          return { taskId, treeId: resp.tree_id, reuse: resp.mode === 'reuse' }
+        } catch (err) {
+          const msg = formatGenerateBackendError(err?.message || String(err))
+          markTask({ status: 'failed', progress: 100, stage: 'failed', message: msg, error: msg })
+          upsertProgressMessage({
+            taskId,
+            agent: '流程控制',
+            avatar: 'P',
+            quote: promptPreview,
+            content: `错误：${msg}`,
+          })
+          return { taskId, error: msg }
+        }
+      }
+
       const now = Date.now()
       const taskId = `task-${now}-${Math.random().toString(36).slice(2, 9)}`
       const promptPreview = prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt
@@ -1808,389 +2099,181 @@ function FaultTreePage() {
           createdAt: now,
           userPrompt: prompt,
           promptPreview,
-          title: '生成故障树',
-          status: 'queued',
-          progress: 0,
-          stage: 'queued',
-          message: '排队中',
+          title: '多智能体生成故障树',
+          status: 'running',
+          progress: 8,
+          stage: agentRun.current_stage || agentRun.status || 'queued',
+          message: '已调度，正在等待多智能体进度',
           error: null,
           faultTreeId: null,
-          jobId: null,
-          itemId: null,
+          jobId: agentRun.generation_job_id || null,
+          itemId: agentRun.generation_job_item_id || null,
         },
         ...prev,
       ].slice(0, 80))
-
       assistantTaskEventHistoryRef.current.set(taskId, [])
-      upsertProgressMessage({
-        taskId,
-        agent: '调度器',
-        avatar: 'S',
-        quote: promptPreview,
-        content: '任务已提交，等待执行…',
-      })
 
-      const pushEvent = (evt) => {
-        const prev = assistantTaskEventHistoryRef.current.get(taskId) || []
-        assistantTaskEventHistoryRef.current.set(taskId, [...prev, evt].slice(-400))
+      const statusOf = (run) => String(run?.status || '').toLowerCase()
+      const percentOf = (run) => {
+        const status = statusOf(run)
+        const total = Number(run?.progress?.total || 0)
+        const done = Number(run?.progress?.completed || 0)
+        if (status === 'completed') return 100
+        if (status === 'failed' || status === 'human_review_required') return 100
+        if (status === 'waiting_confirmation') return 12
+        if (total > 0) return Math.max(8, Math.min(98, Math.round((done / total) * 100)))
+        return 35
       }
+      const messageOf = (run, fallback = '') =>
+        run?.events?.[run.events.length - 1]?.message ||
+        run?.current_stage ||
+        run?.status ||
+        fallback ||
+        '任务运行中'
 
-      /** 与后端 job-item.events 的 seq 错开，避免与 Mongo 递增 seq 混排时撞号 */
-      let nextLocalEventSeq = 1_000_000
-      const tick = (progress, agent, text) => {
-        nextLocalEventSeq += 1
-        setAssistantTasks((prev) =>
-          prev.map((t) =>
-            t.id === taskId
-              ? {
-                  ...t,
-                  status: progress >= 100 ? 'completed' : 'running',
-                  progress,
-                  stage: 'running',
-                  message: text,
-                }
-              : t,
-          ),
+      const updateTask = (run, fallback = '') => {
+        if (!run?.run_id) return
+        const status = statusOf(run)
+        const progress = percentOf(run)
+        const message = messageOf(run, fallback)
+        mergeAgentRunEventsIntoTaskRef(assistantTaskEventHistoryRef, taskId, run, () =>
+          setAssistantTaskEventsRevision((n) => n + 1),
         )
-        const evt = {
-          seq: nextLocalEventSeq,
-          ts: new Date().toISOString(),
-          agent,
-          avatar: agent?.slice(0, 1) || 'A',
-          level: 'INFO',
-          text,
-          progress,
-        }
-        pushEvent(evt)
-        upsertProgressMessage({
-          taskId,
-          agent,
-          avatar: evt.avatar,
-          quote: promptPreview,
-          content: `进度：${text}`,
-        })
-      }
-
-      /** 轮询时只刷新任务行与对话气泡：后端 events 已含详细步骤，勿再写入历史（否则会与每轮 tick 重复） */
-      const syncPollProgressUi = (progress, text) => {
         setAssistantTasks((prev) =>
           prev.map((t) =>
             t.id === taskId
               ? {
                   ...t,
-                  status: progress >= 100 ? 'completed' : 'running',
+                  status:
+                    status === 'failed'
+                      ? 'failed'
+                      : status === 'human_review_required'
+                        ? 'review'
+                        : progress >= 100
+                          ? 'completed'
+                          : 'running',
                   progress,
-                  stage: 'running',
-                  message: text,
+                  stage: run.current_stage || status || t.stage,
+                  message,
+                  faultTreeId: run.tree_id || t.faultTreeId,
+                  jobId: run.generation_job_id || t.jobId,
+                  itemId: run.generation_job_item_id || t.itemId,
+                  error: run.error?.message || run.error || t.error,
                 }
               : t,
           ),
         )
         upsertProgressMessage({
           taskId,
-          agent: '调度器',
-          avatar: 'S',
+          agent: status === 'human_review_required' ? 'ReviewAgent' : 'AgentRun',
+          avatar: status === 'human_review_required' ? 'R' : 'A',
           quote: promptPreview,
-          content: `进度：${text}`,
+          content: status === 'completed' ? `生成完成：tree_id=${run.tree_id || ''}` : `进度：${message}`,
+          actionsDisabled: true,
         })
       }
 
-      tick(8, '调度器', '正在连接后端…')
-      const doGenerate = async (opts = {}) => {
-        if (!selectedFileVersionIdsForAssistant.length) {
-          const err = '请先在右侧「依据文件」中至少选择 1 个已导入完成的文件（file_version_id）'
-          throw new Error(err)
-        }
-        const payload = { prompt: opts.promptOverride || prompt, ...opts }
-        delete payload.promptOverride
-        payload.selectedFileVersionIds = selectedFileVersionIdsForAssistant
-        const hasExploded3dForPrompt =
-          !!exploded3dGlbObjectUrl &&
-          exploded3dPartDetails &&
-          typeof exploded3dPartDetails === 'object' &&
-          Object.keys(exploded3dPartDetails).length > 0
-        if (hasExploded3dForPrompt) {
-          payload.partDetails = exploded3dPartDetails
-        }
-        const r = normalizeGenerateResponse(await generateTree(payload))
-        return r
-      }
-
-      const continueWithResponse = async (resp) => {
-        const hasInlineTree =
-          resp?.tree_id &&
-          (resp?.tree_data || resp?.treeData) &&
-          typeof (resp.tree_data || resp.treeData) === 'object' &&
-          (Array.isArray((resp.tree_data || resp.treeData).nodeList) ||
-            Array.isArray((resp.tree_data || resp.treeData).linkList))
-
-        const mergeJobItemEventsIntoTask = async (itemId) => {
-          if (!itemId) return
-          try {
-            const item = await getBatchJobItem({ itemId })
-            mergeBackendJobEventsIntoTaskRef(assistantTaskEventHistoryRef, taskId, item, () =>
-              setAssistantTaskEventsRevision((n) => n + 1),
-            )
-          } catch (err) {
-            console.warn('getBatchJobItem events', err)
-          }
-        }
-
-        if (hasInlineTree) {
-          const verPayload = buildVersionPayloadFromGenerateResponse(resp)
-          if (!verPayload) {
-            const err = '生成响应中 tree_data 无效'
-            setAssistantTasks((prev) =>
-              prev.map((t) => (t.id === taskId ? { ...t, status: 'failed', error: err } : t)),
-            )
-            upsertProgressMessage({
-              taskId,
-              agent: '流程控制',
-              avatar: 'P',
-              quote: promptPreview,
-              content: `错误：${err}`,
-            })
-            return { taskId, error: err }
-          }
-          try {
-            applyBackendVersionPayload(verPayload)
-          } catch (err) {
-            const msg = err?.message || String(err)
-            setAssistantTasks((prev) =>
-              prev.map((t) => (t.id === taskId ? { ...t, status: 'failed', error: msg } : t)),
-            )
-            upsertProgressMessage({
-              taskId,
-              agent: '流程控制',
-              avatar: 'P',
-              quote: promptPreview,
-              content: `错误：${msg}`,
-            })
-            return { taskId, error: msg }
-          }
-          setBackendTreeId(String(resp.tree_id))
-          setAssistantTasks((prev) =>
-            prev.map((t) =>
-              t.id === taskId
-                ? {
-                    ...t,
-                    status: 'completed',
-                    progress: 100,
-                    stage: resp.mode === 'reuse' ? 'reuse' : 'completed',
-                    message: resp.mode === 'reuse' ? '已复用故障树' : '生成完成',
-                    faultTreeId: resp.tree_id,
-                    itemId: resp.item_id || null,
-                    jobId: resp.job_id || null,
-                  }
-                : t,
-            ),
-          )
-          await mergeJobItemEventsIntoTask(resp.item_id)
-          setAssistantTasks((prev) => [...prev])
-          tick(
-            100,
-            '流程控制',
-            resp.mode === 'reuse'
-              ? `已复用（tree_id=${resp.tree_id}）`
-              : `生成完成（tree_id=${resp.tree_id}）`,
-          )
-          upsertProgressMessage({
-            taskId,
-            agent: '流程控制',
-            avatar: 'P',
-            quote: promptPreview,
-            content:
-              resp.mode === 'reuse'
-                ? `已复用故障树并加载到画布（tree_id=${resp.tree_id}）。`
-                : `生成完成并加载到画布（tree_id=${resp.tree_id}）。可在「进度详情」查看多智能体执行轨迹。`,
+      const loadCompletedTree = async (run) => {
+        if (!run?.tree_id) return { taskId, error: '生成完成但没有返回 tree_id' }
+        setBackendTreeId(String(run.tree_id))
+        if (run.tree_data) {
+          const verPayload = buildVersionPayloadFromGenerateResponse({
+            tree_id: run.tree_id,
+            tree_version: run.tree_version,
+            tree_data: run.tree_data,
           })
-          return { taskId, treeId: resp.tree_id, reuse: resp.mode === 'reuse' }
-        }
-
-        if (resp?.mode === 'reuse' && resp?.tree_id) {
-          tick(100, '流程控制', `已复用故障树（tree_id=${resp.tree_id}）`)
-          setBackendTreeId(String(resp.tree_id))
-          const ver = await getTree({ treeId: resp.tree_id })
+          if (verPayload) applyBackendVersionPayload(verPayload)
+        } else {
+          const ver = await getTree({ treeId: run.tree_id })
           applyBackendVersionPayload(ver)
-          setAssistantTasks((prev) =>
-            prev.map((t) =>
-              t.id === taskId
-                ? {
-                    ...t,
-                    status: 'completed',
-                    progress: 100,
-                    stage: 'reuse',
-                    faultTreeId: resp.tree_id,
-                    itemId: resp.item_id || null,
-                    jobId: resp.job_id || null,
-                  }
-                : t,
-            ),
-          )
-          await mergeJobItemEventsIntoTask(resp.item_id)
-          setAssistantTasks((prev) => [...prev])
-          return { taskId, treeId: resp.tree_id, reuse: true }
         }
-
-        if (resp?.mode === 'queued' && resp?.item_id) {
-          setAssistantTasks((prev) =>
-            prev.map((t) =>
-              t.id === taskId ? { ...t, itemId: resp.item_id, jobId: resp.job_id || null } : t,
-            ),
-          )
-          const finalItem = await pollGenerationJobItem({
-            itemId: resp.item_id,
-            onUpdate: (it) => {
-              const p = Math.max(0, Math.min(100, Number(it?.progress) || 0))
-              syncPollProgressUi(p, it?.message || '生成中…')
-              mergeBackendJobEventsIntoTaskRef(assistantTaskEventHistoryRef, taskId, it, () =>
-                setAssistantTaskEventsRevision((n) => n + 1),
-              )
-            },
-          })
-          if (finalItem?.status === 'success' && finalItem?.tree_id) {
-            tick(100, '流程控制', `生成完成（tree_id=${finalItem.tree_id}）`)
-            setBackendTreeId(String(finalItem.tree_id))
-            const ver = await getTree({ treeId: finalItem.tree_id })
-            applyBackendVersionPayload(ver)
-            await mergeJobItemEventsIntoTask(resp.item_id)
-            setAssistantTasks((prev) => [...prev])
-            return { taskId, treeId: finalItem.tree_id, reuse: false }
-          }
-          setAssistantTasks((prev) =>
-            prev.map((t) =>
-              t.id === taskId ? { ...t, status: 'failed', error: finalItem?.error || '生成失败' } : t,
-            ),
-          )
-          upsertProgressMessage({
-            taskId,
-            agent: '流程控制',
-            avatar: 'P',
-            quote: promptPreview,
-            content: `错误：${finalItem?.error || '生成失败'}`,
-          })
-          return { taskId, error: finalItem?.error || '生成失败' }
-        }
-
-        const parseHint = (() => {
-          try {
-            const keys = Object.keys(resp || {}).slice(0, 18).join(', ')
-            return keys ? `（响应字段：${keys}）` : ''
-          } catch {
-            return ''
-          }
-        })()
-        setAssistantTasks((prev) =>
-          prev.map((t) =>
-            t.id === taskId ? { ...t, status: 'failed', error: `无法解析后端响应${parseHint}` } : t,
-          ),
-        )
-        return { taskId, error: `无法解析后端响应${parseHint}` }
+        updateTask(run, '生成完成')
+        return { taskId, treeId: run.tree_id, agentRunId: run.run_id, reuse: false }
       }
 
-      let resp
-      try {
-        resp = options?.initialResponse ? normalizeGenerateResponse(options.initialResponse) : await doGenerate()
-      } catch (e) {
-        const msg = formatGenerateBackendError(e?.message || String(e))
-        setAssistantTasks((prev) =>
-          prev.map((t) => (t.id === taskId ? { ...t, status: 'failed', error: msg } : t)),
-        )
-        upsertProgressMessage({
-          taskId,
-          agent: '流程控制',
-          avatar: 'P',
-          quote: promptPreview,
-          content: `错误：${msg}`,
-        })
-        return { taskId, error: msg }
-      }
-
-      // 新版后端：顶事件未精确命中时需要用户确认候选
-      if (resp?.mode === 'need_confirmation' && Array.isArray(resp?.candidates) && resp.candidates.length > 0) {
-        const candidates = resp.candidates
-
+      const showConfirmation = (run) => {
+        const confirmation = run?.confirmation || {}
+        const candidates = Array.isArray(confirmation.candidates) ? confirmation.candidates : []
+        if (!confirmation.confirmation_id || !candidates.length) {
+          updateTask(run, '等待确认，但缺少候选信息')
+          return { taskId, error: '等待确认，但缺少候选信息' }
+        }
         setAssistantTasks((prev) =>
           prev.map((t) =>
             t.id === taskId
-              ? { ...t, status: 'queued', progress: 12, stage: 'need_confirmation', message: '等待用户确认顶事件' }
+              ? { ...t, status: 'queued', progress: 12, stage: 'waiting_confirmation', message: '等待确认顶事件候选' }
               : t,
           ),
         )
-
-        // 注册 continuation：用户点击候选后继续生成
         pendingTopEventConfirmRef.current.set(taskId, {
           candidates,
           continueWithCandidate: async (cand) => {
-            const disp = cand?.display_name || cand?.name || cand?.normalized_top_event || ''
-            tick(14, '调度器', `已选择顶事件：${disp}，正在提交生成任务…`)
-
-            // 用“用户选择的顶事件名”构造新 prompt，确保后端按该顶事件解析生成
-            const reqTop = String(cand?.name || cand?.display_name || cand?.normalized_top_event || '').trim()
-            const req = String(resp?.requirements || resp?.parsed_prompt?.requirements || '').trim()
-            const promptOverride = reqTop
-              ? `请生成一棵顶事件为“${reqTop}”的故障树。${req ? `\n要求：${req}` : ''}`
-              : undefined
-            try {
-              const next = await doGenerate({
-                ...(promptOverride ? { promptOverride } : null),
-                confirmedTopEvent: cand?.name || cand?.display_name || '',
-                confirmedNormalizedTopEvent: cand?.normalized_top_event || cand?.normalized_name || '',
-                confirmedGraphNodeId: cand?.graph_node_id || '',
-                selectedFileVersionIds: resp?.selected_file_version_ids || [],
-              })
-              return await continueWithResponse(next)
-            } catch (err) {
-              const msg = formatGenerateBackendError(err?.message || String(err))
-              setAssistantTasks((prev) =>
-                prev.map((t) => (t.id === taskId ? { ...t, status: 'failed', error: msg } : t)),
-              )
-              upsertProgressMessage({
-                taskId,
-                agent: '流程控制',
-                avatar: 'P',
-                quote: promptPreview,
-                content: `错误：${msg}`,
-              })
-              setAssistantMessages((prev) =>
-                prev.concat({
-                  id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                  role: 'assistant',
-                  kind: 'text',
-                  content: `生成失败：${msg}`,
-                  at: Date.now(),
-                }),
-              )
-              throw err
-            }
+            const candidateRef = String(
+              cand?.candidate_ref || cand?.candidateRef || cand?.graph_node_id || cand?.graphNodeId || cand?.id || '',
+            ).trim()
+            if (!candidateRef) throw new Error('候选项缺少 candidate_ref')
+            const confirmedResp = await confirmAssistantAgentRun({
+              runId: run.run_id,
+              sessionId: assistantStoreKey,
+              confirmationId: confirmation.confirmation_id,
+              confirmationType: confirmation.type || confirmation.confirmation_type || 'top_event',
+              candidateRef,
+            })
+            const confirmedRun = unwrapAssistantAgentRun(confirmedResp)
+            updateTask(confirmedRun, '已确认候选，继续生成')
+            return await pollToTerminal(confirmedRun?.run_id || run.run_id, Number(confirmedRun?.last_event_seq || run.last_event_seq || 0))
           },
         })
-
         upsertProgressMessage({
           taskId,
-          agent: '调度器',
-          avatar: 'S',
+          agent: 'AgentRun',
+          avatar: 'A',
           quote: promptPreview,
-          content: '顶事件未精确命中：请在下方选择一个最接近的顶事件候选，以继续生成。',
+          content: '顶事件未精确命中：请先选中候选，再点确认并继续。',
+          actionsDisabled: false,
           actions: candidates.map((c) => ({
             kind: 'top_event_candidate',
-            label: c?.display_name || c?.name || c?.normalized_top_event || '—',
+            label: c?.display_name || c?.name || c?.normalized_top_event || c?.candidate_ref || '候选项',
             candidate: c,
           })),
         })
-        return { taskId, needConfirmation: true }
+        return { taskId, needConfirmation: true, agentRunId: run.run_id }
       }
 
-      return await continueWithResponse(resp)
+      const finishRun = async (run) => {
+        const status = statusOf(run)
+        updateTask(run)
+        if (status === 'completed') return await loadCompletedTree(run)
+        if (status === 'waiting_confirmation') return showConfirmation(run)
+        if (status === 'human_review_required') return { taskId, reviewRequired: true, agentRunId: run.run_id }
+        if (status === 'failed') return { taskId, error: run.error?.message || run.error || '多智能体生成失败' }
+        return null
+      }
+
+      const pollToTerminal = async (runId, afterEventSeq = 0) => {
+        const finalResp = await pollAssistantAgentRun({
+          runId,
+          sessionId: assistantStoreKey,
+          afterEventSeq,
+          includeTreeData: true,
+          intervalMs: 1500,
+          onUpdate: (_resp, run) => updateTask(run),
+        })
+        const finalRun = unwrapAssistantAgentRun(finalResp)
+        return await finishRun(finalRun)
+      }
+
+      updateTask(agentRun, '已调度，开始轮询')
+      const immediate = await finishRun(agentRun)
+      if (immediate) return immediate
+      return await pollToTerminal(agentRun.run_id, Number(agentRun.last_event_seq || 0))
     },
-    [
-      applyBackendVersionPayload,
-      upsertProgressMessage,
-      setBackendTreeId,
-      selectedFileVersionIdsForAssistant,
-      exploded3dGlbObjectUrl,
-      exploded3dPartDetails,
-    ],
+    [applyBackendVersionPayload, assistantStoreKey, setBackendTreeId, upsertProgressMessage],
+  )
+
+  const runGenerateTaskFromEmptyCanvas = useCallback(
+    async (prompt) => runAgentRunGeneration(prompt, {}),
+    [runAgentRunGeneration],
   )
 
   const handleAssistantSend = useCallback(async () => {
@@ -2198,7 +2281,6 @@ function FaultTreePage() {
     if (!text) return
     const now = Date.now()
     const wasEmptyCanvas = graphData.nodes.length === 0
-    const textLooksLikeGenerate = /生成|构建|新建|重新生成|重建|画一棵|创建|generate|create/i.test(text)
     const textLooksLikeHelp = /你好|您好|介绍一下|你能做什么|能做什么|帮助|怎么用|怎么说|如何表达|示例|例子|举例|模板|格式|hello|hi|help/i.test(text)
 
     const wsEpoch =
@@ -2313,9 +2395,9 @@ function FaultTreePage() {
           return
         }
 
-        if (intent === 'generate_tree' || intent === 'regenerate_tree' || action.startsWith('generation_') || action === 'need_top_event_confirmation') {
+        if (intent === 'generate_tree' || intent === 'regenerate_tree' || action.startsWith('generation_') || action === 'need_top_event_confirmation' || action === 'human_review_required') {
           if (mustUseGeneratePipeline) requireGenerateViaGenerateRef.current = false
-          const gen = await runGenerateTaskFromEmptyCanvas(text, { initialResponse: assistantAgentResp.result || {} })
+          const gen = await runAgentRunGeneration(text, assistantAgentResp.result || {})
           setAssistantMessages((prev) =>
             prev.filter((m) => m.id !== thinkingMsgId).concat({
               id: `a-${Date.now()}`,
@@ -2329,10 +2411,6 @@ function FaultTreePage() {
               at: Date.now(),
             }),
           )
-          if (gen?.needConfirmation) {
-            if (mustUseGeneratePipeline) requireGenerateViaGenerateRef.current = true
-            return
-          }
           if (gen?.treeId) {
             setAssistantPending({
               kind: 'generate',
@@ -2343,8 +2421,6 @@ function FaultTreePage() {
             kbSyncedBaselineEpochRef.current = wsEpoch
             kbSyncedBaselineFvSigRef.current = currentFvSig
             requireGenerateViaGenerateRef.current = false
-          } else if (mustUseGeneratePipeline) {
-            requireGenerateViaGenerateRef.current = true
           }
           return
         }
@@ -2415,41 +2491,12 @@ function FaultTreePage() {
         return
       }
 
-      // 规则：如果当前画布为空 => 视为“生成一棵故障树”的任务（走 FTA-Latest 并生成任务/进度/泳道图）
-      if (wasEmptyCanvas && textLooksLikeGenerate && !textLooksLikeHelp) {
-        const gen = await runGenerateTaskFromEmptyCanvas(text)
-        setAssistantMessages((prev) =>
-          prev.filter((m) => m.id !== thinkingMsgId).concat({
-            id: `a-${Date.now()}`,
-            role: 'assistant',
-            kind: 'text',
-            content: gen?.needConfirmation
-              ? '已找到多个相似顶事件候选。请在上方进度卡片下方选择一个候选，以继续生成。'
-              : gen?.treeId
-                ? `已生成故障树并加载到画布（tree_id=${gen.treeId}）。`
-                : `生成失败：${gen?.error || '未知错误'}`,
-            at: Date.now(),
-          }),
-        )
-        if (gen?.needConfirmation) {
-          return
-        }
-        if (gen?.treeId) {
-          setAssistantPending({
-            kind: 'generate',
-            backendTreeId: gen.treeId,
-            deleteOnUndo: gen.reuse !== true,
-            prev: { graphData: preGraph, rawJsonText: preRaw },
-          })
-          // 关键：首次生成成功后即与项目页知识库 epoch 对齐，否则下一条编辑消息会误判“知识库已变更”而强制走 generate。
-          kbSyncedBaselineEpochRef.current = wsEpoch
-          kbSyncedBaselineFvSigRef.current = currentFvSig
-          requireGenerateViaGenerateRef.current = false
-        }
-        return
-      }
-
-      if (wasEmptyCanvas) {
+      const generateRequested =
+        wasEmptyCanvas ||
+        mustUseGeneratePipeline ||
+        /生成|构建|新建|重新生成|重建|画一棵|创建|generate|create/i.test(text)
+      if (generateRequested && !textLooksLikeHelp) {
+        const gen = await runAgentRunGeneration(text, assistantAgentResp?.result || {})
         setAssistantMessages((prev) =>
           prev
             .filter((m) => m.id !== thinkingMsgId)
@@ -2457,35 +2504,16 @@ function FaultTreePage() {
               id: `a-${Date.now()}`,
               role: 'assistant',
               kind: 'text',
-              content:
-                '当前画布还没有故障树。我可以帮你生成、编辑、校验故障树，也可以解释如何描述生成需求。要开始生成时，请明确说“为某个顶事件生成故障树”。',
+              content: gen?.needConfirmation
+                ? '已找到多个相似顶事件候选。请先选中候选，再点确认并继续。'
+                : gen?.reviewRequired
+                  ? '生成结果需要人工复核。请查看任务进度详情。'
+                  : gen?.treeId
+                    ? `已生成故障树并加载到画布（tree_id=${gen.treeId}）。`
+                    : `生成失败：${gen?.error || '未知错误'}`,
               at: Date.now(),
-            })
-            .slice(-320),
+            }),
         )
-        return
-      }
-
-      if (mustUseGeneratePipeline) {
-        requireGenerateViaGenerateRef.current = false
-        const gen = await runGenerateTaskFromEmptyCanvas(text)
-        setAssistantMessages((prev) =>
-          prev.filter((m) => m.id !== thinkingMsgId).concat({
-            id: `a-${Date.now()}`,
-            role: 'assistant',
-            kind: 'text',
-            content: gen?.needConfirmation
-              ? '已找到多个相似顶事件候选。请在上方进度卡片下方选择一个候选，以继续生成。'
-              : gen?.treeId
-                ? `已根据最新知识库来源重新生成并加载故障树（tree_id=${gen.treeId}）。`
-                : `生成失败：${gen?.error || '未知错误'}`,
-            at: Date.now(),
-          }),
-        )
-        if (gen?.needConfirmation) {
-          requireGenerateViaGenerateRef.current = true
-          return
-        }
         if (gen?.treeId) {
           setAssistantPending({
             kind: 'generate',
@@ -2495,8 +2523,7 @@ function FaultTreePage() {
           })
           kbSyncedBaselineEpochRef.current = wsEpoch
           kbSyncedBaselineFvSigRef.current = currentFvSig
-        } else {
-          requireGenerateViaGenerateRef.current = true
+          requireGenerateViaGenerateRef.current = false
         }
         return
       }
