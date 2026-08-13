@@ -1926,6 +1926,7 @@ def generate_fault_tree_with_progress(
     log_callback: Optional[Callable[[str], None]] = None,
     part_details: Optional[Dict[str, Any]] = None,
     max_depth: Optional[int] = None,
+    draft_only: bool = False,
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
@@ -1965,6 +1966,7 @@ def generate_fault_tree(
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     part_details: Optional[Dict[str, Any]] = None,
     max_depth: Optional[int] = None,
+    draft_only: bool = False,
 ) -> dict:
     # Keep this later definition as the runtime-active implementation.
     def emit(message: str):
@@ -2160,6 +2162,42 @@ def generate_fault_tree(
                 f"[graph-draft] generated draft attempt={attempt} "
                 f"nodes={len(draft_tree.get('nodeList') or [])} links={len(draft_tree.get('linkList') or [])}"
             )
+            if draft_only:
+                evidence_chunk_ids = [
+                    chunk.get("chunk_uid") or chunk.get("chunk_id")
+                    for chunk in raw_chunks
+                    if chunk.get("chunk_uid") or chunk.get("chunk_id")
+                ]
+                subgraph_node_ids = [
+                    node.get("graph_node_id")
+                    for node in (subgraph_bundle.get("nodes") or [])
+                    if node.get("graph_node_id")
+                ]
+                draft_tree["retrieval"] = {
+                    "source": "graph_local_subgraph",
+                    "matched_top_event": matched["matched_name"],
+                    "matched_node_id": matched["matched_node_id"],
+                    "matched_node_ids": root_node_ids or [matched["matched_node_id"]],
+                    "alternatives": matched.get("alternatives") or [],
+                    "source_file_version_ids": scoped_file_version_ids,
+                    "subgraph_node_count": len(subgraph_bundle.get("nodes") or []),
+                    "subgraph_edge_count": len(subgraph_bundle.get("edges") or []),
+                    "chunk_ids": chunk_ids or evidence_chunk_ids,
+                    "evidence_chunk_ids": evidence_chunk_ids,
+                    "subgraph_node_ids": subgraph_node_ids,
+                    "llm_used_subgraph": llm_used_subgraph,
+                }
+                draft_tree["source_file_version_ids"] = scoped_file_version_ids
+                draft_tree["performance"] = {
+                    **performance,
+                    "tree_generation": _make_stage_profile(
+                        time.perf_counter() - llm_stage_started,
+                        token_usage=llm_token_usage,
+                        attempt_count=attempt,
+                        draft_only=True,
+                    ),
+                }
+                return draft_tree
         except ValueError as exc:
             emit(f"[graph-draft] draft generation error attempt={attempt} error={exc}")
             if attempt > MAX_RETRY:
@@ -2316,6 +2354,31 @@ def generate_fault_tree(
     }
     final_tree["performance"] = performance
     return final_tree
+
+
+def generate_fault_tree_draft(
+    top_event: str,
+    requirements: str = "",
+    selected_file_version_ids: Optional[List[str]] = None,
+    root_graph_node_id: Optional[str] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+    part_details: Optional[Dict[str, Any]] = None,
+    max_depth: Optional[int] = None,
+    draft_only: bool = False,
+) -> dict:
+    """Build an immutable draft without validation, repair, or persistence."""
+    return generate_fault_tree(
+        top_event,
+        requirements,
+        selected_file_version_ids=selected_file_version_ids,
+        root_graph_node_id=root_graph_node_id,
+        log_callback=log_callback,
+        progress_callback=progress_callback,
+        part_details=part_details,
+        max_depth=max_depth,
+        draft_only=True,
+    )
 
 
 def generate_fault_tree_with_progress(

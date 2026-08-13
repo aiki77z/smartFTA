@@ -39,7 +39,10 @@ class RepairAgent:
         correction_hint = format_corrections_for_repair(corrections)
         repaired_tree = None
         repair_error = None
-        if apply_legacy_repair and (correction_hint or patterns):
+        # Phase 2 also repairs validator-detected structural issues when no
+        # prior correction is available. The validation report supplies the
+        # minimum change constraints in that case.
+        if apply_legacy_repair and repairable_issues:
             try:
                 result = repair_fault_tree(
                     tree_data,
@@ -61,7 +64,7 @@ class RepairAgent:
                 "repair_patterns": _summarize_patterns(patterns),
                 "corrections": _summarize_corrections(corrections),
                 "legacy_repair_fault_tree": {
-                    "attempted": bool(apply_legacy_repair and (correction_hint or patterns)),
+                    "attempted": bool(apply_legacy_repair and repairable_issues),
                     "succeeded": repaired_tree is not None,
                     "error": repair_error,
                 },
@@ -76,6 +79,8 @@ class RepairAgent:
                 artifact_type=ARTIFACT_REPAIR_PATCH,
                 content=patch,
                 metadata={"producer": self.name},
+                producer=self.name,
+                parent_artifact_id=str(draft_tree_artifact.get("artifact_id") or "") or None,
             )
             patch["artifact_id"] = artifact.get("artifact_id")
             append_agent_event(

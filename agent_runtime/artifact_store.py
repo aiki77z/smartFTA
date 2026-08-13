@@ -73,3 +73,16 @@ def put_agent_artifact(
     agent_artifacts_col.insert_one(doc)
     return _strip_mongo_id(doc) or {}
 
+
+def get_latest_agent_artifact(run_id: str, artifact_type: str) -> Optional[Dict[str, Any]]:
+    """Return the latest immutable artifact of a type for workflow recovery."""
+    run_id = str(run_id or "").strip()
+    artifact_type = str(artifact_type or "").strip()
+    if not run_id or not artifact_type:
+        return None
+    doc = agent_artifacts_col.find_one(
+        {"run_id": run_id, "type": artifact_type},
+        sort=[("version", DESCENDING)],
+    )
+    return _strip_mongo_id(doc)
+

@@ -39,6 +39,8 @@ class VerifyAgent:
                 artifact_type=ARTIFACT_VALIDATION_REPORT,
                 content=report,
                 metadata={"producer": self.name},
+                producer=self.name,
+                parent_artifact_id=str(draft_tree_artifact.get("artifact_id") or "") or None,
             )
             report["artifact_id"] = artifact.get("artifact_id")
             append_agent_event(
