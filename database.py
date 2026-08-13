@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import json
 import math
 import re
@@ -1985,6 +1986,51 @@ def list_active_repair_patterns(
         .limit(max(1, min(int(limit or 50), 500)))
     )
     return list(cursor)
+
+
+def upsert_repair_pattern(pattern: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(pattern or {})
+    issue_code = _normalize_identifier(payload.get("issue_code")).upper()
+    operation = _normalize_identifier(payload.get("operation"))
+    if not issue_code or not operation:
+        raise ValueError("issue_code and operation are required")
+
+    scope_key = _normalize_identifier(payload.get("scope_key"))
+    pattern_id = _normalize_identifier(payload.get("pattern_id"))
+    if not pattern_id:
+        stable = "|".join(
+            [
+                issue_code,
+                operation,
+                scope_key,
+                _normalize_identifier(payload.get("signature")),
+            ]
+        )
+        pattern_id = "rp_" + hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+    now = _now()
+    payload.update(
+        {
+            "_id": pattern_id,
+            "pattern_id": pattern_id,
+            "issue_code": issue_code,
+            "operation": operation,
+            "scope_key": scope_key,
+            "updated_at": now,
+        }
+    )
+    payload.setdefault("status", "pending")
+    payload.setdefault("success_count", 0)
+    payload.setdefault("failure_count", 0)
+    payload.setdefault("created_at", now)
+    set_payload = dict(payload)
+    set_payload.pop("_id", None)
+    created_at = set_payload.pop("created_at", now)
+    repair_patterns_col.update_one(
+        {"_id": pattern_id},
+        {"$set": set_payload, "$setOnInsert": {"created_at": created_at}},
+        upsert=True,
+    )
+    return _strip_mongo_id(repair_patterns_col.find_one({"_id": pattern_id})) or {}
 
 
 def rollback_version(tree_id: str, target_version: int):

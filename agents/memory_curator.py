@@ -4,7 +4,11 @@ from typing import Any, Dict, Optional
 
 from database import get_version
 from diff_analyzer import _diff_trees, _get_top_event_name, analyze_and_store
-from tools.correction_tools import build_correction_episode, store_correction_episode
+from tools.correction_tools import (
+    build_correction_episode,
+    derive_repair_patterns_from_episode,
+    store_correction_episode,
+)
 
 
 class MemoryCurator:
@@ -21,6 +25,8 @@ class MemoryCurator:
         scope_key: str = "",
         validation_report: Optional[Dict[str, Any]] = None,
         write_legacy_corrections: bool = False,
+        derive_patterns: bool = True,
+        activate_expert_patterns: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         ai_ver = get_version(tree_id, ai_version)
@@ -68,6 +74,12 @@ class MemoryCurator:
             metadata=metadata,
         )
         stored_episode = store_correction_episode(episode)
+        patterns = []
+        if derive_patterns:
+            patterns = derive_repair_patterns_from_episode(
+                stored_episode,
+                activate_expert_confirmed=activate_expert_patterns,
+            )
         legacy_count = 0
         if write_legacy_corrections:
             legacy_count = analyze_and_store(tree_id, ai_version, expert_version)
@@ -75,6 +87,7 @@ class MemoryCurator:
             "agent": self.name,
             "status": "stored",
             "episode": stored_episode,
+            "repair_patterns": patterns,
             "legacy_corrections_written": legacy_count,
         }
 
