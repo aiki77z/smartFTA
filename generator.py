@@ -1118,6 +1118,7 @@ def generate_fault_tree_with_progress(
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     part_details: Optional[Dict[str, Any]] = None,
+    max_depth: Optional[int] = None,
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
@@ -1137,6 +1138,7 @@ def generate_fault_tree_with_progress(
         selected_file_version_ids=selected_file_version_ids,
         log_callback=log_callback,
         part_details=part_details,
+        max_depth=max_depth,
     )
     if part_details:
         tree_data = apply_physical_refs_to_fault_tree_data(tree_data, part_details)
@@ -1923,6 +1925,7 @@ def generate_fault_tree_with_progress(
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     part_details: Optional[Dict[str, Any]] = None,
+    max_depth: Optional[int] = None,
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
@@ -1943,6 +1946,7 @@ def generate_fault_tree_with_progress(
         root_graph_node_id=root_graph_node_id,
         log_callback=log_callback,
         part_details=part_details,
+        max_depth=max_depth,
     )
     if part_details:
         tree_data = apply_physical_refs_to_fault_tree_data(tree_data, part_details)
@@ -1960,6 +1964,7 @@ def generate_fault_tree(
     log_callback: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     part_details: Optional[Dict[str, Any]] = None,
+    max_depth: Optional[int] = None,
 ) -> dict:
     # Keep this later definition as the runtime-active implementation.
     def emit(message: str):
@@ -2036,9 +2041,10 @@ def generate_fault_tree(
     )
 
     stage_started = time.perf_counter()
+    effective_max_depth = GRAPH_TREE_MAX_DEPTH if max_depth is None else max(1, min(int(max_depth), 10))
     subgraph_bundle = expand_scoped_local_fault_subgraph(
         root_node_ids or [matched["matched_node_id"]],
-        max_depth=GRAPH_TREE_MAX_DEPTH,
+        max_depth=effective_max_depth,
         max_nodes=GRAPH_TREE_MAX_NODES,
         selected_file_version_ids=scoped_file_version_ids,
     )
@@ -2320,6 +2326,7 @@ def generate_fault_tree_with_progress(
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     part_details: Optional[Dict[str, Any]] = None,
+    max_depth: Optional[int] = None,
 ) -> dict:
     if progress_callback:
         progress_callback(10, "prepare", "Preparing generation request")
@@ -2339,6 +2346,7 @@ def generate_fault_tree_with_progress(
         log_callback=log_callback,
         progress_callback=progress_callback,
         part_details=part_details,
+        max_depth=max_depth,
     )
     if part_details:
         tree_data = apply_physical_refs_to_fault_tree_data(tree_data, part_details)
