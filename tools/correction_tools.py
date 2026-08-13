@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional
 from database import (
     correction_episodes_col,
     list_active_repair_patterns as db_list_active_repair_patterns,
-    upsert_repair_pattern,
     upsert_correction_episode,
+    upsert_repair_pattern,
 )
 
 

@@ -7,13 +7,13 @@ from tools.repair_patch_tools import apply_repair_patch, build_repair_patch_from
 def _sample_tree():
     return {
         "nodeList": [
-            {"id": "n1", "name": "顶事件", "type": "top_event", "gate": "OR", "event": None},
+            {"id": "n1", "name": "Top event", "type": "top_event", "gate": "OR", "event": None},
             {
                 "id": "n2",
-                "name": "原因A",
+                "name": "Cause A",
                 "type": "basic_event",
                 "gate": None,
-                "event": {"id": "E2", "name": "原因A", "documents": []},
+                "event": {"id": "E2", "name": "Cause A", "documents": []},
             },
         ],
         "linkList": [{"type": "link", "sourceId": "n2", "targetId": "n1", "isCondition": False}],
@@ -23,18 +23,18 @@ def _sample_tree():
 def _basic_event_missing_event_tree():
     return {
         "nodeList": [
-            {"id": "top", "name": "顶事件", "type": "top_event", "event": None},
+            {"id": "top", "name": "Top event", "type": "top_event", "event": None},
             {
                 "id": "a",
-                "name": "原因A",
+                "name": "Cause A",
                 "type": "basic_event",
                 "event": None,
             },
             {
                 "id": "b",
-                "name": "原因B",
+                "name": "Cause B",
                 "type": "basic_event",
-                "event": {"id": "b", "name": "原因B"},
+                "event": {"id": "b", "name": "Cause B"},
             },
         ],
         "linkList": [
@@ -110,7 +110,7 @@ def test_ai_only_episode_does_not_create_active_patterns():
                 "episode_id": "ce_1",
                 "status": "pending",
                 "scope_key": "scope_a",
-                "diffs": [{"type": "gate_changed", "node_name": "顶事件", "to_gate": "AND"}],
+                "diffs": [{"type": "gate_changed", "node_name": "Top event", "to_gate": "AND"}],
             }
         )
     finally:
@@ -125,8 +125,8 @@ def test_repair_patch_edge_ops_can_resolve_node_names():
         "operations": [
             {
                 "op": "add_edge",
-                "from_node": "原因B",
-                "to_node": "原因A",
+                "from_node": "Cause B",
+                "to_node": "Cause A",
                 "reason_issue_code": "MISSING_EDGE",
                 "source": "repair_patterns",
             }
@@ -165,9 +165,9 @@ def test_repair_patch_removes_broken_link_by_index():
 def test_repair_patch_duplicate_node_id_updates_links():
     tree = {
         "nodeList": [
-            {"id": "top", "name": "顶事件", "type": "top_event", "event": None},
-            {"id": "dup", "name": "原因A", "type": "basic_event", "event": {"id": "a", "name": "原因A"}},
-            {"id": "dup", "name": "原因B", "type": "basic_event", "event": {"id": "b", "name": "原因B"}},
+            {"id": "top", "name": "Top event", "type": "top_event", "event": None},
+            {"id": "dup", "name": "Cause A", "type": "basic_event", "event": {"id": "a", "name": "Cause A"}},
+            {"id": "dup", "name": "Cause B", "type": "basic_event", "event": {"id": "b", "name": "Cause B"}},
         ],
         "linkList": [
             {"type": "link", "sourceId": "dup", "targetId": "top"},

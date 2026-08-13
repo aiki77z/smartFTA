@@ -37,6 +37,7 @@ class MemoryCurator:
                 "status": "skipped",
                 "reason": "version_not_found",
                 "episode": None,
+                "repair_patterns": [],
                 "legacy_corrections_written": 0,
             }
 
@@ -49,6 +50,7 @@ class MemoryCurator:
                 "status": "skipped",
                 "reason": "no_structural_diff",
                 "episode": None,
+                "repair_patterns": [],
                 "legacy_corrections_written": 0,
             }
 

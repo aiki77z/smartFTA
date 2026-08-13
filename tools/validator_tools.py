@@ -4,19 +4,28 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 _STRUCTURAL_REPAIRABLE_CODES = {
+    "BASIC_HAS_CHILDREN",
     "BROKEN_LINK",
+    "CYCLE_DETECTED",
+    "DISCONNECTED_NODES",
     "DUPLICATE_NODE_ID",
+    "INTERMEDIATE_WITHOUT_CHILDREN",
     "INVALID_LINK",
     "INVALID_NODE",
     "MISSING_EVENT",
     "MISSING_EVENT_FIELD",
+    "MISSING_GATE",
     "MISSING_LINK_ENDPOINT",
     "MISSING_NODE_ID",
     "MISSING_NODE_NAME",
     "MISSING_NODE_TYPE",
+    "MULTI_CHILD_NO_GATE",
+    "MULTIPLE_TOP_EVENTS",
     "NO_DOCUMENTS",
     "NO_ERROR_LEVEL",
+    "NO_TOP_EVENT",
     "TOP_EVENT_EVENT_NOT_NULL",
+    "TOP_EVENT_HAS_EVENT",
 }
 
 _NON_REPAIRABLE_CODES = {
@@ -42,6 +51,21 @@ def _as_severity(level: Any) -> str:
     if value == "warning":
         return "warning"
     return "info"
+
+
+def _issue_category(raw: Dict[str, Any]) -> str:
+    category = str(raw.get("category") or "").strip().lower()
+    if category:
+        return category
+    source = str(raw.get("source") or "").strip().lower()
+    if source == "logic":
+        return "structure"
+    if source == "ai":
+        return "semantic"
+    code = str(raw.get("code") or raw.get("issue_code") or "").strip().upper()
+    if code in {"NO_DOCUMENTS", "MISSING_EVIDENCE", "EVIDENCE_NOT_FOUND"}:
+        return "evidence"
+    return "structure" if code in _STRUCTURAL_REPAIRABLE_CODES else "validation"
 
 
 def _extract_node_ids(raw_issue: Dict[str, Any]) -> List[str]:
@@ -90,6 +114,7 @@ def normalize_validation_issue(raw_issue: Dict[str, Any], index: int = 0) -> Dic
         "issue_id": str(raw.get("issue_id") or f"issue_{index + 1:03d}"),
         "issue_code": issue_code,
         "severity": severity,
+        "category": _issue_category(raw),
         "node_ids": node_ids,
         "link_ids": link_ids,
         "message": message,
@@ -136,6 +161,10 @@ def normalize_validation_report(
         if isinstance(issue, dict)
     ]
     error_count, warning_count, info_count = _count_by_severity(issues)
+    by_category: Dict[str, int] = {}
+    for issue in issues:
+        category = str(issue.get("category") or "validation")
+        by_category[category] = by_category.get(category, 0) + 1
     report = {
         "passed": error_count == 0,
         "error_count": error_count,
@@ -150,6 +179,7 @@ def normalize_validation_report(
             "blocking_error_count": sum(
                 1 for issue in issues if issue.get("severity") == "error" and not issue.get("repairable")
             ),
+            "by_category": by_category,
         },
         "scope_key": str(scope_key or ""),
         "draft_artifact_id": draft_artifact_id,

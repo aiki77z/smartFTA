@@ -34,6 +34,8 @@ STAGE_SCOPE: Final[str] = "scope"
 STAGE_RETRIEVAL: Final[str] = "retrieval"
 STAGE_DRAFT: Final[str] = "draft"
 STAGE_VALIDATE: Final[str] = "validate"
+# Compatibility name used by the independently delivered VerifyAgent.
+STAGE_VALIDATION: Final[str] = STAGE_VALIDATE
 STAGE_REPAIR: Final[str] = "repair"
 STAGE_COMMIT: Final[str] = "commit"
 STAGE_CURATE: Final[str] = "curate"
@@ -70,6 +72,8 @@ ARTIFACT_TREE_DRAFT: Final[str] = "tree_draft"
 ARTIFACT_REPAIR_PATCH: Final[str] = "repair_patch"
 ARTIFACT_VALIDATION_REPORT: Final[str] = "validation_report"
 ARTIFACT_FINAL_TREE: Final[str] = "final_tree"
+
+MAX_REPAIR_ATTEMPTS: Final[int] = 2
 
 ERROR_INVALID_REQUEST: Final[str] = "INVALID_REQUEST"
 ERROR_RUN_NOT_FOUND: Final[str] = "RUN_NOT_FOUND"

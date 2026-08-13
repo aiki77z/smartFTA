@@ -62,7 +62,7 @@ from database import (
     upsert_top_event_catalog_entry,
     versions_col,
 )
-from agent_runtime.artifact_store import put_agent_artifact
+from agent_runtime.artifact_store import get_latest_agent_artifact, put_agent_artifact
 from agent_runtime.event_store import append_agent_event, list_agent_events
 from agent_runtime.policies import (
     ARTIFACT_FINAL_TREE,
@@ -96,6 +96,8 @@ from agent_runtime.policies import (
     RUN_STATUS_WAITING_CONFIRMATION,
     RUN_STATUS_COMPLETED,
     RUN_STATUS_FAILED,
+    RUN_STATUS_HUMAN_REVIEW_REQUIRED,
+    MAX_REPAIR_ATTEMPTS,
     STAGE_COMMIT,
     STAGE_CURATE,
     STAGE_DRAFT,
@@ -114,8 +116,12 @@ from agent_runtime.run_store import (
 )
 from agent_runtime.schemas import AgentConfirmRequest, AgentRunRequest
 from diff_analyzer import analyze_and_store, corrections_col, generate_change_description
+from agents.repair_agent import RepairAgent
+from agents.verify_agent import VerifyAgent
+from agents.memory_curator import MemoryCurator
 from generator import (
     build_top_event_normalized_candidates,
+    generate_fault_tree_draft,
     generate_fault_tree_with_progress,
     normalize_top_event_name,
     parse_user_prompt,
@@ -363,6 +369,8 @@ def _agent_response_mode(run: Dict[str, Any]) -> str:
         return "need_confirmation"
     if status == RUN_STATUS_COMPLETED:
         return "completed"
+    if status == RUN_STATUS_HUMAN_REVIEW_REQUIRED:
+        return "human_review_required"
     if status == RUN_STATUS_FAILED:
         return "failed"
     return "queued"
@@ -480,6 +488,7 @@ def _append_agent_artifact(
     content: Dict[str, Any],
     *,
     producer: str,
+    parent_artifact_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     artifact = put_agent_artifact(
         run_id=run_id,
@@ -487,6 +496,7 @@ def _append_agent_artifact(
         content=content,
         metadata={"producer": producer},
         producer=producer,
+        parent_artifact_id=parent_artifact_id,
     )
     append_agent_event(
         run_id,
@@ -679,11 +689,227 @@ def _start_agent_generation_monitor(run_id: str, item_id: str) -> None:
         thread.start()
 
 
+def _load_run_evidence_chunks(run: Dict[str, Any], tree_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    retrieval = tree_data.get("retrieval") or {}
+    chunk_ids = retrieval.get("evidence_chunk_ids") or retrieval.get("chunk_ids") or []
+    if not chunk_ids:
+        return []
+    return get_chunks_by_ids(
+        chunk_ids,
+        limit=max(1, len(chunk_ids)),
+        selected_file_version_ids=run.get("selected_file_version_ids") or [],
+    )
+
+
+def _mark_agent_run_human_review(
+    run_id: str,
+    *,
+    draft_artifact_id: str,
+    validation: Dict[str, Any],
+    reason: str,
+) -> Dict[str, Any]:
+    run = update_agent_run(
+        run_id,
+        {
+            "status": RUN_STATUS_HUMAN_REVIEW_REQUIRED,
+            "current_stage": STAGE_VALIDATE,
+            "review_tree_artifact_id": draft_artifact_id,
+            "result": {
+                "mode": "human_review_required",
+                "review_tree_artifact_id": draft_artifact_id,
+                "validation": validation,
+            },
+            "error": None,
+            "finished_at": datetime.utcnow(),
+        },
+    )
+    append_agent_event(
+        run_id,
+        EVENT_AGENT_MESSAGE,
+        stage=STAGE_VALIDATE,
+        message=reason,
+        payload={"review_tree_artifact_id": draft_artifact_id, "validation": validation},
+    )
+    return run or get_agent_run(run_id) or {}
+
+
+def _commit_agent_draft(run_id: str, draft_artifact: Dict[str, Any], validation: Dict[str, Any]) -> Dict[str, Any]:
+    run = get_agent_run(run_id) or {}
+    tree_data = (draft_artifact.get("payload") or draft_artifact.get("content") or {}).copy()
+    tree_data["validation"] = validation
+    retrieval = tree_data.get("retrieval") or {}
+    tree_id = f"ft_{uuid.uuid4().hex[:8]}"
+    append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_COMMIT, message="Saving validated draft as a tree version.")
+    create_tree(
+        tree_id=tree_id,
+        top_event=run.get("resolved_top_event") or run.get("requested_top_event") or "",
+        requested_top_event=run.get("requested_top_event"),
+        resolved_top_event=run.get("resolved_top_event"),
+        catalog_name=run.get("resolved_top_event"),
+        normalized_top_event=run.get("normalized_top_event"),
+        graph_node_id=run.get("graph_node_id"),
+        source_chunk_ids=retrieval.get("evidence_chunk_ids") or retrieval.get("chunk_ids") or [],
+        source_file_version_ids=run.get("selected_file_version_ids") or [],
+        source_scope_key=run.get("scope_key"),
+    )
+    version = save_version(
+        tree_id=tree_id,
+        tree_data=tree_data,
+        editor="AI",
+        description=f"AI agent workflow generation for top event: {run.get('resolved_top_event') or ''}",
+        is_ai=True,
+        requested_top_event=run.get("requested_top_event"),
+        resolved_top_event=run.get("resolved_top_event"),
+        normalized_top_event=run.get("normalized_top_event"),
+        source_file_version_ids=run.get("selected_file_version_ids") or [],
+        evidence_chunk_ids=retrieval.get("evidence_chunk_ids") or retrieval.get("chunk_ids") or [],
+        subgraph_node_ids=retrieval.get("subgraph_node_ids") or [],
+    )
+    final_artifact = _append_agent_artifact(
+        run_id,
+        ARTIFACT_FINAL_TREE,
+        {"tree_id": tree_id, "tree_version": version, "draft_artifact_id": draft_artifact.get("artifact_id")},
+        producer="CommitAgent",
+        parent_artifact_id=draft_artifact.get("artifact_id"),
+    )
+    run = update_agent_run(
+        run_id,
+        {
+            "status": RUN_STATUS_COMPLETED,
+            "current_stage": STAGE_CURATE,
+            "progress": {"completed": 100, "total": 100},
+            "tree_id": tree_id,
+            "tree_version": version,
+            "result": {
+                "mode": "completed",
+                "tree_id": tree_id,
+                "tree_version": version,
+                "final_tree_artifact_id": final_artifact.get("artifact_id"),
+                "draft_tree_artifact_id": draft_artifact.get("artifact_id"),
+                "validation": validation,
+            },
+            "error": None,
+            "finished_at": datetime.utcnow(),
+        },
+    )
+    append_agent_event(run_id, EVENT_TREE_COMMITTED, stage=STAGE_COMMIT, message="Validated draft committed.", payload={"tree_id": tree_id, "tree_version": version})
+    append_agent_event(run_id, EVENT_RUN_COMPLETED, stage=STAGE_CURATE, message="Agent run completed.", payload={"tree_id": tree_id, "tree_version": version})
+    return run or get_agent_run(run_id) or {}
+
+
+def _run_agent_second_phase(run_id: str, catalog: Dict[str, Any]) -> Dict[str, Any]:
+    """Phase 2: draft -> verify -> repair (at most twice) -> commit."""
+    run = get_agent_run(run_id)
+    if not run:
+        return {}
+    options = run.get("options") or {}
+    try:
+        draft_artifact = get_latest_agent_artifact(run_id, ARTIFACT_TREE_DRAFT)
+        if draft_artifact:
+            draft_tree = draft_artifact.get("payload") or draft_artifact.get("content") or {}
+            append_agent_event(run_id, EVENT_AGENT_MESSAGE, stage=STAGE_VALIDATE, message="Recovered persisted draft artifact for workflow resume.", payload={"artifact_id": draft_artifact.get("artifact_id")})
+        else:
+            update_agent_run(run_id, {"status": RUN_STATUS_RUNNING, "current_stage": STAGE_RETRIEVAL})
+            append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_RETRIEVAL, message="Generating a non-persisted draft from scoped evidence.")
+            draft_tree = generate_fault_tree_draft(
+                top_event=run.get("resolved_top_event") or catalog.get("name") or "",
+                requirements=run.get("requirements") or "",
+                selected_file_version_ids=run.get("selected_file_version_ids") or [],
+                root_graph_node_id=run.get("graph_node_id") or _graph_node_id_from_catalog(catalog),
+                part_details=options.get("part_details") if isinstance(options, dict) else None,
+                max_depth=options.get("max_depth") if isinstance(options, dict) else None,
+            )
+            retrieval = draft_tree.get("retrieval") or {}
+            _append_agent_artifact(run_id, ARTIFACT_RETRIEVAL_CONTEXT, retrieval, producer="RetrievalAgent")
+            append_agent_event(run_id, EVENT_RETRIEVAL_DONE, stage=STAGE_RETRIEVAL, message="Scoped evidence retrieved.", payload={"evidence_chunk_ids": retrieval.get("evidence_chunk_ids") or []})
+            update_agent_run(run_id, {"current_stage": STAGE_DRAFT, "progress": {"completed": 45, "total": 100}})
+            draft_artifact = _append_agent_artifact(run_id, ARTIFACT_TREE_DRAFT, draft_tree, producer="TreeDraftAgent")
+            append_agent_event(run_id, EVENT_DRAFT_GENERATED, stage=STAGE_DRAFT, message="Draft tree generated.", payload={"artifact_id": draft_artifact.get("artifact_id")})
+
+        verify_agent = VerifyAgent()
+        repair_agent = RepairAgent()
+        current_draft = draft_artifact
+        chunks = _load_run_evidence_chunks(run, draft_tree)
+        resume_attempt = max(0, min(int(run.get("repair_attempt_count") or 0), MAX_REPAIR_ATTEMPTS))
+        for repair_attempt in range(resume_attempt, MAX_REPAIR_ATTEMPTS + 1):
+            update_agent_run(run_id, {"current_stage": STAGE_VALIDATE, "repair_attempt_count": repair_attempt})
+            append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_VALIDATE, message=f"Validating draft (pass {repair_attempt + 1}).")
+            verification = verify_agent.run(
+                current_draft,
+                run_id=run_id,
+                scope_key=run.get("scope_key") or "",
+                skip_semantic=False,
+                persist_artifact=True,
+            )
+            validation = verification["payload"]
+            if validation.get("passed"):
+                return _commit_agent_draft(run_id, current_draft, validation)
+            if verification.get("human_review_required") or repair_attempt >= MAX_REPAIR_ATTEMPTS:
+                return _mark_agent_run_human_review(
+                    run_id,
+                    draft_artifact_id=current_draft.get("artifact_id"),
+                    validation=validation,
+                    reason="Draft requires expert review after validation or repair limit.",
+                )
+
+            update_agent_run(run_id, {"current_stage": STAGE_REPAIR, "repair_attempt_count": repair_attempt + 1})
+            append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_REPAIR, message=f"Repairing draft (attempt {repair_attempt + 1}).")
+            repair = repair_agent.run(
+                current_draft,
+                validation,
+                run_id=run_id,
+                scope_key=run.get("scope_key") or "",
+                chunks=chunks,
+                repair_attempt=repair_attempt + 1,
+                persist_artifact=True,
+                apply_legacy_repair=True,
+            )
+            repaired_tree = (repair.get("payload") or {}).get("repaired_tree")
+            if not isinstance(repaired_tree, dict):
+                return _mark_agent_run_human_review(
+                    run_id,
+                    draft_artifact_id=current_draft.get("artifact_id"),
+                    validation=validation,
+                    reason="No reliable repair could be produced; expert review is required.",
+                )
+            current_draft = _append_agent_artifact(
+                run_id,
+                ARTIFACT_TREE_DRAFT,
+                repaired_tree,
+                producer="RepairAgent",
+                parent_artifact_id=current_draft.get("artifact_id"),
+            )
+            append_agent_event(run_id, EVENT_DRAFT_GENERATED, stage=STAGE_REPAIR, message="Repaired draft created.", payload={"artifact_id": current_draft.get("artifact_id"), "repair_patch_artifact_id": (repair.get("payload") or {}).get("artifact_id")})
+        raise RuntimeError("Unexpected repair workflow exit")
+    except Exception as exc:
+        return _mark_agent_run_failed(run_id, f"Second-phase workflow failed: {exc}")
+
+
+def _start_agent_second_phase_thread(run_id: str, catalog: Dict[str, Any]) -> None:
+    thread = threading.Thread(target=_run_agent_second_phase, args=(run_id, catalog), daemon=True, name=f"agent-run-phase2-{run_id[-6:]}")
+    thread.start()
+
+
 def _launch_agent_legacy_generation(run_id: str, catalog: Dict[str, Any]) -> Dict[str, Any]:
     run = get_agent_run(run_id)
     if not run:
         return {}
     options = run.get("options") or {}
+    # New agent runs use the Phase-2 pre-commit loop.  The legacy worker is
+    # retained only for explicit Phase-1 compatibility and old API behavior.
+    if not isinstance(options, dict) or options.get("workflow_version") != "phase1":
+        if run.get("execution_mode") == "sync":
+            return _run_agent_second_phase(run_id, catalog)
+        updated = update_agent_run(
+            run_id,
+            {
+                "status": RUN_STATUS_RUNNING,
+                "current_stage": STAGE_RETRIEVAL,
+                "progress": {"completed": 10, "total": 100},
+            },
+        )
+        _start_agent_second_phase_thread(run_id, catalog)
+        return updated or get_agent_run(run_id) or {}
     requested_top_event = run.get("requested_top_event") or run.get("prompt")
     requirements = run.get("requirements") or ""
     graph_node_id = run.get("graph_node_id") or _graph_node_id_from_catalog(catalog)
@@ -3079,13 +3305,30 @@ def api_save(tree_id: str, req: SaveRequest):
     )
 
     learned_count = 0
+    correction_episode = None
     if prev_version_num and prev_ver and prev_ver.get("is_ai_generated"):
-        learned_count = analyze_and_store(tree_id, prev_version_num, new_version)
+        try:
+            curated = MemoryCurator().curate_expert_save(
+                tree_id=tree_id,
+                ai_version=int(prev_version_num),
+                expert_version=int(new_version),
+                scope_key=(prev_ver or {}).get("source_scope_key") or meta.get("source_scope_key") or "",
+                validation_report=validation,
+                write_legacy_corrections=True,
+                metadata={"editor": req.editor, "description": description},
+            )
+            learned_count = int(curated.get("legacy_corrections_written") or 0)
+            correction_episode = curated.get("episode")
+        except Exception:
+            # Saving a user-approved tree must not be rolled back if optional
+            # experience curation is temporarily unavailable.
+            learned_count = analyze_and_store(tree_id, prev_version_num, new_version)
 
     return {
         "success": True,
         "version": new_version,
         "learned_count": learned_count,
+        "correction_episode": correction_episode,
         "graph_property_updates": {
             "attempted": len(graph_property_updates),
             "applied": graph_updates_applied,
