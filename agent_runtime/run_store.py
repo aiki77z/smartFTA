@@ -8,7 +8,7 @@ from pymongo import ReturnDocument
 
 from database import agent_runs_col
 
-from .policies import CONTRACT_VERSION, RUN_STATUS_QUEUED, STAGE_CREATED
+from .policies import CONTRACT_VERSION, RUN_STATUS_QUEUED, STAGE_SCOPE
 
 
 def _now() -> datetime:
@@ -71,11 +71,16 @@ def create_agent_run(
         "generation_job_id": None,
         "generation_job_item_id": None,
         "last_generation_job_event_seq": 0,
+        "retry_count": 0,
+        "repair_attempt_count": 0,
         "tree_id": str(tree_id).strip() if tree_id else None,
         "tree_version": tree_version,
+        "review_tree_artifact_id": None,
         "execution_mode": execution_mode,
         "status": RUN_STATUS_QUEUED,
-        "current_stage": STAGE_CREATED,
+        # A newly persisted run is ready to execute scope resolution.  The
+        # lifecycle remains queued until the executor starts it.
+        "current_stage": STAGE_SCOPE,
         "progress": {"completed": 0, "total": 0},
         "confirmation": None,
         "last_event_seq": 0,

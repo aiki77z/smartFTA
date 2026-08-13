@@ -35,6 +35,8 @@ def put_agent_artifact(
     content: Any,
     version: Optional[int] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    parent_artifact_id: Optional[str] = None,
+    producer: Optional[str] = None,
 ) -> Dict[str, Any]:
     run_id = str(run_id or "").strip()
     artifact_type = str(artifact_type or "").strip()
@@ -50,15 +52,21 @@ def put_agent_artifact(
         version = int((latest or {}).get("version") or 0) + 1
     now = _now()
     artifact_id = f"art_{uuid4().hex[:12]}"
+    safe_metadata = metadata or {}
     doc = {
         "_id": artifact_id,
         "artifact_id": artifact_id,
         "run_id": run_id,
         "type": artifact_type,
         "version": int(version),
+        "parent_artifact_id": str(parent_artifact_id).strip() if parent_artifact_id else None,
+        "producer": str(producer or safe_metadata.get("producer") or "").strip() or None,
+        # payload is the published contract field. content is retained for
+        # compatibility with the initial runtime implementation.
+        "payload": content,
         "content": content,
         "content_hash": _content_hash(content),
-        "metadata": metadata or {},
+        "metadata": safe_metadata,
         "created_at": now,
         "updated_at": now,
     }

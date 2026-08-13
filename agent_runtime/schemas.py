@@ -16,7 +16,7 @@ class AgentRunRequest(BaseModel):
     canvas_id: Optional[str] = None
     tree_id: Optional[str] = None
     tree_version: Optional[int] = None
-    max_depth: Optional[int] = Field(default=None, ge=1, le=20)
+    max_depth: Optional[int] = Field(default=None, ge=1, le=10)
     sync: bool = False
     options: Dict[str, Any] = Field(default_factory=dict)
 

@@ -20,16 +20,33 @@ TERMINAL_RUN_STATUSES: Final[Set[str]] = {
     RUN_STATUS_HUMAN_REVIEW_REQUIRED,
 }
 
-STAGE_CREATED: Final[str] = "created"
+RUN_STATUSES: Final[Set[str]] = {
+    RUN_STATUS_QUEUED,
+    RUN_STATUS_RUNNING,
+    RUN_STATUS_WAITING_CONFIRMATION,
+    RUN_STATUS_COMPLETED,
+    RUN_STATUS_FAILED,
+    RUN_STATUS_CANCELLED,
+    RUN_STATUS_HUMAN_REVIEW_REQUIRED,
+}
+
 STAGE_SCOPE: Final[str] = "scope"
 STAGE_RETRIEVAL: Final[str] = "retrieval"
-STAGE_PLANNING: Final[str] = "planning"
-STAGE_GENERATION: Final[str] = "generation"
-STAGE_VALIDATION: Final[str] = "validation"
+STAGE_DRAFT: Final[str] = "draft"
+STAGE_VALIDATE: Final[str] = "validate"
 STAGE_REPAIR: Final[str] = "repair"
 STAGE_COMMIT: Final[str] = "commit"
 STAGE_CURATE: Final[str] = "curate"
-STAGE_DONE: Final[str] = "done"
+
+RUN_STAGES: Final[Set[str]] = {
+    STAGE_SCOPE,
+    STAGE_RETRIEVAL,
+    STAGE_DRAFT,
+    STAGE_VALIDATE,
+    STAGE_REPAIR,
+    STAGE_COMMIT,
+    STAGE_CURATE,
+}
 
 EVENT_RUN_CREATED: Final[str] = "RUN_CREATED"
 EVENT_STAGE_STARTED: Final[str] = "STAGE_STARTED"

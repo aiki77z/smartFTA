@@ -66,7 +66,12 @@ from agent_runtime.artifact_store import put_agent_artifact
 from agent_runtime.event_store import append_agent_event, list_agent_events
 from agent_runtime.policies import (
     ARTIFACT_FINAL_TREE,
+    ARTIFACT_REQUIREMENT,
+    ARTIFACT_REPAIR_PATCH,
     ARTIFACT_SCOPE,
+    ARTIFACT_RETRIEVAL_CONTEXT,
+    ARTIFACT_TREE_DRAFT,
+    ARTIFACT_VALIDATION_REPORT,
     ERROR_INVALID_CANDIDATE_REF,
     ERROR_CONFIRMATION_NOT_FOUND,
     ERROR_INVALID_REQUEST,
@@ -80,6 +85,10 @@ from agent_runtime.policies import (
     EVENT_RUN_CREATED,
     EVENT_RUN_COMPLETED,
     EVENT_RUN_FAILED,
+    EVENT_RETRIEVAL_DONE,
+    EVENT_DRAFT_GENERATED,
+    EVENT_VALIDATION_DONE,
+    EVENT_TREE_COMMITTED,
     EVENT_SCOPE_RESOLVED,
     EVENT_STAGE_STARTED,
     RUN_STATUS_QUEUED,
@@ -87,10 +96,13 @@ from agent_runtime.policies import (
     RUN_STATUS_WAITING_CONFIRMATION,
     RUN_STATUS_COMPLETED,
     RUN_STATUS_FAILED,
-    STAGE_DONE,
-    STAGE_GENERATION,
+    STAGE_COMMIT,
+    STAGE_CURATE,
+    STAGE_DRAFT,
+    STAGE_REPAIR,
     STAGE_RETRIEVAL,
     STAGE_SCOPE,
+    STAGE_VALIDATE,
 )
 from agent_runtime.run_store import (
     claim_agent_confirmation,
@@ -311,6 +323,7 @@ def _agent_error_response(
 
 
 def _agent_run_response(run: Dict[str, Any], events: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    result = run.get("result") or {}
     return {
         "contract_version": run.get("contract_version"),
         "run_id": run.get("run_id"),
@@ -325,11 +338,15 @@ def _agent_run_response(run: Dict[str, Any], events: Optional[List[Dict[str, Any
         "canvas_id": run.get("canvas_id"),
         "generation_job_id": run.get("generation_job_id"),
         "generation_job_item_id": run.get("generation_job_item_id"),
+        "retry_count": int(run.get("retry_count") or 0),
+        "repair_attempt_count": int(run.get("repair_attempt_count") or 0),
         "tree_id": run.get("tree_id"),
         "tree_version": run.get("tree_version"),
+        "review_tree_artifact_id": run.get("review_tree_artifact_id"),
         "execution_mode": run.get("execution_mode"),
         "confirmation": run.get("confirmation"),
-        "result": run.get("result"),
+        "result": result,
+        "validation": result.get("validation") if isinstance(result, dict) else None,
         "error": run.get("error"),
         "last_event_seq": int(run.get("last_event_seq") or 0),
         "next_event_seq": int(run.get("last_event_seq") or 0),
@@ -353,9 +370,108 @@ def _agent_response_mode(run: Dict[str, Any]) -> str:
 
 def _agent_stage_from_legacy(stage: Any) -> str:
     text = str(stage or "").lower()
+    if any(key in text for key in ("validate", "validation")):
+        return STAGE_VALIDATE
+    if "repair" in text:
+        return STAGE_REPAIR
+    if any(key in text for key in ("persist", "save", "commit")):
+        return STAGE_COMMIT
+    if any(key in text for key in ("draft", "generate", "tree_record", "prepare", "queued")):
+        return STAGE_DRAFT
     if any(key in text for key in ("retriev", "recall", "graph")):
         return STAGE_RETRIEVAL
-    return STAGE_GENERATION
+    return STAGE_DRAFT
+
+
+def _legacy_artifact_payloads(tree_data: Dict[str, Any], legacy_events: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Map the persisted legacy worker result into Phase-1 audit artifacts."""
+    retrieval = tree_data.get("retrieval") if isinstance(tree_data, dict) else {}
+    retrieval = retrieval if isinstance(retrieval, dict) else {}
+    validation = tree_data.get("validation") if isinstance(tree_data, dict) else {}
+    validation = validation if isinstance(validation, dict) else {}
+    history_repair = tree_data.get("history_repair") if isinstance(tree_data, dict) else None
+    repair_events = [
+        event
+        for event in legacy_events or []
+        if "history-repair" in str((event or {}).get("text") or "").lower()
+    ]
+    payloads = [
+        {
+            "type": ARTIFACT_RETRIEVAL_CONTEXT,
+            "producer": "LegacyGenerationAdapter",
+            "stage": STAGE_RETRIEVAL,
+            "event": EVENT_RETRIEVAL_DONE,
+            "message": "Retrieved graph context and evidence were recorded.",
+            "content": {
+                "matched_node_id": retrieval.get("matched_node_id"),
+                "subgraph_node_ids": retrieval.get("subgraph_node_ids") or [],
+                "evidence_chunk_ids": retrieval.get("evidence_chunk_ids") or retrieval.get("chunk_ids") or [],
+                "source_file_version_ids": retrieval.get("source_file_version_ids") or [],
+                "warnings": retrieval.get("warnings") or [],
+            },
+        },
+        {
+            "type": ARTIFACT_TREE_DRAFT,
+            "producer": "LegacyGenerationAdapter",
+            "stage": STAGE_DRAFT,
+            "event": EVENT_DRAFT_GENERATED,
+            "message": "Legacy worker draft was recorded.",
+            "content": {
+                "nodeList": tree_data.get("nodeList") or [],
+                "linkList": tree_data.get("linkList") or [],
+                "documents": tree_data.get("documents") or [],
+                "rules": tree_data.get("rules") or [],
+                "investigateMethod": tree_data.get("investigateMethod"),
+            },
+        },
+        {
+            "type": ARTIFACT_VALIDATION_REPORT,
+            "producer": "LegacyGenerationAdapter",
+            "stage": STAGE_VALIDATE,
+            "event": EVENT_VALIDATION_DONE,
+            "message": "Legacy worker validation result was recorded.",
+            "content": validation,
+        },
+    ]
+    if history_repair is not None or repair_events:
+        payloads.append(
+            {
+                "type": ARTIFACT_REPAIR_PATCH,
+                "producer": "LegacyGenerationAdapter",
+                "stage": STAGE_REPAIR,
+                "event": EVENT_AGENT_MESSAGE,
+                "message": "Legacy history-repair summary was recorded.",
+                "content": {
+                    "summary": history_repair if isinstance(history_repair, dict) else history_repair,
+                    "legacy_events": repair_events,
+                },
+            }
+        )
+    return payloads
+
+
+def _record_legacy_generation_artifacts(run_id: str, tree_id: str, tree_version: int) -> Dict[str, str]:
+    version_doc = get_version(tree_id, tree_version) or {}
+    tree_data = version_doc.get("tree_data") or {}
+    run = get_agent_run(run_id) or {}
+    item = get_generation_job_item(run.get("generation_job_item_id")) if run.get("generation_job_item_id") else {}
+    artifacts: Dict[str, str] = {}
+    for payload in _legacy_artifact_payloads(tree_data, (item or {}).get("events") or []):
+        artifact = _append_agent_artifact(
+            run_id,
+            payload["type"],
+            payload["content"],
+            producer=payload["producer"],
+        )
+        artifacts[payload["type"]] = artifact.get("artifact_id")
+        append_agent_event(
+            run_id,
+            payload["event"],
+            stage=payload["stage"],
+            message=payload["message"],
+            payload={"artifact_id": artifact.get("artifact_id"), "tree_id": tree_id, "tree_version": tree_version},
+        )
+    return artifacts
 
 
 def _append_agent_artifact(
@@ -370,6 +486,7 @@ def _append_agent_artifact(
         artifact_type=artifact_type,
         content=content,
         metadata={"producer": producer},
+        producer=producer,
     )
     append_agent_event(
         run_id,
@@ -382,11 +499,13 @@ def _append_agent_artifact(
 
 
 def _mark_agent_run_failed(run_id: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    previous = get_agent_run(run_id) or {}
+    last_stage = previous.get("current_stage") or STAGE_SCOPE
     run = update_agent_run(
         run_id,
         {
             "status": RUN_STATUS_FAILED,
-            "current_stage": STAGE_DONE,
+            "current_stage": last_stage,
             "error": {
                 "code": ERROR_WORKFLOW_FAILED,
                 "message": message,
@@ -399,7 +518,7 @@ def _mark_agent_run_failed(run_id: str, message: str, *, details: Optional[Dict[
     append_agent_event(
         run_id,
         EVENT_RUN_FAILED,
-        stage=STAGE_DONE,
+        stage=last_stage,
         message=message,
         payload=details or {},
     )
@@ -407,6 +526,7 @@ def _mark_agent_run_failed(run_id: str, message: str, *, details: Optional[Dict[
 
 
 def _complete_agent_run_from_generation_result(run_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    run = get_agent_run(run_id) or {}
     tree_id = result.get("tree_id")
     tree_version = result.get("version") or result.get("tree_version")
     if tree_id and tree_version is None:
@@ -420,14 +540,16 @@ def _complete_agent_run_from_generation_result(run_id: str, result: Dict[str, An
         )
 
     tree_version = int(tree_version)
+    legacy_artifacts = _record_legacy_generation_artifacts(run_id, tree_id, tree_version)
+    append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_COMMIT, message="Persisting final tree reference.")
     artifact = _append_agent_artifact(
         run_id,
         ARTIFACT_FINAL_TREE,
         {
             "tree_id": tree_id,
             "tree_version": tree_version,
-            "generation_job_id": result.get("job_id"),
-            "generation_job_item_id": result.get("item_id"),
+            "generation_job_id": result.get("job_id") or run.get("generation_job_id"),
+            "generation_job_item_id": result.get("item_id") or run.get("generation_job_item_id"),
         },
         producer="LegacyGenerationAdapter",
     )
@@ -435,15 +557,21 @@ def _complete_agent_run_from_generation_result(run_id: str, result: Dict[str, An
         run_id,
         {
             "status": RUN_STATUS_COMPLETED,
-            "current_stage": STAGE_DONE,
+            "current_stage": STAGE_CURATE,
             "progress": {"completed": 100, "total": 100},
             "tree_id": tree_id,
             "tree_version": tree_version,
+            "generation_job_id": result.get("job_id") or run.get("generation_job_id"),
+            "generation_job_item_id": result.get("item_id") or run.get("generation_job_item_id"),
             "result": {
                 "mode": result.get("mode") or "generated",
                 "tree_id": tree_id,
                 "tree_version": tree_version,
                 "final_tree_artifact_id": artifact.get("artifact_id"),
+                "retrieval_context_artifact_id": legacy_artifacts.get(ARTIFACT_RETRIEVAL_CONTEXT),
+                "draft_tree_artifact_id": legacy_artifacts.get(ARTIFACT_TREE_DRAFT),
+                "validation_artifact_id": legacy_artifacts.get(ARTIFACT_VALIDATION_REPORT),
+                "validation": (get_version(tree_id, tree_version) or {}).get("tree_data", {}).get("validation"),
             },
             "error": None,
             "finished_at": datetime.utcnow(),
@@ -451,8 +579,21 @@ def _complete_agent_run_from_generation_result(run_id: str, result: Dict[str, An
     )
     append_agent_event(
         run_id,
+        EVENT_TREE_COMMITTED,
+        stage=STAGE_COMMIT,
+        message="Final tree reference recorded.",
+        payload={"tree_id": tree_id, "tree_version": tree_version, "artifact_id": artifact.get("artifact_id")},
+    )
+    append_agent_event(
+        run_id,
+        EVENT_STAGE_STARTED,
+        stage=STAGE_CURATE,
+        message="Finalizing agent run audit trail.",
+    )
+    append_agent_event(
+        run_id,
         EVENT_RUN_COMPLETED,
-        stage=STAGE_DONE,
+        stage=STAGE_CURATE,
         message="Agent run completed.",
         payload={"tree_id": tree_id, "tree_version": tree_version, "artifact_id": artifact.get("artifact_id")},
     )
@@ -551,7 +692,7 @@ def _launch_agent_legacy_generation(run_id: str, catalog: Dict[str, Any]) -> Dic
         append_agent_event(
             run_id,
             EVENT_STAGE_STARTED,
-            stage=STAGE_GENERATION,
+            stage=STAGE_DRAFT,
             message="Starting existing fault-tree generation workflow.",
         )
         result = _queue_single_generation(
@@ -563,6 +704,7 @@ def _launch_agent_legacy_generation(run_id: str, catalog: Dict[str, Any]) -> Dic
             selected_file_version_ids=run.get("selected_file_version_ids") or [],
             async_mode=async_mode,
             part_details=options.get("part_details") if isinstance(options, dict) else None,
+            max_depth=options.get("max_depth") if isinstance(options, dict) else None,
         )
     except Exception as exc:
         return _mark_agent_run_failed(run_id, f"Failed to start generation: {exc}")
@@ -577,7 +719,7 @@ def _launch_agent_legacy_generation(run_id: str, catalog: Dict[str, Any]) -> Dic
         run_id,
         {
             "status": RUN_STATUS_RUNNING,
-            "current_stage": STAGE_GENERATION,
+            "current_stage": STAGE_DRAFT,
             "generation_job_id": result.get("job_id"),
             "generation_job_item_id": item_id,
             "progress": {"completed": 0, "total": 100},
@@ -619,6 +761,17 @@ def _run_agent_scope(run_id: str) -> Dict[str, Any]:
                     "graph_node_id": resolution.get("graph_node_id"),
                 }
             )
+        _append_agent_artifact(
+            run_id,
+            ARTIFACT_REQUIREMENT,
+            {
+                "prompt": run.get("prompt") or "",
+                "requested_top_event": resolution.get("requested_top_event"),
+                "requirements": resolution.get("requirements") or "",
+                "selected_file_version_ids": scope_ids,
+            },
+            producer="ScopeAgent",
+        )
         _append_agent_artifact(run_id, ARTIFACT_SCOPE, resolution, producer="ScopeAgent")
 
         if resolution.get("status") != "exact_match":
@@ -673,11 +826,14 @@ def _catalog_from_confirmed_candidate(run: Dict[str, Any], candidate_ref: str) -
     )
     if not candidate:
         raise ValueError("Selected candidate does not belong to this run.")
+    candidate_scope_ids = _dedupe_keep_order(candidate.get("file_version_ids") or [])
+    if not candidate_scope_ids:
+        candidate_scope_ids = run.get("selected_file_version_ids") or []
     return _resolve_confirmed_top_event(
         confirmed_top_event=candidate.get("name"),
         confirmed_normalized_top_event=candidate.get("normalized_name"),
         confirmed_graph_node_id=candidate.get("graph_node_id"),
-        selected_file_version_ids=run.get("selected_file_version_ids") or [],
+        selected_file_version_ids=candidate_scope_ids,
     )
 
 
@@ -783,7 +939,7 @@ def api_agent_run_status(
         return _agent_error_response(404, ERROR_RUN_NOT_FOUND, f"Agent run not found: {run_id}")
     events = list_agent_events(run_id, after_event_seq=after_event_seq)
     payload = _agent_run_response(run, events)
-    if include_tree_data and payload.get("tree_id") and payload.get("tree_version") is not None:
+    if include_tree_data and run.get("status") == RUN_STATUS_COMPLETED and payload.get("tree_id") and payload.get("tree_version") is not None:
         version_doc = get_version(payload["tree_id"], int(payload["tree_version"]))
         payload["tree_data"] = (version_doc or {}).get("tree_data")
     return payload
@@ -855,6 +1011,8 @@ def api_agent_run_confirm(run_id: str, req: AgentConfirmRequest):
             "resolved_top_event": catalog.get("name"),
             "normalized_top_event": catalog.get("normalized_name"),
             "graph_node_id": _graph_node_id_from_catalog(catalog),
+            "selected_file_version_ids": _dedupe_keep_order(candidate.get("file_version_ids") or run.get("selected_file_version_ids") or []),
+            "scope_key": make_scope_key(candidate.get("file_version_ids") or run.get("selected_file_version_ids") or []),
         },
     )
     if not updated:
@@ -1650,12 +1808,19 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
     requirements = item.get("requirements") or ""
     selected_file_version_ids = _resolve_selected_scope(item.get("source_file_version_ids") or [])
     part_details = None
+    meta: Dict[str, Any] = {}
     try:
         meta = item.get("metadata") or {}
         if isinstance(meta, dict) and meta.get("part_details"):
             part_details = meta.get("part_details")
     except Exception:
         part_details = None
+    max_depth = None
+    try:
+        if isinstance(meta, dict) and meta.get("max_depth") is not None:
+            max_depth = max(1, min(int(meta["max_depth"]), 10))
+    except (TypeError, ValueError):
+        max_depth = None
     tree_id = None
 
     try:
@@ -1801,6 +1966,7 @@ def _run_generation_item(item_id: str, execution_owner: Optional[str] = None, mi
             progress_callback=progress_callback,
             log_callback=log_callback,
             part_details=part_details,
+            max_depth=max_depth,
         )
 
         retrieval = tree_data.get("retrieval") or {}
@@ -1989,6 +2155,7 @@ def _queue_single_generation(
     selected_file_version_ids: Optional[List[str]] = None,
     async_mode: bool = False,
     part_details: Optional[Dict[str, Any]] = None,
+    max_depth: Optional[int] = None,
 ) -> Dict:
     scoped_file_version_ids = _resolve_selected_scope(selected_file_version_ids)
     resolved_top_event = catalog["name"]
@@ -2076,6 +2243,8 @@ def _queue_single_generation(
     }
     if part_details:
         item_metadata["part_details"] = part_details
+    if max_depth is not None:
+        item_metadata["max_depth"] = max(1, min(int(max_depth), 10))
 
     item = create_generation_job_item(
         job_id=job["job_id"],
