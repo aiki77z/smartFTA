@@ -16,5 +16,5 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip() or None
 
 FTA_GNR_BASE_URL = os.getenv("FTA_GNR_BASE_URL", "http://localhost:8000").strip().rstrip("/")
-FTA_GNR_AGENT_RUN_PATH = os.getenv("FTA_GNR_AGENT_RUN_PATH", "").strip()
+FTA_GNR_AGENT_RUN_PATH = os.getenv("FTA_GNR_AGENT_RUN_PATH", "/api/agent/run").strip()
 
