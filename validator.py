@@ -80,8 +80,6 @@ def validate_full(tree_data: Dict[str, Any], *, skip_semantic: bool = False) -> 
         # Event checks
         ev = n.get("event")
         if node_type == "top_event":
-            if ev is not None:
-                issues.append(Issue("ERROR", "TOP_EVENT_EVENT_NOT_NULL", "顶事件节点的 event 必须为 null", node_id=node_id or None, node_name=node_name or None))
             continue
 
         if not isinstance(ev, dict):

@@ -1386,7 +1386,7 @@ def build_fault_tree_from_chunk_elements(
 ## 生成规则
 1. 每个节点id格式：node-{{8位十六进制}}，全部唯一
 2. event.id格式：E001, E002...依次递增
-3. 顶事件的event字段固定为null
+3. 顶事件的event字段可以为null，也可以保留完整event对象；不要为了置空而丢失已有顶事件信息
 4. 中间事件和底事件必须填完整event对象
 5. errorLevel必须填写：高/中/低
 6. rules尽量从手册提取触发条件；无量化数据则填[]

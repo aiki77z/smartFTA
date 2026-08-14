@@ -337,16 +337,6 @@ def validate_fault_tree(payload: ValidateRequest) -> Dict[str, Any]:
     ev = _resolve_event(node)
 
     if node_type == 'top':
-      # 顶事件 event 应为 null（允许缺省）
-      if ev is not None:
-        issues.append(
-          _issue(
-            level='WARNING',
-            code='TOP_EVENT_HAS_EVENT',
-            message='顶事件的event字段应为null',
-            node_ids=[nid],
-          ),
-        )
       continue
 
     # intermediate/basic（以及其它非 gate 非 top 的事件节点）必须有 event

@@ -152,11 +152,6 @@ def _operations_for_issue(tree_data: Dict[str, Any], issue: Dict[str, Any]) -> L
                 )
             )
         return ops or [_mark_uncertain(issue)]
-    if code in {"TOP_EVENT_EVENT_NOT_NULL", "TOP_EVENT_HAS_EVENT"}:
-        return [
-            _op("update_node", issue, node_id=node_id, fields={"event": None})
-            for node_id in node_ids
-        ] or [_mark_uncertain(issue)]
     if code == "BASIC_HAS_CHILDREN":
         parent_id = node_ids[0] if node_ids else ""
         if parent_id:

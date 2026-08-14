@@ -741,6 +741,13 @@ def _commit_agent_draft(run_id: str, draft_artifact: Dict[str, Any], validation:
     retrieval = tree_data.get("retrieval") or {}
     tree_id = f"ft_{uuid.uuid4().hex[:8]}"
     append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_COMMIT, message="Saving validated draft as a tree version.")
+    append_agent_event(
+        run_id,
+        EVENT_AGENT_MESSAGE,
+        stage="persistence",
+        message="Persisting final fault tree version.",
+        payload={"progress": 90, "draft_artifact_id": draft_artifact.get("artifact_id")},
+    )
     create_tree(
         tree_id=tree_id,
         top_event=run.get("resolved_top_event") or run.get("requested_top_event") or "",
@@ -812,6 +819,31 @@ def _run_agent_second_phase(run_id: str, catalog: Dict[str, Any]) -> Dict[str, A
         else:
             update_agent_run(run_id, {"status": RUN_STATUS_RUNNING, "current_stage": STAGE_RETRIEVAL})
             append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_RETRIEVAL, message="Generating a non-persisted draft from scoped evidence.")
+            append_agent_event(
+                run_id,
+                EVENT_AGENT_MESSAGE,
+                stage="graph_subgraph",
+                message="Expanding local graph subgraph for the confirmed top event.",
+                payload={
+                    "progress": 25,
+                    "top_event": run.get("resolved_top_event") or catalog.get("name") or "",
+                    "graph_node_id": run.get("graph_node_id") or _graph_node_id_from_catalog(catalog),
+                },
+            )
+            append_agent_event(
+                run_id,
+                EVENT_AGENT_MESSAGE,
+                stage="graph_chunks",
+                message="Collecting evidence chunks from the scoped subgraph.",
+                payload={"progress": 35},
+            )
+            append_agent_event(
+                run_id,
+                EVENT_AGENT_MESSAGE,
+                stage="generate_draft",
+                message="Generating draft fault tree from retrieval context.",
+                payload={"progress": 40},
+            )
             draft_tree = generate_fault_tree_draft(
                 top_event=run.get("resolved_top_event") or catalog.get("name") or "",
                 requirements=run.get("requirements") or "",
@@ -822,10 +854,32 @@ def _run_agent_second_phase(run_id: str, catalog: Dict[str, Any]) -> Dict[str, A
             )
             retrieval = draft_tree.get("retrieval") or {}
             _append_agent_artifact(run_id, ARTIFACT_RETRIEVAL_CONTEXT, retrieval, producer="RetrievalAgent")
-            append_agent_event(run_id, EVENT_RETRIEVAL_DONE, stage=STAGE_RETRIEVAL, message="Scoped evidence retrieved.", payload={"evidence_chunk_ids": retrieval.get("evidence_chunk_ids") or []})
+            append_agent_event(
+                run_id,
+                EVENT_RETRIEVAL_DONE,
+                stage="graph_chunks",
+                message="Scoped evidence chunks retrieved.",
+                payload={
+                    "progress": 42,
+                    "evidence_chunk_ids": retrieval.get("evidence_chunk_ids") or [],
+                    "subgraph_node_count": retrieval.get("subgraph_node_count"),
+                    "subgraph_edge_count": retrieval.get("subgraph_edge_count"),
+                },
+            )
             update_agent_run(run_id, {"current_stage": STAGE_DRAFT, "progress": {"completed": 45, "total": 100}})
             draft_artifact = _append_agent_artifact(run_id, ARTIFACT_TREE_DRAFT, draft_tree, producer="TreeDraftAgent")
-            append_agent_event(run_id, EVENT_DRAFT_GENERATED, stage=STAGE_DRAFT, message="Draft tree generated.", payload={"artifact_id": draft_artifact.get("artifact_id")})
+            append_agent_event(
+                run_id,
+                EVENT_DRAFT_GENERATED,
+                stage="generate_draft",
+                message="Draft tree generated.",
+                payload={
+                    "progress": 50,
+                    "artifact_id": draft_artifact.get("artifact_id"),
+                    "node_count": len(draft_tree.get("nodeList") or []),
+                    "link_count": len(draft_tree.get("linkList") or []),
+                },
+            )
 
         verify_agent = VerifyAgent()
         repair_agent = RepairAgent()
@@ -844,6 +898,13 @@ def _run_agent_second_phase(run_id: str, catalog: Dict[str, Any]) -> Dict[str, A
             )
             validation = verification["payload"]
             if validation.get("passed"):
+                append_agent_event(
+                    run_id,
+                    EVENT_AGENT_MESSAGE,
+                    stage=STAGE_REPAIR,
+                    message="No repair required; validation passed.",
+                    payload={"progress": 75, "repair_required": False},
+                )
                 return _commit_agent_draft(run_id, current_draft, validation)
             if verification.get("human_review_required") or repair_attempt >= MAX_REPAIR_ATTEMPTS:
                 return _mark_agent_run_human_review(
@@ -1043,6 +1104,18 @@ def _run_agent_scope(run_id: str) -> Dict[str, Any]:
             stage=STAGE_RETRIEVAL,
             message="Top event and knowledge scope resolved.",
             payload={"resolved_top_event": resolution.get("resolved_top_event"), "scope_key": make_scope_key(scope_ids)},
+        )
+        append_agent_event(
+            run_id,
+            EVENT_AGENT_MESSAGE,
+            stage="graph_match",
+            message=f"Matched top event: {resolution.get('resolved_top_event') or resolution.get('requested_top_event')}",
+            payload={
+                "progress": 20,
+                "resolved_top_event": resolution.get("resolved_top_event"),
+                "graph_node_id": resolution.get("graph_node_id"),
+                "scope_key": make_scope_key(scope_ids),
+            },
         )
         return _launch_agent_legacy_generation(run_id, resolution.get("catalog_entry") or {})
     except Exception as exc:
