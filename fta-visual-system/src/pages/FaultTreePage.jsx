@@ -312,22 +312,112 @@ function unwrapAssistantAgentRun(resp) {
   return run && typeof run === 'object' && run.run_id ? run : null
 }
 
+const AGENT_EVENT_PROFILES = {
+  AssistantAgent: { agent: 'AssistantAgent · 交互智能体', avatar: '助' },
+  ScopeAgent: { agent: 'ScopeAgent · 范围智能体', avatar: '范' },
+  RetrievalAgent: { agent: 'RetrievalAgent · 检索智能体', avatar: '检' },
+  TreeDraftAgent: { agent: 'TreeDraftAgent · 草稿智能体', avatar: '草' },
+  VerifyAgent: { agent: 'VerifyAgent · 校验智能体', avatar: '验' },
+  RepairAgent: { agent: 'RepairAgent · 修复智能体', avatar: '修' },
+  CommitAgent: { agent: 'CommitAgent · 持久化智能体', avatar: '存' },
+  MemoryCurator: { agent: 'MemoryCurator · 记忆整理智能体', avatar: '忆' },
+  ReviewAgent: { agent: 'ReviewAgent · 人工复核智能体', avatar: '审' },
+  SchedulerAgent: { agent: 'SchedulerAgent · 调度智能体', avatar: '调' },
+}
+
+function artifactTypeOfAgentEvent(e) {
+  return String(e?.artifact_type || e?.artifactType || e?.payload?.artifact_type || e?.payload?.type || '').toLowerCase()
+}
+
+function agentProfileForAgentRunEvent(e) {
+  const type = String(e?.type || '').toUpperCase()
+  const stage = String(e?.stage || '').toLowerCase()
+  const artifactType = artifactTypeOfAgentEvent(e)
+  const message = String(e?.message || e?.text || '').toLowerCase()
+
+  if (stage === 'repair' || artifactType === 'repair_patch' || message.includes('repair')) {
+    return AGENT_EVENT_PROFILES.RepairAgent
+  }
+  if (
+    stage === 'validate' ||
+    type === 'VALIDATION_DONE' ||
+    artifactType === 'validation_report' ||
+    message.includes('validat')
+  ) {
+    return AGENT_EVENT_PROFILES.VerifyAgent
+  }
+  if (
+    stage === 'commit' ||
+    stage === 'persistence' ||
+    type === 'TREE_COMMITTED' ||
+    artifactType === 'final_tree' ||
+    message.includes('persist') ||
+    message.includes('saving validated draft')
+  ) {
+    return AGENT_EVENT_PROFILES.CommitAgent
+  }
+  if (stage === 'curate' || type === 'RUN_COMPLETED') {
+    return AGENT_EVENT_PROFILES.MemoryCurator
+  }
+  if (
+    stage === 'draft' ||
+    stage === 'generate_draft' ||
+    type === 'DRAFT_GENERATED' ||
+    artifactType === 'tree_draft' ||
+    message.includes('draft')
+  ) {
+    return AGENT_EVENT_PROFILES.TreeDraftAgent
+  }
+  if (
+    stage === 'retrieval' ||
+    stage === 'graph_subgraph' ||
+    stage === 'graph_chunks' ||
+    type === 'RETRIEVAL_DONE' ||
+    artifactType === 'retrieval_context' ||
+    message.includes('evidence') ||
+    message.includes('subgraph')
+  ) {
+    return AGENT_EVENT_PROFILES.RetrievalAgent
+  }
+  if (
+    stage === 'scope' ||
+    stage === 'graph_match' ||
+    type === 'SCOPE_RESOLVED' ||
+    type === 'CONFIRMATION_REQUIRED' ||
+    type === 'CONFIRMATION_RECEIVED' ||
+    artifactType === 'requirement' ||
+    artifactType === 'scope' ||
+    message.includes('top event') ||
+    message.includes('knowledge scope')
+  ) {
+    return AGENT_EVENT_PROFILES.ScopeAgent
+  }
+  if (type === 'RUN_FAILED') return AGENT_EVENT_PROFILES.ReviewAgent
+  if (type === 'RUN_CREATED' || type === 'STAGE_STARTED' || type === 'ARTIFACT_CREATED') {
+    return AGENT_EVENT_PROFILES.SchedulerAgent
+  }
+  return AGENT_EVENT_PROFILES.AssistantAgent
+}
+
 function mapAgentRunEventsToTaskFormat(agentRun) {
   const evs = Array.isArray(agentRun?.events) ? agentRun.events : []
   return evs
-    .map((e, idx) => ({
-      seq: Number(e.event_seq ?? e.seq) || idx + 1,
-      ts: e.created_at || e.ts || new Date().toISOString(),
-      agent: e.type || e.agent || 'AgentRun',
-      avatar: String(e.type || e.agent || 'A').slice(0, 1),
-      level: String(e.level || 'INFO').toUpperCase(),
-      text: String(e.message || e.text || e.stage || ''),
-      progress: e.payload?.progress ?? e.progress,
-      stage: String(e.stage || '').toLowerCase(),
-      type: String(e.type || '').toUpperCase(),
-      artifactType: String(e.artifact_type || e.artifactType || e.payload?.artifact_type || e.payload?.type || '').toLowerCase(),
-      payload: e.payload || {},
-    }))
+    .map((e, idx) => {
+      const profile = agentProfileForAgentRunEvent(e)
+      return {
+        seq: Number(e.event_seq ?? e.seq) || idx + 1,
+        ts: e.created_at || e.ts || new Date().toISOString(),
+        agent: profile.agent,
+        avatar: profile.avatar,
+        level: String(e.level || 'INFO').toUpperCase(),
+        text: String(e.message || e.text || e.stage || ''),
+        progress: e.payload?.progress ?? e.progress,
+        stage: String(e.stage || '').toLowerCase(),
+        type: String(e.type || '').toUpperCase(),
+        artifactType: artifactTypeOfAgentEvent(e),
+        payload: e.payload || {},
+      }
+    })
     .sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0))
 }
 
@@ -335,8 +425,7 @@ function mergeAgentRunEventsIntoTaskRef(ref, taskId, agentRun, bumpRevision) {
   const mapped = mapAgentRunEventsToTaskFormat(agentRun)
   if (!mapped.length) return
   const prev = ref.current.get(taskId) || []
-  const locals = prev.filter((e) => (Number(e.seq) || 0) >= ASSISTANT_LOCAL_EVENT_SEQ_MIN)
-  const bySeq = new Map([...locals, ...mapped].map((e) => [Number(e.seq) || 0, e]))
+  const bySeq = new Map([...prev, ...mapped].map((e) => [Number(e.seq) || 0, e]))
   ref.current.set(taskId, [...bySeq.values()].sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0)))
   bumpRevision?.()
 }
@@ -1612,7 +1701,7 @@ function FaultTreePage() {
           !['completed', 'failed', 'cancelled'].includes(String(memory.agent_run_status).toLowerCase())
         ) {
           const runId = String(memory.agent_run_id)
-          const afterSeq = Number(memory.agent_run_last_event_seq || 0)
+          const afterSeq = 0
           const includeTreeData = String(memory.agent_run_status).toLowerCase() !== 'waiting_confirmation'
           const finalResp = await pollAssistantAgentRun({
             runId,
@@ -1622,6 +1711,9 @@ function FaultTreePage() {
             intervalMs: 1500,
             onUpdate: (_resp, agentRun) => {
               if (cancelled) return
+              mergeAgentRunEventsIntoTaskRef(assistantTaskEventHistoryRef, `task-${runId}`, agentRun, () =>
+                setAssistantTaskEventsRevision((n) => n + 1),
+              )
               setAssistantTasks((prev) =>
                 prev.map((t) =>
                   t.id === `task-${runId}`
@@ -1917,7 +2009,7 @@ function FaultTreePage() {
   // 修改任务已改为调用 fta-ai-service（不再使用前端模拟 patch）
 
   const upsertProgressMessage = useCallback(
-    ({ taskId, agent = '调度器', avatar = 'S', quote = '', content = '', actions = null, actionsDisabled = false }) => {
+    ({ taskId, agent = '调度智能体', avatar = 'S', quote = '', content = '', actions = null, actionsDisabled = false }) => {
       if (!taskId) return
       const msg = {
         id: `progress-${taskId}`,
@@ -5412,7 +5504,7 @@ function FaultTreeAssistantPanel({
                       <span className="fta-assistant-progress-avatar" aria-hidden>
                         {m.avatar || 'S'}
                       </span>
-                      <span className="fta-assistant-progress-agent">{m.agent || '调度器'}</span>
+                      <span className="fta-assistant-progress-agent">{m.agent || '调度智能体'}</span>
                       {m.taskId ? (
                         <span className="fta-assistant-progress-task" title={m.taskId}>
                           #{String(m.taskId).slice(-6)}
@@ -5454,7 +5546,7 @@ function FaultTreeAssistantPanel({
                               // 不删除此卡片；仅更新文案并禁用按钮，避免重复点击
                               window.__fta_upsertProgressMessage?.({
                                 taskId,
-                                agent: m.agent || '调度器',
+                                agent: m.agent || '调度智能体',
                                 avatar: m.avatar || 'S',
                                 quote: m.quote || '',
                                 content: `已选择候选：${a.label}（正在提交…）`,

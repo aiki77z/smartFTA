@@ -160,6 +160,19 @@ export async function pollAssistantAgentRun({
     cursor = Math.max(cursor, Number(agentRun.last_event_seq || agentRun.next_event_seq || 0))
     const status = String(agentRun.status || '').toLowerCase()
     if (['completed', 'failed', 'cancelled', 'waiting_confirmation', 'human_review_required'].includes(status)) {
+      const eventCount = Array.isArray(agentRun.events) ? agentRun.events.length : 0
+      if (cursor > 0 && eventCount < cursor) {
+        const fullResp = await getAssistantAgentRun({
+          runId,
+          sessionId,
+          afterEventSeq: 0,
+          includeTreeData,
+          signal,
+        })
+        const fullAgentRun = fullResp?.result?.agent_run || {}
+        onUpdate?.(fullResp, fullAgentRun)
+        return fullResp
+      }
       return resp
     }
     await new Promise((resolve, reject) => {

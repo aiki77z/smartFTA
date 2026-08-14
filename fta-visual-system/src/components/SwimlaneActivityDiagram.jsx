@@ -85,12 +85,12 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
     [events])
 
   const lanes = useMemo(() => [
-    { id: 'scheduler', name: '调度器' },
-    { id: 'recall', name: '召回' },
-    { id: 'llm2', name: '草稿生成' },
-    { id: 'validate', name: '结构校验' },
-    { id: 'repair', name: '修复' },
-    { id: 'persist', name: '持久化' },
+    { id: 'scheduler', name: '调度智能体' },
+    { id: 'recall', name: '范围与检索智能体' },
+    { id: 'llm2', name: '构建智能体' },
+    { id: 'validate', name: '校验智能体' },
+    { id: 'repair', name: '修复智能体' },
+    { id: 'persist', name: '持久化智能体' },
   ], [])
 
   const laneIdx = useMemo(() => {
