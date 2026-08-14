@@ -1,10 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './swimlane-activity-diagram.css'
 
-function textOf(e) { return String(e?.text || '') }
+function textOf(e) { return String(e?.text || e?.message || '') }
 function typeOf(e) { return String(e?.type || e?.agent || '').toUpperCase() }
-function artifactOf(e) { return String(e?.artifactType || e?.artifact_type || e?.payload?.artifact_type || '').toLowerCase() }
+function artifactOf(e) { return String(e?.artifactType || e?.artifact_type || e?.payload?.artifact_type || e?.payload?.type || '').toLowerCase() }
 function stageOf(e) { return String(e?.stage || '').toLowerCase() }
+function validationPassed(e) {
+  if (e?.payload?.passed === false) return false
+  if (e?.payload?.valid === false) return false
+  return true
+}
 
 function findFirstSeq(events, pred) {
   for (const e of events || []) if (pred(e)) return Number(e.seq) || 0
@@ -193,7 +198,7 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
         kind: 'action',
         label: '校验通过',
         match: e =>
-          (typeOf(e) === 'VALIDATION_DONE' && e?.payload?.valid !== false) ||
+          (typeOf(e) === 'VALIDATION_DONE' && validationPassed(e)) ||
           /validation passed/i.test(textOf(e)) ||
           textOf(e).includes('校验通过'),
       },

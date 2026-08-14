@@ -325,7 +325,8 @@ function mapAgentRunEventsToTaskFormat(agentRun) {
       progress: e.payload?.progress ?? e.progress,
       stage: String(e.stage || '').toLowerCase(),
       type: String(e.type || '').toUpperCase(),
-      artifactType: String(e.artifact_type || e.artifactType || e.payload?.artifact_type || '').toLowerCase(),
+      artifactType: String(e.artifact_type || e.artifactType || e.payload?.artifact_type || e.payload?.type || '').toLowerCase(),
+      payload: e.payload || {},
     }))
     .sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0))
 }
