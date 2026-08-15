@@ -610,6 +610,27 @@ def generate_annotation_dataset(
     sleep_seconds: float = 0.0,
     continue_on_error: bool = True,
 ) -> Dict[str, Any]:
+    if os.getenv("LLM_MODE", "single") == "two-stage":
+        from llm_ft_extractor import generate_annotation_dataset_two_stage
+
+        return generate_annotation_dataset_two_stage(
+            chunks=chunks,
+            output_csv=output_csv,
+            raw_jsonl=raw_jsonl,
+            base_url=os.getenv("LLM_FT_BASE_URL", base_url),
+            api_key=os.getenv("LLM_FT_API_KEY", api_key),
+            entity_model=os.getenv("LLM_FT_ENTITY_MODEL", ""),
+            relation_model=os.getenv("LLM_FT_RELATION_MODEL", ""),
+            entity_rules_file=os.getenv("LLM_FT_ENTITY_RULES_FILE", ""),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            workers=workers,
+            dry_run=dry_run,
+            debug_context=debug_context,
+            sleep_seconds=sleep_seconds,
+            continue_on_error=continue_on_error,
+        )
+
     if output_csv.exists():
         output_csv.unlink()
     if raw_jsonl.exists():
