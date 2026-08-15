@@ -72,8 +72,10 @@ ARTIFACT_TREE_DRAFT: Final[str] = "tree_draft"
 ARTIFACT_REPAIR_PATCH: Final[str] = "repair_patch"
 ARTIFACT_VALIDATION_REPORT: Final[str] = "validation_report"
 ARTIFACT_FINAL_TREE: Final[str] = "final_tree"
+ARTIFACT_MEMORY_SUMMARY: Final[str] = "memory_summary"
 
 MAX_REPAIR_ATTEMPTS: Final[int] = 2
+MAX_DRAFT_REBUILD_ATTEMPTS: Final[int] = 2
 
 ERROR_INVALID_REQUEST: Final[str] = "INVALID_REQUEST"
 ERROR_RUN_NOT_FOUND: Final[str] = "RUN_NOT_FOUND"

@@ -41,6 +41,8 @@ class RepairAgent:
         apply_patch: bool = True,
         revalidate: bool = True,
         max_operations: int = 50,
+        experience_patterns: Optional[List[Dict[str, Any]]] = None,
+        experience_corrections: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         tree_data = _extract_tree_data(draft_tree_artifact)
         repairable_issues = [
@@ -49,8 +51,8 @@ class RepairAgent:
             if issue.get("repairable") and issue.get("severity") == "error"
         ]
         issue_codes = [str(issue.get("issue_code") or "").upper() for issue in repairable_issues]
-        patterns = find_active_repair_patterns(issue_codes=issue_codes, scope_key=scope_key, limit=10)
-        corrections = get_relevant_corrections(tree_data, max_distinct=20)
+        patterns = experience_patterns if experience_patterns is not None else find_active_repair_patterns(issue_codes=issue_codes, scope_key=scope_key, limit=10)
+        corrections = experience_corrections if experience_corrections is not None else get_relevant_corrections(tree_data, max_distinct=20)
         correction_hint = format_corrections_for_repair(corrections)
         legacy_repaired_tree = None
         repair_error = None

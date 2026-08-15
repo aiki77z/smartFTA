@@ -1966,6 +1966,8 @@ def generate_fault_tree(
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     part_details: Optional[Dict[str, Any]] = None,
     max_depth: Optional[int] = None,
+    retrieval_context: Optional[Dict[str, Any]] = None,
+    draft_strategy: Optional[str] = None,
     draft_only: bool = False,
 ) -> dict:
     # Keep this later definition as the runtime-active implementation.
@@ -2114,7 +2116,7 @@ def generate_fault_tree(
         fallback_used=fallback_used,
     )
 
-    llm_used_subgraph = ENABLE_GRAPH_RETRIEVAL
+    llm_used_subgraph = ENABLE_GRAPH_RETRIEVAL and str(draft_strategy or "").lower() != "chunks"
     elements: Dict[str, Any] = {}
     llm_stage_started = time.perf_counter()
     if not llm_used_subgraph:
@@ -2365,6 +2367,8 @@ def generate_fault_tree_draft(
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     part_details: Optional[Dict[str, Any]] = None,
     max_depth: Optional[int] = None,
+    retrieval_context: Optional[Dict[str, Any]] = None,
+    draft_strategy: Optional[str] = None,
     draft_only: bool = False,
 ) -> dict:
     """Build an immutable draft without validation, repair, or persistence."""
@@ -2377,6 +2381,8 @@ def generate_fault_tree_draft(
         progress_callback=progress_callback,
         part_details=part_details,
         max_depth=max_depth,
+        retrieval_context=retrieval_context,
+        draft_strategy=draft_strategy,
         draft_only=True,
     )
 
@@ -2417,6 +2423,51 @@ def generate_fault_tree_with_progress(
     if progress_callback:
         progress_callback(90, "persistence", "Generation completed, persisting result")
     return tree_data
+
+
+def collect_fault_tree_retrieval_context(
+    top_event: str,
+    selected_file_version_ids: Optional[List[str]] = None,
+    root_graph_node_id: Optional[str] = None,
+    *,
+    max_depth: Optional[int] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    def emit(message: str):
+        try:
+            print(message)
+        finally:
+            if log_callback:
+                try:
+                    log_callback(message)
+                except Exception:
+                    pass
+
+    performance: Dict[str, Any] = {}
+    retrieval = retrieval_context or collect_fault_tree_retrieval_context(
+        top_event,
+        selected_file_version_ids=selected_file_version_ids,
+        root_graph_node_id=root_graph_node_id,
+        max_depth=max_depth,
+        log_callback=log_callback,
+    )
+    matched = retrieval["matched"]
+    root_node_ids = retrieval.get("root_node_ids") or []
+    subgraph_bundle = retrieval["subgraph_bundle"]
+    chunk_ids = retrieval.get("chunk_ids") or []
+    raw_chunks = retrieval.get("raw_chunks") or []
+    scoped_file_version_ids = retrieval.get("scoped_file_version_ids") or []
+    performance.update(retrieval.get("performance") or {})
+    return {
+        "matched": matched,
+        "root_node_ids": root_node_ids,
+        "subgraph_bundle": subgraph_bundle,
+        "chunk_ids": chunk_ids,
+        "raw_chunks": raw_chunks,
+        "scoped_file_version_ids": scoped_file_version_ids,
+        "performance": performance,
+        "fallback_used": fallback_used,
+    }
 
 
 def _normalize_event_key(value: Any) -> str:

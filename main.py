@@ -819,24 +819,47 @@ def _run_agent_second_phase(run_id: str, catalog: Dict[str, Any]) -> Dict[str, A
         else:
             update_agent_run(run_id, {"status": RUN_STATUS_RUNNING, "current_stage": STAGE_RETRIEVAL})
             append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_RETRIEVAL, message="Generating a non-persisted draft from scoped evidence.")
-            append_agent_event(
-                run_id,
-                EVENT_AGENT_MESSAGE,
-                stage="graph_subgraph",
-                message="Expanding local graph subgraph for the confirmed top event.",
-                payload={
-                    "progress": 25,
-                    "top_event": run.get("resolved_top_event") or catalog.get("name") or "",
-                    "graph_node_id": run.get("graph_node_id") or _graph_node_id_from_catalog(catalog),
-                },
-            )
-            append_agent_event(
-                run_id,
-                EVENT_AGENT_MESSAGE,
-                stage="graph_chunks",
-                message="Collecting evidence chunks from the scoped subgraph.",
-                payload={"progress": 35},
-            )
+            retrieval_context = None
+            retrieval_context_artifact = get_latest_agent_artifact(run_id, ARTIFACT_RETRIEVAL_CONTEXT)
+            if retrieval_context_artifact:
+                candidate_context = retrieval_context_artifact.get("payload") or retrieval_context_artifact.get("content") or {}
+                if (
+                    isinstance(candidate_context, dict)
+                    and candidate_context.get("matched")
+                    and candidate_context.get("subgraph_bundle")
+                    and candidate_context.get("raw_chunks")
+                ):
+                    retrieval_context = candidate_context
+                    append_agent_event(
+                        run_id,
+                        EVENT_AGENT_MESSAGE,
+                        stage="graph_chunks",
+                        message="TreeDraftAgent reused RetrievalAgent context artifact.",
+                        payload={
+                            "progress": 39,
+                            "artifact_id": retrieval_context_artifact.get("artifact_id"),
+                            "agent": "TreeDraftAgent",
+                        },
+                    )
+            if not retrieval_context:
+                append_agent_event(
+                    run_id,
+                    EVENT_AGENT_MESSAGE,
+                    stage="graph_subgraph",
+                    message="Expanding local graph subgraph for the confirmed top event.",
+                    payload={
+                        "progress": 25,
+                        "top_event": run.get("resolved_top_event") or catalog.get("name") or "",
+                        "graph_node_id": run.get("graph_node_id") or _graph_node_id_from_catalog(catalog),
+                    },
+                )
+                append_agent_event(
+                    run_id,
+                    EVENT_AGENT_MESSAGE,
+                    stage="graph_chunks",
+                    message="Collecting evidence chunks from the scoped subgraph.",
+                    payload={"progress": 35},
+                )
             append_agent_event(
                 run_id,
                 EVENT_AGENT_MESSAGE,
@@ -851,9 +874,11 @@ def _run_agent_second_phase(run_id: str, catalog: Dict[str, Any]) -> Dict[str, A
                 root_graph_node_id=run.get("graph_node_id") or _graph_node_id_from_catalog(catalog),
                 part_details=options.get("part_details") if isinstance(options, dict) else None,
                 max_depth=options.get("max_depth") if isinstance(options, dict) else None,
+                retrieval_context=retrieval_context,
             )
             retrieval = draft_tree.get("retrieval") or {}
-            _append_agent_artifact(run_id, ARTIFACT_RETRIEVAL_CONTEXT, retrieval, producer="RetrievalAgent")
+            if not retrieval_context:
+                _append_agent_artifact(run_id, ARTIFACT_RETRIEVAL_CONTEXT, retrieval, producer="RetrievalAgent")
             append_agent_event(
                 run_id,
                 EVENT_RETRIEVAL_DONE,
@@ -886,17 +911,43 @@ def _run_agent_second_phase(run_id: str, catalog: Dict[str, Any]) -> Dict[str, A
         current_draft = draft_artifact
         chunks = _load_run_evidence_chunks(run, draft_tree)
         resume_attempt = max(0, min(int(run.get("repair_attempt_count") or 0), MAX_REPAIR_ATTEMPTS))
+        reusable_validation_artifact = get_latest_agent_artifact(run_id, ARTIFACT_VALIDATION_REPORT)
         for repair_attempt in range(resume_attempt, MAX_REPAIR_ATTEMPTS + 1):
             update_agent_run(run_id, {"current_stage": STAGE_VALIDATE, "repair_attempt_count": repair_attempt})
-            append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_VALIDATE, message=f"Validating draft (pass {repair_attempt + 1}).")
-            verification = verify_agent.run(
-                current_draft,
-                run_id=run_id,
-                scope_key=run.get("scope_key") or "",
-                skip_semantic=False,
-                persist_artifact=True,
-            )
-            validation = verification["payload"]
+            if (
+                reusable_validation_artifact
+                and reusable_validation_artifact.get("parent_artifact_id") == current_draft.get("artifact_id")
+                and repair_attempt == resume_attempt
+            ):
+                validation = reusable_validation_artifact.get("payload") or reusable_validation_artifact.get("content") or {}
+                append_agent_event(
+                    run_id,
+                    EVENT_AGENT_MESSAGE,
+                    stage=STAGE_VALIDATE,
+                    message="Phase2CompatWorkflow reused VerifyAgent validation artifact.",
+                    payload={
+                        "progress": 69,
+                        "artifact_id": reusable_validation_artifact.get("artifact_id"),
+                        "passed": bool(validation.get("passed")),
+                        "agent": "VerifyAgent",
+                    },
+                )
+                verification = {
+                    "payload": validation,
+                    "human_review_required": bool((validation.get("summary") or {}).get("blocking_error_count")),
+                    "next_stage": "commit" if validation.get("passed") else "repair",
+                }
+                reusable_validation_artifact = None
+            else:
+                append_agent_event(run_id, EVENT_STAGE_STARTED, stage=STAGE_VALIDATE, message=f"Validating draft (pass {repair_attempt + 1}).")
+                verification = verify_agent.run(
+                    current_draft,
+                    run_id=run_id,
+                    scope_key=run.get("scope_key") or "",
+                    skip_semantic=False,
+                    persist_artifact=True,
+                )
+                validation = verification["payload"]
             if validation.get("passed"):
                 append_agent_event(
                     run_id,
@@ -956,14 +1007,44 @@ def _start_agent_second_phase_thread(run_id: str, catalog: Dict[str, Any]) -> No
     thread.start()
 
 
+def _run_agentic_v2_graph(run_id: str, catalog: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        from agentic.graph import run_agentic_v2_workflow
+
+        return run_agentic_v2_workflow(run_id, catalog, phase2_runner=_run_agent_second_phase)
+    except Exception as exc:
+        return _mark_agent_run_failed(run_id, f"Agentic v2 workflow failed: {exc}")
+
+
+def _start_agentic_v2_thread(run_id: str, catalog: Dict[str, Any]) -> None:
+    thread = threading.Thread(target=_run_agentic_v2_graph, args=(run_id, catalog), daemon=True, name=f"agentic-v2-{run_id[-6:]}")
+    thread.start()
+
+
 def _launch_agent_legacy_generation(run_id: str, catalog: Dict[str, Any]) -> Dict[str, Any]:
     run = get_agent_run(run_id)
     if not run:
         return {}
     options = run.get("options") or {}
+    if not isinstance(options, dict):
+        options = {}
+    if options.get("workflow_version") != "phase1" and str(options.get("agentic_version") or "v2").lower() == "v2":
+        if run.get("execution_mode") == "sync":
+            return _run_agentic_v2_graph(run_id, catalog)
+        updated = update_agent_run(
+            run_id,
+            {
+                "status": RUN_STATUS_RUNNING,
+                "current_stage": STAGE_RETRIEVAL,
+                "progress": {"completed": 10, "total": 100},
+            },
+        )
+        _start_agentic_v2_thread(run_id, catalog)
+        return updated or get_agent_run(run_id) or {}
+
     # New agent runs use the Phase-2 pre-commit loop.  The legacy worker is
     # retained only for explicit Phase-1 compatibility and old API behavior.
-    if not isinstance(options, dict) or options.get("workflow_version") != "phase1":
+    if options.get("workflow_version") != "phase1":
         if run.get("execution_mode") == "sync":
             return _run_agent_second_phase(run_id, catalog)
         updated = update_agent_run(
@@ -1183,6 +1264,11 @@ def api_agent_run(req: AgentRunRequest, response: Response):
     if not prompt:
         return _agent_error_response(400, ERROR_INVALID_REQUEST, "prompt is required")
     ids = _dedupe_keep_order(req.selected_file_version_ids)
+    run_options = {
+        "agentic_version": "v2",
+        **(req.options or {}),
+        **({"max_depth": req.max_depth} if req.max_depth is not None else {}),
+    }
     try:
         run = create_agent_run(
             task_type=req.task_type,
@@ -1194,10 +1280,7 @@ def api_agent_run(req: AgentRunRequest, response: Response):
             tree_id=req.tree_id,
             tree_version=req.tree_version,
             execution_mode="sync" if req.sync else "async",
-            options={
-                **(req.options or {}),
-                **({"max_depth": req.max_depth} if req.max_depth is not None else {}),
-            },
+            options=run_options,
         )
         event = append_agent_event(
             run["run_id"],
@@ -1246,6 +1329,18 @@ def api_agent_run_status(
     if include_tree_data and run.get("status") == RUN_STATUS_COMPLETED and payload.get("tree_id") and payload.get("tree_version") is not None:
         version_doc = get_version(payload["tree_id"], int(payload["tree_version"]))
         payload["tree_data"] = (version_doc or {}).get("tree_data")
+    if include_tree_data and run.get("status") == RUN_STATUS_HUMAN_REVIEW_REQUIRED:
+        review_artifact = get_latest_agent_artifact(run_id, ARTIFACT_TREE_DRAFT)
+        review_payload = (review_artifact or {}).get("payload") or (review_artifact or {}).get("content") or {}
+        review_tree = review_payload.get("tree_data") if isinstance(review_payload, dict) else None
+        if not isinstance(review_tree, dict) and isinstance(review_payload, dict):
+            review_tree = review_payload
+        if isinstance(review_tree, dict):
+            validation = (run.get("result") or {}).get("validation") if isinstance(run.get("result"), dict) else None
+            if isinstance(validation, dict):
+                review_tree = {**review_tree, "validation": validation}
+            payload["review_tree_data"] = review_tree
+            payload["review_tree_artifact_id"] = (review_artifact or {}).get("artifact_id")
     return payload
 
 
@@ -2717,6 +2812,17 @@ class SaveRequest(BaseModel):
     description: str = "手动修改"
 
 
+class CreateReviewTreeRequest(BaseModel):
+    tree_data: dict
+    editor: str = "AI"
+    description: str = "AI human-review draft"
+    requested_top_event: Optional[str] = None
+    resolved_top_event: Optional[str] = None
+    normalized_top_event: Optional[str] = None
+    selected_file_version_ids: Optional[List[str]] = None
+    run_id: Optional[str] = None
+
+
 class ValidateRequest(BaseModel):
     tree_data: dict
 
@@ -3256,6 +3362,77 @@ def api_get_batch_job_item(item_id: str):
     if not item:
         raise HTTPException(status_code=404, detail="任务项不存在")
     return item
+
+
+def _infer_top_event_from_tree_data(tree_data: dict) -> str:
+    for node in (tree_data or {}).get("nodeList", []) or []:
+        node_type = str(node.get("type") or node.get("rawType") or node.get("event_type") or "").strip().lower()
+        if node_type in {"1", "top", "top_event"}:
+            event = node.get("event") if isinstance(node.get("event"), dict) else {}
+            return str(node.get("name") or node.get("label") or event.get("name") or event.get("label") or node.get("id") or "").strip()
+    for node in (tree_data or {}).get("nodeList", []) or []:
+        event = node.get("event") if isinstance(node.get("event"), dict) else {}
+        label = str(node.get("name") or node.get("label") or event.get("name") or event.get("label") or node.get("id") or "").strip()
+        if label:
+            return label
+    return "人工复核故障树"
+
+
+@app.post("/api/tree/create-from-review")
+def api_create_tree_from_review(req: CreateReviewTreeRequest):
+    tree_data = req.tree_data or {}
+    if not isinstance(tree_data.get("nodeList"), list) or not isinstance(tree_data.get("linkList"), list):
+        raise HTTPException(status_code=400, detail="tree_data 必须包含 nodeList 和 linkList")
+
+    run = get_agent_run(req.run_id) if req.run_id else None
+    top_event = (
+        req.resolved_top_event
+        or (run or {}).get("resolved_top_event")
+        or req.requested_top_event
+        or (run or {}).get("requested_top_event")
+        or _infer_top_event_from_tree_data(tree_data)
+    )
+    requested_top_event = req.requested_top_event or (run or {}).get("requested_top_event") or top_event
+    resolved_top_event = req.resolved_top_event or (run or {}).get("resolved_top_event") or top_event
+    normalized_top_event = req.normalized_top_event or (run or {}).get("normalized_top_event") or normalize_top_event_name(resolved_top_event)
+    source_file_version_ids = req.selected_file_version_ids or (run or {}).get("selected_file_version_ids") or []
+
+    tree_id = f"ft_{uuid.uuid4().hex[:8]}"
+    create_tree(
+        tree_id=tree_id,
+        top_event=resolved_top_event,
+        requested_top_event=requested_top_event,
+        resolved_top_event=resolved_top_event,
+        catalog_name=resolved_top_event,
+        normalized_top_event=normalized_top_event,
+        source_file_version_ids=source_file_version_ids,
+        source_scope_key=make_scope_key(source_file_version_ids),
+    )
+    version = save_version(
+        tree_id=tree_id,
+        tree_data=tree_data,
+        editor=req.editor or "AI",
+        description=req.description or "AI human-review draft",
+        is_ai=True,
+        requested_top_event=requested_top_event,
+        resolved_top_event=resolved_top_event,
+        normalized_top_event=normalized_top_event,
+        source_file_version_ids=source_file_version_ids,
+    )
+    if req.run_id:
+        try:
+            update_agent_run(req.run_id, {"tree_id": tree_id, "tree_version": version})
+        except Exception:
+            pass
+    return {
+        "success": True,
+        "tree_id": tree_id,
+        "version": version,
+        "tree_data": tree_data,
+        "requested_top_event": requested_top_event,
+        "resolved_top_event": resolved_top_event,
+        "normalized_top_event": normalized_top_event,
+    }
 
 
 @app.get("/api/tree/{tree_id}")
