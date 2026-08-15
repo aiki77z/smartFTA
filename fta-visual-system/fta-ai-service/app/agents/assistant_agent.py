@@ -3,13 +3,15 @@ import time
 from typing import Any, Dict, List, Optional
 
 from app.config import OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL
+from app.agents.chat_agent import chat_agent
+from app.agents.conversation_supervisor import conversation_supervisor
 from app.agents.conversation_summary_agent import conversation_summary_agent
+from app.agents.edit_agent import edit_agent
+from app.agents.generate_agent import generate_agent
 from app.memory.session_store import session_store
-from app.schemas import AssistantMessageRequest, AssistantMessageResponse, EditRequest
-from app.services.edit_plan_service import plan_edit_fault_tree
+from app.schemas import AssistantMessageRequest, AssistantMessageResponse
 from app.services.tree_utils import summarize_tree
 from app.tools.gnr_client import gnr_client
-from app.tools.kb_tools import knowledge_reader_tool
 
 try:
     from openai import OpenAI
@@ -21,7 +23,6 @@ VALID_INTENTS = {
     "generate_tree",
     "regenerate_tree",
     "edit_tree",
-    "validate_tree",
     "query_knowledge",
     "explain_evidence",
     "need_clarification",
@@ -63,7 +64,9 @@ class AssistantAgent:
             source_changed=source_changed,
         )
         intent = intent_decision["intent"]
-        trace.append(self._step("IntentAgent", "success", {"intent": intent}))
+        route_decision = conversation_supervisor.route(intent_decision)
+        route = str(route_decision.get("route") or "ChatAgent")
+        trace.append(self._step(conversation_supervisor.name, "success", route_decision))
 
         session_store.append_message(
             session_id,
@@ -77,18 +80,49 @@ class AssistantAgent:
         )
 
         try:
-            if intent in {"generate_tree", "regenerate_tree"}:
-                response = self._handle_generate(req, session_id, message, scope_ids, intent, trace)
-            elif intent == "need_clarification":
+            if route == "GenerateAgent":
+                response = generate_agent.handle(
+                    owner=self,
+                    req=req,
+                    session_id=session_id,
+                    message=message,
+                    scope_ids=scope_ids,
+                    intent=intent,
+                    trace=trace,
+                )
+            elif route == conversation_supervisor.name:
                 response = self._handle_need_clarification(req, session_id, intent_decision, tree_summary, scope_ids, trace)
-            elif intent == "validate_tree":
-                response = self._handle_validate(req, session_id, trace)
-            elif intent == "edit_tree":
-                response = self._handle_edit(req, session_id, message, trace)
-            elif intent in {"query_knowledge", "explain_evidence"}:
-                response = self._handle_knowledge_query(req, session_id, previous_memory, recent_messages, tree_summary, scope_ids, intent_decision, trace)
+            elif route == "EditAgent":
+                response = edit_agent.handle(
+                    owner=self,
+                    req=req,
+                    session_id=session_id,
+                    message=message,
+                    trace=trace,
+                )
+            elif route == "ChatAgent" and intent in {"query_knowledge", "explain_evidence"}:
+                response = chat_agent.handle_knowledge_query(
+                    owner=self,
+                    req=req,
+                    session_id=session_id,
+                    previous_memory=previous_memory,
+                    recent_messages=recent_messages,
+                    tree_summary=tree_summary,
+                    scope_ids=scope_ids,
+                    intent_decision=intent_decision,
+                    trace=trace,
+                )
             else:
-                response = self._handle_chat(req, session_id, previous_memory, recent_messages, tree_summary, intent_decision, trace)
+                response = chat_agent.handle_chat(
+                    owner=self,
+                    req=req,
+                    session_id=session_id,
+                    previous_memory=previous_memory,
+                    recent_messages=recent_messages,
+                    tree_summary=tree_summary,
+                    intent_decision=intent_decision,
+                    trace=trace,
+                )
         except Exception as exc:
             trace.append(self._step("AssistantAgent", "failed", {"error": str(exc)}))
             assistant_message = f"处理失败：{exc}"
@@ -108,133 +142,6 @@ class AssistantAgent:
             "duration_seconds": round(time.time() - started, 3),
         }))
         return response
-
-    def _handle_generate(
-        self,
-        req: AssistantMessageRequest,
-        session_id: str,
-        message: str,
-        scope_ids: List[str],
-        intent: str,
-        trace: List[Dict[str, Any]],
-    ) -> AssistantMessageResponse:
-        if not scope_ids:
-            assistant_message = "请先选择至少一个已导入完成的知识库依据文件，我才能调度故障树生成。"
-            session_store.append_message(session_id, "assistant", assistant_message, {"intent": intent})
-            memory = self._update_memory(req, session_id, intent, summarize_tree(req.current_tree), scope_ids, assistant_message)
-            return AssistantMessageResponse(
-                session_id=session_id,
-                intent=intent,
-                action="need_source_files",
-                assistant_message=assistant_message,
-                memory=memory,
-                agent_trace=trace,
-            )
-
-        trace.append(self._step("GenerationDispatchAgent", "running", {
-            "target": "FTA-GNR",
-            "mode": "agent_run" if self._has_agent_run_path() else "tree_generate_api",
-        }))
-        result = gnr_client.run_generation_agent(
-            prompt=message,
-            selected_file_version_ids=scope_ids,
-            session_id=session_id,
-            project_id=req.project_id,
-            canvas_id=req.canvas_id,
-        )
-        trace.append(self._step("GenerationDispatchAgent", "success", {
-            "response_mode": result.get("mode"),
-            "job_id": result.get("job_id"),
-            "item_id": result.get("item_id"),
-            "tree_id": result.get("tree_id"),
-        }))
-
-        if result.get("mode") == "need_confirmation":
-            assistant_message = "我找到了多个相似顶事件候选，需要你确认一个候选后再继续生成。"
-            action = "need_top_event_confirmation"
-        elif result.get("mode") == "queued":
-            assistant_message = "已调度故障树生成任务。后续可根据返回的 job/item 继续轮询生成进度。"
-            action = "generation_queued"
-        elif result.get("tree_id"):
-            assistant_message = f"已完成故障树生成并返回 tree_id={result.get('tree_id')}。"
-            action = "generation_finished"
-        else:
-            assistant_message = "已提交故障树生成请求，但返回格式需要前端进一步处理。"
-            action = "generation_submitted"
-
-        session_store.append_message(session_id, "assistant", assistant_message, {"intent": intent, "result": result})
-        memory = self._update_memory(req, session_id, intent, summarize_tree(req.current_tree), scope_ids, assistant_message, result)
-        return AssistantMessageResponse(
-            session_id=session_id,
-            intent=intent,
-            action=action,
-            assistant_message=assistant_message,
-            result=result,
-            memory=memory,
-            agent_trace=trace,
-        )
-
-    def _handle_edit(
-        self,
-        req: AssistantMessageRequest,
-        session_id: str,
-        message: str,
-        trace: List[Dict[str, Any]],
-    ) -> AssistantMessageResponse:
-        if req.current_tree is None:
-            assistant_message = "当前没有可编辑的故障树。你可以先让我生成一棵故障树。"
-            session_store.append_message(session_id, "assistant", assistant_message, {"intent": "edit_tree"})
-            memory = self._update_memory(req, session_id, "edit_tree", {}, self._normalize_ids(req.selected_file_version_ids), assistant_message)
-            return AssistantMessageResponse(
-                session_id=session_id,
-                intent="edit_tree",
-                action="need_current_tree",
-                assistant_message=assistant_message,
-                memory=memory,
-                agent_trace=trace,
-            )
-
-        trace.append(self._step("EditPlannerAgent", "success", {"strategy": "llm_edit_plan_with_legacy_fallback"}))
-        edit_resp = plan_edit_fault_tree(EditRequest(
-            instruction=message,
-            tree_json=req.current_tree,
-            selected_files=req.selected_files,
-        ))
-        pending = session_store.save_pending_action(session_id, {
-            "kind": "edit_diff",
-            "before_tree": req.current_tree,
-            "after_tree": edit_resp.updated_tree_json,
-            "diff": edit_resp.diff.dict(),
-            "rationale": edit_resp.rationale,
-        })
-        trace.append(self._step("DiffAgent", "success", {"diff": edit_resp.diff.dict()}))
-
-        assistant_message = (
-            f"已生成编辑草案：新增 {len(edit_resp.diff.added)}，修改 {len(edit_resp.diff.modified)}，"
-            f"删除 {len(edit_resp.diff.removed)}。请在前端确认 Accept 或 Undo。"
-        )
-        session_store.append_message(session_id, "assistant", assistant_message, {
-            "intent": "edit_tree",
-            "pending_id": pending.get("pending_id"),
-        })
-        memory = self._update_memory(
-            req,
-            session_id,
-            "edit_tree",
-            summarize_tree(edit_resp.updated_tree_json),
-            self._normalize_ids(req.selected_file_version_ids),
-            assistant_message,
-        )
-        return AssistantMessageResponse(
-            session_id=session_id,
-            intent="edit_tree",
-            action="edit_draft_created",
-            assistant_message=assistant_message,
-            result=edit_resp.dict(),
-            pending_action=pending,
-            memory=memory,
-            agent_trace=trace,
-        )
 
     def _handle_need_clarification(
         self,
@@ -260,156 +167,6 @@ class AssistantAgent:
             action="need_clarification",
             assistant_message=assistant_message,
             result={"intent_decision": intent_decision},
-            memory=memory,
-            agent_trace=trace,
-        )
-
-    def _handle_validate(
-        self,
-        req: AssistantMessageRequest,
-        session_id: str,
-        trace: List[Dict[str, Any]],
-    ) -> AssistantMessageResponse:
-        if req.current_tree is None:
-            assistant_message = "当前没有可校验的故障树。"
-            session_store.append_message(session_id, "assistant", assistant_message, {"intent": "validate_tree"})
-            memory = self._update_memory(req, session_id, "validate_tree", {}, self._normalize_ids(req.selected_file_version_ids), assistant_message)
-            return AssistantMessageResponse(
-                session_id=session_id,
-                intent="validate_tree",
-                action="need_current_tree",
-                assistant_message=assistant_message,
-                memory=memory,
-                agent_trace=trace,
-            )
-
-        result = gnr_client.validate_tree(tree_data=req.current_tree)
-        trace.append(self._step("ValidationDispatchAgent", "success", {
-            "passed": result.get("passed"),
-            "error_count": result.get("error_count"),
-            "warning_count": result.get("warning_count"),
-        }))
-        assistant_message = (
-            f"校验完成：{'通过' if result.get('passed') else '未通过'}，"
-            f"错误 {result.get('error_count', 0)} 个，警告 {result.get('warning_count', 0)} 个。"
-        )
-        session_store.append_message(session_id, "assistant", assistant_message, {"intent": "validate_tree", "result": result})
-        memory = self._update_memory(req, session_id, "validate_tree", summarize_tree(req.current_tree), self._normalize_ids(req.selected_file_version_ids), assistant_message, result)
-        return AssistantMessageResponse(
-            session_id=session_id,
-            intent="validate_tree",
-            action="validation_finished",
-            assistant_message=assistant_message,
-            result=result,
-            memory=memory,
-            agent_trace=trace,
-        )
-
-    def _handle_chat(
-        self,
-        req: AssistantMessageRequest,
-        session_id: str,
-        previous_memory: Dict[str, Any],
-        recent_messages: List[Dict[str, Any]],
-        tree_summary: Dict[str, Any],
-        intent_decision: Dict[str, Any],
-        trace: List[Dict[str, Any]],
-    ) -> AssistantMessageResponse:
-        top_event = tree_summary.get("top_event") or previous_memory.get("current_top_event") or "当前故障树"
-        assistant_message = self._build_chat_reply(
-            req.message,
-            top_event,
-            tree_summary,
-            previous_memory,
-            recent_messages,
-            intent_decision,
-        )
-        session_store.append_message(session_id, "assistant", assistant_message, {"intent": "chat"})
-        memory = self._update_memory(req, session_id, "chat", tree_summary, self._normalize_ids(req.selected_file_version_ids), assistant_message)
-        return AssistantMessageResponse(
-            session_id=session_id,
-            intent="chat",
-            action="chat",
-            assistant_message=assistant_message,
-            memory=memory,
-            agent_trace=trace,
-        )
-
-    def _handle_knowledge_query(
-        self,
-        req: AssistantMessageRequest,
-        session_id: str,
-        previous_memory: Dict[str, Any],
-        recent_messages: List[Dict[str, Any]],
-        tree_summary: Dict[str, Any],
-        scope_ids: List[str],
-        intent_decision: Dict[str, Any],
-        trace: List[Dict[str, Any]],
-    ) -> AssistantMessageResponse:
-        intent = str(intent_decision.get("intent") or "query_knowledge")
-        if intent not in {"query_knowledge", "explain_evidence"}:
-            intent = "query_knowledge"
-        if not scope_ids:
-            assistant_message = "我可以读取已选择文件的知识库摘要和 chunks，但当前还没有选中的知识库文件。请先在页面里选择一个或多个已导入文件。"
-            session_store.append_message(session_id, "assistant", assistant_message, {"intent": intent})
-            memory = self._update_memory(req, session_id, intent, tree_summary, scope_ids, assistant_message)
-            return AssistantMessageResponse(
-                session_id=session_id,
-                intent=intent,
-                action="need_source_files",
-                assistant_message=assistant_message,
-                memory=memory,
-                agent_trace=trace,
-            )
-
-        kb_context: Dict[str, Any] = {"top_events": {}, "chunks": {}}
-        trace.append(self._step("KnowledgeReaderTool", "running", {"scope_count": len(scope_ids)}))
-        try:
-            kb_context["top_events"] = knowledge_reader_tool.top_event_candidates(scope_ids, limit=10)
-            kb_context["chunks"] = knowledge_reader_tool.chunks_preview(scope_ids, limit=6)
-            if intent == "explain_evidence":
-                node_query = self._extract_node_query(req.message, intent_decision, tree_summary)
-                kb_context["node_evidence"] = knowledge_reader_tool.node_evidence(
-                    tree_json=req.current_tree,
-                    node_query=node_query,
-                    selected_file_version_ids=scope_ids,
-                    max_chunks=5,
-                )
-            elif intent == "query_knowledge":
-                kb_context["graph_context"] = knowledge_reader_tool.graph_question(
-                    question=req.message,
-                    selected_file_version_ids=scope_ids,
-                    limit=20,
-                )
-            trace.append(self._step("KnowledgeReaderTool", "success", {
-                "top_event_count": len(kb_context["top_events"].get("items") or []),
-                "chunk_count": len(kb_context["chunks"].get("chunks") or []),
-                "has_node_evidence": bool(kb_context.get("node_evidence")),
-                "has_graph_context": bool(kb_context.get("graph_context")),
-            }))
-        except Exception as exc:
-            trace.append(self._step("KnowledgeReaderTool", "failed", {"error": str(exc)}))
-            kb_context["error"] = str(exc)
-
-        assistant_message = self._build_knowledge_reply(
-            message=req.message,
-            previous_memory=previous_memory,
-            recent_messages=recent_messages,
-            tree_summary=tree_summary,
-            intent_decision=intent_decision,
-            kb_context=kb_context,
-        )
-        session_store.append_message(session_id, "assistant", assistant_message, {
-            "intent": intent,
-            "kb_context": kb_context,
-        })
-        memory = self._update_memory(req, session_id, intent, tree_summary, scope_ids, assistant_message)
-        return AssistantMessageResponse(
-            session_id=session_id,
-            intent=intent,
-            action="knowledge_read",
-            assistant_message=assistant_message,
-            result={"knowledge_context": kb_context},
             memory=memory,
             agent_trace=trace,
         )
@@ -496,7 +253,6 @@ class AssistantAgent:
             "- generate_tree: 用户明确要求现在生成一棵新故障树，并且给出了明确顶事件或分析对象。\n"
             "- regenerate_tree: 用户明确要求基于当前树重新生成/按新知识库重建。\n"
             "- edit_tree: 用户明确要求现在修改当前故障树，例如增删节点、改名、调整连线或逻辑门。\n"
-            "- validate_tree: 用户明确要求检查/校验/评估当前故障树。\n"
             "- explain_evidence: 用户询问节点依据、溯源、为什么这样生成。\n"
             "- need_clarification: 用户似乎想执行任务，但缺少必要信息，例如想生成但没有说明顶事件。\n\n"
             "关键边界：\n"

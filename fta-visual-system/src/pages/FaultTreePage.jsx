@@ -16,13 +16,13 @@ import {
   getTreeVersion,
   generateTree,
   getFtaBackendBaseUrl,
-  getBatchJobItem,
   pollGenerationJobItem,
   saveTree,
   deleteTree,
   validateFaultTreeGraph,
   validateTreeSemantic,
   getFtaChunk,
+  createTreeFromReview,
 } from '../api/ftaBackend.js'
 import {
   confirmAssistantAgentRun,
@@ -318,11 +318,13 @@ const AGENT_EVENT_PROFILES = {
   RetrievalAgent: { agent: 'RetrievalAgent · 检索智能体', avatar: '检' },
   TreeDraftAgent: { agent: 'TreeDraftAgent · 草稿智能体', avatar: '草' },
   VerifyAgent: { agent: 'VerifyAgent · 校验智能体', avatar: '验' },
-  RepairAgent: { agent: 'RepairAgent · 修复智能体', avatar: '修' },
+  RepairAgent: { agent: 'RepairAgent · 优化智能体', avatar: '优' },
+  ExperienceMemoryAgent: { agent: 'ExperienceMemoryAgent · 经验记忆智能体', avatar: '经' },
   CommitAgent: { agent: 'CommitAgent · 持久化智能体', avatar: '存' },
   MemoryCurator: { agent: 'MemoryCurator · 记忆整理智能体', avatar: '忆' },
   ReviewAgent: { agent: 'ReviewAgent · 人工复核智能体', avatar: '审' },
   SchedulerAgent: { agent: 'SchedulerAgent · 调度智能体', avatar: '调' },
+  SupervisorAgent: { agent: 'SupervisorAgent · 监督调度智能体', avatar: '督' },
 }
 
 function artifactTypeOfAgentEvent(e) {
@@ -334,6 +336,11 @@ function agentProfileForAgentRunEvent(e) {
   const stage = String(e?.stage || '').toLowerCase()
   const artifactType = artifactTypeOfAgentEvent(e)
   const message = String(e?.message || e?.text || '').toLowerCase()
+  const payloadAgent = String(e?.payload?.agent || '').trim()
+
+  if (payloadAgent && AGENT_EVENT_PROFILES[payloadAgent]) {
+    return AGENT_EVENT_PROFILES[payloadAgent]
+  }
 
   if (stage === 'repair' || artifactType === 'repair_patch' || message.includes('repair')) {
     return AGENT_EVENT_PROFILES.RepairAgent
@@ -987,6 +994,7 @@ function FaultTreePage() {
   const [notice, setNotice] = useState('')
   const [backendTreeId, setBackendTreeId] = useState(treeIdFromQuery || '')
   const [backendVersion, setBackendVersion] = useState(null)
+  const [reviewDraftContext, setReviewDraftContext] = useState(null)
   const [backendLoading, setBackendLoading] = useState(false)
   const [selectedNode, setSelectedNode] = useState(null)
   const [selectedEdge, setSelectedEdge] = useState(null)
@@ -1543,6 +1551,7 @@ function FaultTreePage() {
       taskEventHistory: Object.fromEntries(assistantTaskEventHistoryRef.current.entries()),
       selectedSourceFiles: s.selectedSourceFiles,
       assistantPending: s.assistantPending ?? null,
+      reviewDraftContext: s.reviewDraftContext ?? null,
       assistantKbBaselineEpoch: s.assistantKbBaselineEpoch ?? 0,
       assistantKbBaselineFvSig: s.assistantKbBaselineFvSig ?? '',
     })
@@ -1592,6 +1601,9 @@ function FaultTreePage() {
     }
     const restoredPending = normalizeRestoredAssistantPending(d.assistantPending)
     if (restoredPending) setAssistantPending(restoredPending)
+    if (d.reviewDraftContext && typeof d.reviewDraftContext === 'object') {
+      setReviewDraftContext(d.reviewDraftContext)
+    }
     if (typeof d.assistantKbBaselineEpoch === 'number' && Number.isFinite(d.assistantKbBaselineEpoch)) {
       kbSyncedBaselineEpochRef.current = d.assistantKbBaselineEpoch
     } else {
@@ -1631,6 +1643,9 @@ function FaultTreePage() {
       }
       const restoredPending = normalizeRestoredAssistantPending(payload?.assistantPending)
       if (restoredPending) setAssistantPending(restoredPending)
+      if (payload?.reviewDraftContext && typeof payload.reviewDraftContext === 'object') {
+        setReviewDraftContext(payload.reviewDraftContext)
+      }
     }
     if (projectIdFromQuery) {
       const fromStore =
@@ -1761,6 +1776,39 @@ function FaultTreePage() {
               applyBackendVersionPayload(ver)
             }
             setBackendTreeId(String(finalRun.tree_id))
+            setReviewDraftContext(null)
+          } else if (finalRun?.status === 'human_review_required' && !cancelled) {
+            const reviewTreeData = finalRun?.review_tree_data || finalRun?.reviewTreeData
+            if (reviewTreeData && typeof reviewTreeData === 'object') {
+              const verPayload = buildVersionPayloadFromGenerateResponse({
+                tree_data: reviewTreeData,
+                version: 1,
+                parsed_prompt: {
+                  top_event: finalRun?.resolved_top_event || finalRun?.requested_top_event || '',
+                },
+              })
+              if (verPayload) {
+                applyBackendVersionPayload({
+                  ...verPayload,
+                  description: '多智能体生成的待人工复核草稿（未入库）',
+                  is_ai_generated: true,
+                })
+                setBackendTreeId('')
+                setBackendVersion(null)
+                setReviewDraftContext({
+                  runId: finalRun?.run_id || '',
+                  treeData: reviewTreeData,
+                  requestedTopEvent: finalRun?.requested_top_event || '',
+                  resolvedTopEvent: finalRun?.resolved_top_event || '',
+                  normalizedTopEvent: finalRun?.normalized_top_event || '',
+                  selectedFileVersionIds: Array.isArray(finalRun?.selected_file_version_ids)
+                    ? finalRun.selected_file_version_ids.slice()
+                    : Array.isArray(memory.selected_file_version_ids)
+                      ? memory.selected_file_version_ids.slice()
+                      : [],
+                })
+              }
+            }
           }
         }
       } catch (err) {
@@ -1771,7 +1819,7 @@ function FaultTreePage() {
     return () => {
       cancelled = true
     }
-  }, [assistantStoreKey, assistantPending, backendTreeId])
+  }, [assistantStoreKey, assistantPending, backendTreeId, applyBackendVersionPayload])
 
   // persist assistant state (best-effort) — 画布会话由下方草稿统一持久化
   useEffect(() => {
@@ -1782,6 +1830,7 @@ function FaultTreePage() {
       tasks: assistantTasks,
       taskEventHistory: Object.fromEntries(assistantTaskEventHistoryRef.current.entries()),
       assistantPending: assistantPending ?? null,
+      reviewDraftContext: reviewDraftContext ?? null,
       assistantKbBaselineEpoch: kbSyncedBaselineEpochRef.current,
       assistantKbBaselineFvSig: kbSyncedBaselineFvSigRef.current,
     })
@@ -1790,6 +1839,7 @@ function FaultTreePage() {
     assistantSnapshots,
     assistantTasks,
     assistantPending,
+    reviewDraftContext,
     persistAssistantState,
     canvasIdFromQuery,
   ])
@@ -1804,6 +1854,7 @@ function FaultTreePage() {
       tasks: assistantTasks,
       taskEventHistory: Object.fromEntries(assistantTaskEventHistoryRef.current.entries()),
       assistantPending,
+      reviewDraftContext: reviewDraftContext ?? null,
       assistantKbBaselineEpoch: kbSyncedBaselineEpochRef.current,
       assistantKbBaselineFvSig: kbSyncedBaselineFvSigRef.current,
     })
@@ -1813,6 +1864,7 @@ function FaultTreePage() {
     assistantMessages,
     assistantSnapshots,
     assistantTasks,
+    reviewDraftContext,
     persistAssistantState,
   ])
 
@@ -2280,8 +2332,52 @@ function FaultTreePage() {
           const ver = await getTree({ treeId: run.tree_id })
           applyBackendVersionPayload(ver)
         }
+        setReviewDraftContext(null)
         updateTask(run, '生成完成')
         return { taskId, treeId: run.tree_id, agentRunId: run.run_id, reuse: false }
+      }
+
+      const loadReviewTree = (run) => {
+        const reviewTreeData = run?.review_tree_data || run?.reviewTreeData
+        const errors = Number(run?.validation?.error_count || 0)
+        const warnings = Number(run?.validation?.warning_count || 0)
+        if (reviewTreeData && typeof reviewTreeData === 'object') {
+          const verPayload = buildVersionPayloadFromGenerateResponse({
+            tree_data: reviewTreeData,
+            version: 1,
+            parsed_prompt: {
+              top_event: run?.resolved_top_event || run?.requested_top_event || '',
+            },
+          })
+          if (verPayload) {
+            applyBackendVersionPayload({
+              ...verPayload,
+              description: '多智能体生成的待人工复核草稿（未入库）',
+              is_ai_generated: true,
+            })
+            setBackendTreeId('')
+            setBackendVersion(null)
+            setReviewDraftContext({
+              runId: run?.run_id || '',
+              treeData: reviewTreeData,
+              requestedTopEvent: run?.requested_top_event || '',
+              resolvedTopEvent: run?.resolved_top_event || '',
+              normalizedTopEvent: run?.normalized_top_event || '',
+              selectedFileVersionIds: Array.isArray(run?.selected_file_version_ids)
+                ? run.selected_file_version_ids.slice()
+                : selectedFileVersionIdsForAssistant.slice(),
+            })
+            setNotice('已加载待人工复核草稿到画布。该草稿尚未入库，请检查并修改后再保存。')
+          }
+        }
+        return {
+          taskId,
+          reviewRequired: true,
+          agentRunId: run.run_id,
+          error: errors > 0
+            ? `需要人工复核：校验仍有 ${errors} 个错误、${warnings} 个警告，已将待复核草稿加载到画布（未入库）。`
+            : '需要人工复核：已将待复核草稿加载到画布（未入库）。',
+        }
       }
 
       const showConfirmation = (run) => {
@@ -2338,7 +2434,7 @@ function FaultTreePage() {
         updateTask(run)
         if (status === 'completed') return await loadCompletedTree(run)
         if (status === 'waiting_confirmation') return showConfirmation(run)
-        if (status === 'human_review_required') return { taskId, reviewRequired: true, agentRunId: run.run_id }
+        if (status === 'human_review_required') return loadReviewTree(run)
         if (status === 'failed') return { taskId, error: run.error?.message || run.error || '多智能体生成失败' }
         return null
       }
@@ -2498,6 +2594,8 @@ function FaultTreePage() {
               kind: 'text',
               content: gen?.needConfirmation
                 ? 'AssistantAgent 已找到多个相似顶事件候选。请在上方进度卡片下方选择一个候选，以继续生成。'
+                : gen?.reviewRequired
+                  ? gen?.error || '生成结果需要人工复核。请查看任务进度详情。'
                 : gen?.treeId
                   ? assistantAgentResp.assistant_message || `已生成故障树并加载到画布（tree_id=${gen.treeId}）。`
                   : `生成失败：${gen?.error || '未知错误'}`,
@@ -3043,11 +3141,6 @@ function FaultTreePage() {
     const v = await runRuleValidation()
     if (!v || v.error_count > 0) return
 
-    if (!backendTreeId) {
-      setNotice('校验通过。当前为本地演示数据（未关联后端 tree_id），无法保存到后端。')
-      return
-    }
-
     const desc = (descriptionInput || '').trim() || '前端保存'
 
     setAiLoading(true)
@@ -3055,16 +3148,57 @@ function FaultTreePage() {
     setAiValidation(null)
     try {
       const treeData = extractTreeDataForBackend({ rawJsonText, graphData, parsedInfo })
-      const resp = await saveTree({ treeId: backendTreeId, treeData, editor: '专家', description: desc })
+      let effectiveTreeId = backendTreeId
+      let createdFromReview = null
+      const reviewContextForSave =
+        reviewDraftContext?.treeData
+          ? reviewDraftContext
+          : !_backendMeta?.is_ai_generated
+            ? null
+            : {
+                treeData,
+                runId: '',
+                requestedTopEvent: '',
+                resolvedTopEvent: '',
+                normalizedTopEvent: '',
+                selectedFileVersionIds: selectedFileVersionIdsForAssistant,
+              }
+      if (!effectiveTreeId && reviewContextForSave?.treeData) {
+        createdFromReview = await createTreeFromReview({
+          treeData: reviewContextForSave.treeData,
+          editor: 'AI',
+          description: '多智能体生成的待人工复核草稿',
+          requestedTopEvent: reviewContextForSave.requestedTopEvent,
+          resolvedTopEvent: reviewContextForSave.resolvedTopEvent,
+          normalizedTopEvent: reviewContextForSave.normalizedTopEvent,
+          selectedFileVersionIds: reviewContextForSave.selectedFileVersionIds || selectedFileVersionIdsForAssistant,
+          runId: reviewContextForSave.runId,
+        })
+        effectiveTreeId = String(createdFromReview?.tree_id || createdFromReview?.treeId || '')
+        if (!effectiveTreeId) throw new Error('已通过校验，但创建后端故障树失败：未返回 tree_id')
+        setBackendTreeId(effectiveTreeId)
+        setBackendVersion(createdFromReview?.version ?? 1)
+      }
+      if (!effectiveTreeId) {
+        setNotice('校验通过。当前为本地演示数据（未关联后端 tree_id），无法保存到后端。')
+        return
+      }
+
+      const resp = await saveTree({ treeId: effectiveTreeId, treeData, editor: '专家', description: desc })
       setBackendVersion(resp?.version ?? backendVersion)
       setAiValidation({
         suggestions: `已保存为版本 ${resp?.version ?? ''}。学习条目数：${resp?.learned_count ?? 0}`,
       })
-      setNotice(`已保存到后端（tree_id=${backendTreeId}，version=${resp?.version ?? ''}）`)
+      setNotice(
+        createdFromReview
+          ? `已将人工复核草稿入库并保存修改（tree_id=${effectiveTreeId}，version=${resp?.version ?? ''}）`
+          : `已保存到后端（tree_id=${effectiveTreeId}，version=${resp?.version ?? ''}）`,
+      )
       setSubmittedToBackend(true)
+      setReviewDraftContext(null)
       setBaselineJsonText(canonicalJsonString(rawJsonText))
       try {
-        const hist = await getTreeHistory({ treeId: backendTreeId })
+        const hist = await getTreeHistory({ treeId: effectiveTreeId })
         setVersionList(Array.isArray(hist) ? hist : [])
         const vnum = resp?.version
         if (vnum != null && Array.isArray(hist)) {
@@ -3088,7 +3222,7 @@ function FaultTreePage() {
     } finally {
       setAiLoading(false)
     }
-  }, [backendTreeId, backendVersion, graphData, parsedInfo, rawJsonText, runRuleValidation])
+  }, [_backendMeta, backendTreeId, backendVersion, graphData, parsedInfo, rawJsonText, reviewDraftContext, runRuleValidation, selectedFileVersionIdsForAssistant])
 
   const handleSubmit = useCallback(() => {
     setModal({ type: 'saveDesc', value: '' })
@@ -3705,6 +3839,7 @@ function FaultTreePage() {
     assistantTasks,
     selectedSourceFiles,
     assistantPending,
+    reviewDraftContext,
     assistantKbBaselineEpoch: kbSyncedBaselineEpochRef.current,
     assistantKbBaselineFvSig: kbSyncedBaselineFvSigRef.current,
   }
@@ -3714,6 +3849,7 @@ function FaultTreePage() {
     snapshots: assistantSnapshots,
     tasks: assistantTasks,
     assistantPending,
+    reviewDraftContext: reviewDraftContext ?? null,
     assistantKbBaselineEpoch: kbSyncedBaselineEpochRef.current,
     assistantKbBaselineFvSig: kbSyncedBaselineFvSigRef.current,
   }

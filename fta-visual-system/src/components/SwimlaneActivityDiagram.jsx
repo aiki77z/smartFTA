@@ -89,7 +89,7 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
     { id: 'recall', name: '范围与检索智能体' },
     { id: 'llm2', name: '构建智能体' },
     { id: 'validate', name: '校验智能体' },
-    { id: 'repair', name: '修复智能体' },
+    { id: 'repair', name: '优化智能体' },
     { id: 'persist', name: '持久化智能体' },
   ], [])
 
@@ -207,12 +207,14 @@ export default function SwimlaneActivityDiagram({ events = [], compact = false, 
         lane: 'repair',
         row: 8,
         kind: 'action',
-        label: '历史修正',
+        label: '经验优化',
         match: e =>
           stageOf(e) === 'repair' ||
           stageOf(e) === 'fix' ||
           artifactOf(e) === 'repair_patch' ||
           textOf(e).includes('[history-repair]') ||
+          /optimization/i.test(textOf(e)) ||
+          textOf(e).includes('经验优化') ||
           textOf(e).includes('修复'),
       },
       {

@@ -213,6 +213,36 @@ export function saveTree({ treeId, treeData, editor = '专家', description = '�
   })
 }
 
+export function createTreeFromReview({
+  treeData,
+  editor = 'AI',
+  description = 'AI human-review draft',
+  requestedTopEvent,
+  resolvedTopEvent,
+  normalizedTopEvent,
+  selectedFileVersionIds,
+  runId,
+  signal,
+} = {}) {
+  const ids = Array.isArray(selectedFileVersionIds)
+    ? selectedFileVersionIds.map((s) => String(s || '').trim()).filter(Boolean)
+    : []
+  return requestJson('/api/tree/create-from-review', {
+    method: 'POST',
+    body: {
+      tree_data: treeData,
+      editor,
+      description,
+      ...(requestedTopEvent ? { requested_top_event: requestedTopEvent } : null),
+      ...(resolvedTopEvent ? { resolved_top_event: resolvedTopEvent } : null),
+      ...(normalizedTopEvent ? { normalized_top_event: normalizedTopEvent } : null),
+      ...(ids.length ? { selected_file_version_ids: ids } : null),
+      ...(runId ? { run_id: runId } : null),
+    },
+    signal,
+  })
+}
+
 export function validateTree({ treeData, signal } = {}) {
   return requestJson('/api/tree/validate', { method: 'POST', body: { tree_data: treeData }, signal })
 }

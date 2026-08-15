@@ -3,6 +3,70 @@ from typing import Any, Dict, List, Tuple
 from app.schemas import GraphDiff
 
 
+def node_display_label(node: Dict[str, Any]) -> str:
+    data = node.get("data") if isinstance(node.get("data"), dict) else {}
+    meta = node.get("meta") if isinstance(node.get("meta"), dict) else {}
+    event = meta.get("event") if isinstance(meta.get("event"), dict) else {}
+    return str(
+        node.get("name")
+        or node.get("label")
+        or node.get("title")
+        or data.get("label")
+        or data.get("name")
+        or event.get("name")
+        or event.get("label")
+        or node.get("id")
+        or ""
+    )
+
+
+def node_compare_signature(node: Dict[str, Any]) -> Dict[str, Any]:
+    meta = node.get("meta") if isinstance(node.get("meta"), dict) else {}
+    event = meta.get("event") if isinstance(meta.get("event"), dict) else {}
+    own_event = node.get("event") if isinstance(node.get("event"), dict) else {}
+    raw = meta.get("raw") if isinstance(meta.get("raw"), dict) else {}
+    raw_event = raw.get("event") if isinstance(raw.get("event"), dict) else {}
+    event_like = {**raw_event, **own_event, **event}
+    keys = [
+        "description",
+        "errorLevel",
+        "priority",
+        "probability",
+        "showProbability",
+        "rule",
+        "rules",
+        "investigateMethod",
+        "documents",
+        "message",
+    ]
+    return {
+        "gate": node.get("gate") or node.get("gateLabel") or meta.get("gateLabel") or raw.get("gate"),
+        "props": {key: event_like.get(key, node.get(key)) for key in keys if event_like.get(key, node.get(key)) is not None},
+    }
+
+
+def edge_compare_signature(edge: Dict[str, Any]) -> Dict[str, Any]:
+    meta = edge.get("meta") if isinstance(edge.get("meta"), dict) else {}
+    raw = meta.get("raw") if isinstance(meta.get("raw"), dict) else {}
+    relation = edge.get("relation") if isinstance(edge.get("relation"), dict) else {}
+    meta_relation = meta.get("relation") if isinstance(meta.get("relation"), dict) else {}
+    raw_relation = raw.get("relation") if isinstance(raw.get("relation"), dict) else {}
+    keys = [
+        "relation_type",
+        "polarity",
+        "certainty",
+        "evidence",
+        "evidence_texts",
+        "documents",
+        "gate_type",
+        "member_relation",
+        "gate_relation",
+    ]
+    merged = {**raw_relation, **meta_relation, **relation}
+    props = {key: merged.get(key, edge.get(key)) for key in keys if merged.get(key, edge.get(key)) is not None}
+    return {"props": props}
+
+
 def normalize_to_graph(obj: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not obj:
         return [], []
@@ -20,7 +84,7 @@ def normalize_to_graph(obj: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, A
             nid = str(n.get("id") or n.get("event_id") or n.get("node_id") or "")
             if not nid:
                 continue
-            label = n.get("name") or n.get("label") or n.get("title") or nid
+            label = node_display_label(n) or nid
             raw_type = str(n.get("type") or n.get("rawType") or n.get("event_type") or "")
             node_type = "event"
             if raw_type in ("1", "top", "top_event"):
@@ -31,17 +95,17 @@ def normalize_to_graph(obj: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, A
                 node_type = "basic"
             elif raw_type.upper() in ("AND", "OR") or n.get("gateLabel"):
                 node_type = "gate"
-            nodes.append({"id": nid, "label": str(label), "type": node_type})
+            nodes.append({"id": nid, "label": str(label), "type": node_type, **node_compare_signature(n)})
 
         edges = []
         for idx, e in enumerate(obj["linkList"]):
             if not isinstance(e, dict):
                 continue
-            src = e.get("source") or e.get("from") or e.get("child") or e.get("source_id")
-            tgt = e.get("target") or e.get("to") or e.get("parent") or e.get("target_id")
+            src = e.get("source") or e.get("sourceId") or e.get("from") or e.get("child") or e.get("source_id")
+            tgt = e.get("target") or e.get("targetId") or e.get("to") or e.get("parent") or e.get("target_id")
             if src is None or tgt is None:
                 continue
-            edges.append({"id": str(e.get("id") or f"e-{idx}"), "source": str(src), "target": str(tgt)})
+            edges.append({"id": str(e.get("id") or f"e-{idx}"), "source": str(src), "target": str(tgt), **edge_compare_signature(e)})
         return nodes, edges
 
     if isinstance(obj, dict) and isinstance(obj.get("nodes"), list) and isinstance(obj.get("edges"), list):
@@ -52,8 +116,8 @@ def normalize_to_graph(obj: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, A
             nid = str(n.get("id") or "")
             if not nid:
                 continue
-            label = n.get("label") or n.get("name") or n.get("title") or nid
-            nodes.append({"id": nid, "label": str(label), "type": str(n.get("type") or "event")})
+            label = node_display_label(n) or nid
+            nodes.append({"id": nid, "label": str(label), "type": str(n.get("type") or "event"), **node_compare_signature(n)})
         edges = []
         for idx, e in enumerate(obj["edges"]):
             if not isinstance(e, dict):
@@ -62,7 +126,7 @@ def normalize_to_graph(obj: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, A
             tgt = e.get("target")
             if src is None or tgt is None:
                 continue
-            edges.append({"id": str(e.get("id") or f"e-{idx}"), "source": str(src), "target": str(tgt)})
+            edges.append({"id": str(e.get("id") or f"e-{idx}"), "source": str(src), "target": str(tgt), **edge_compare_signature(e)})
         return nodes, edges
 
     return [], []
@@ -79,6 +143,8 @@ def diff_graph(prev_json: Any, next_json: Any) -> GraphDiff:
 
     prev_edge_set = {edge_key(e) for e in prev_edges}
     next_edge_set = {edge_key(e) for e in next_edges}
+    prev_edge_map = {edge_key(e): e for e in prev_edges}
+    next_edge_map = {edge_key(e): e for e in next_edges}
 
     added = []
     modified = []
@@ -88,11 +154,24 @@ def diff_graph(prev_json: Any, next_json: Any) -> GraphDiff:
             added.append(nid)
         else:
             p = prev_map[nid]
-            if p.get("label") != n.get("label") or p.get("type") != n.get("type"):
+            if (
+                p.get("label") != n.get("label")
+                or p.get("type") != n.get("type")
+                or p.get("gate") != n.get("gate")
+                or p.get("props") != n.get("props")
+            ):
                 modified.append(nid)
     for nid in prev_map:
         if nid not in next_map:
             removed.append(nid)
+
+    for key in sorted(prev_edge_set & next_edge_set):
+        prev_edge = prev_edge_map.get(key) or {}
+        next_edge = next_edge_map.get(key) or {}
+        if prev_edge.get("props") != next_edge.get("props"):
+            target = str(next_edge.get("target") or "")
+            if target and target in next_map and target not in modified:
+                modified.append(target)
 
     return GraphDiff(
         added=added,

@@ -83,7 +83,10 @@ export function createAgentRun({
   if (treeId) body.tree_id = String(treeId)
   if (treeVersion !== undefined && treeVersion !== null) body.tree_version = Number(treeVersion)
   if (maxDepth !== undefined && maxDepth !== null) body.max_depth = Number(maxDepth)
-  if (options && typeof options === 'object' && !Array.isArray(options)) body.options = options
+  body.options = {
+    agentic_version: 'v2',
+    ...((options && typeof options === 'object' && !Array.isArray(options)) ? options : {}),
+  }
   return requestJson('/api/agent/run', { method: 'POST', body, signal })
 }
 

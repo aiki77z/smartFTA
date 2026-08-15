@@ -18,3 +18,7 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip() or None
 FTA_GNR_BASE_URL = os.getenv("FTA_GNR_BASE_URL", "http://localhost:8000").strip().rstrip("/")
 FTA_GNR_AGENT_RUN_PATH = os.getenv("FTA_GNR_AGENT_RUN_PATH", "/api/agent/run").strip()
 
+ASSISTANT_MEMORY_BACKEND = os.getenv("ASSISTANT_MEMORY_BACKEND", "mongo").strip().lower()
+ASSISTANT_MONGO_URI = os.getenv("ASSISTANT_MONGO_URI", os.getenv("MONGO_URI", "mongodb://localhost:27017/")).strip()
+ASSISTANT_MONGO_DB_NAME = os.getenv("ASSISTANT_MONGO_DB_NAME", os.getenv("MONGO_DB_NAME", "smart-fta-test")).strip()
+
