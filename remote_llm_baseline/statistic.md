@@ -80,4 +80,66 @@ outputs\combined_test_twostage_entity_error_analysis_qwen3_14b.json
 
 关键诊断：`gold_relations = 625`，其中只有 `315` 条 gold relation 的 source/target 能被普通 two-stage 的 entity 候选同时覆盖，`310` 条在进入 relation 阶段前已经被 entity 候选阻断，端点覆盖给 relation recall 设置的粗略上限约为 `0.5040`。因此下一步优先做 `entity_v2`，暂不优先继续微调 relation。
 
+## Entity V2 第一步：prompt-addendum 重训结果（2026-08-10）
 
+实验内容：使用 `2stages/data/entity_v2/`（assistant gold 与原始一致，system prompt 追加
+`entity_v2_prompt_addendum.md` 规则）训练 `entity_v2_e4_lr8e5_r32_a64_len4096`，
+推理时同样追加规则文件，relation 阶段复用 `relation_e35`。
+
+先行的标签分析发现：训练集 gold 端点覆盖 2508/2508、测试集 626/626（100%），
+即 gold 标签本身完全一致，315/625 的瓶颈在模型预测侧，不在标签。
+
+| 指标 | 基线 entity_e4 + relation_e35 | entity_v2 第一步（prompt-addendum） |
+|---|---:|---:|
+| relation_endpoint_possible | 315 / 625 (0.5040) | 307 / 625 (0.4912) |
+| relation strict F1 | 0.4419 | 0.4267 |
+| relation semantic F1 | 0.5368 | 未跑（本地缺 bge-m3） |
+| entity_normalized F1 | 0.5971 | 0.6007 |
+| entity_mention_type F1 | 0.6064 | 0.6045 |
+| overlong extra predictions | 有 | 0 |
+
+结论：第一步未达标（strict F1 与端点覆盖均略降）。entity F1 微升但端点覆盖未升，
+符合"normalized_name 仍未对齐 relation 端点"的预警情形。仅加规则提示、不改标签
+不足以解决瓶颈，进入第二步：按 `entity_v2_normalization_rules.md` 清洗训练集约
+120 行风格问题（过长/带测量值的 normalized_name）后重训。
+
+## Entity V2 第二步：标签风格清洗 + 重训结果（2026-08-10）
+
+实验内容：按 `entity_v2_normalization_rules.md` 用 DeepSeek 清洗训练集 120 行
+风格问题（120 行 0 错误；实际 9 行 14 处 normalized_name 被修改，主要去除
+测量值/压缩长描述），合并后全量校验通过（844 行、端点覆盖 2508/2508），
+生成 `entity_v2_clean` SFT 并训练 `entity_v2_clean_e4_lr8e5_r32_a64_len4096`，
+relation 阶段复用 `relation_e35`。
+
+| 指标 | 基线 entity_e4 | 第一步 prompt-addendum | 第二步 entity_v2_clean |
+|---|---:|---:|---:|
+| relation_endpoint_possible | 315 / 625 (0.5040) | 307 / 625 (0.4912) | 324 / 625 (0.5184) |
+| relation strict F1 | 0.4419 | 0.4267 | 0.4579 |
+| relation semantic F1 | 0.5368 | 未跑 | 未跑（本地缺 bge-m3） |
+| entity_normalized F1 | 0.5971 | 0.6007 | 0.6011 |
+| entity_mention_type F1 | 0.6064 | 0.6045 | 0.6061 |
+| overlong extra predictions | 有 | 0 | 0 |
+
+结论：第二步方向有效——strict F1 超过基线（0.4419）与单阶段最优（0.4469），
+端点覆盖 315 -> 324。但仍低于 HANDOFF 最低目标（400/625），端到端还有较大
+提升空间；语义评估待补（需要 `D:\models\bge-m3`）。
+
+## Entity V2 扩大清洗（主动规范化模式）结果（2026-08-14）
+
+实验内容：在第二步基础上把清洗改为"主动规范化"模式（对每条 normalized_name
+主动去测量值/压缩长描述），120 行清洗 0 错误、22 行 31 处改动，合并校验通过后
+训练 `entity_v2_clean_v2_e4_lr8e5_r32_a64_len4096`，relation 阶段复用
+`relation_e35`。
+
+| 指标 | 基线 entity_e4 | 第二步 entity_v2_clean | 扩大清洗 entity_v2_clean_v2 |
+|---|---:|---:|---:|
+| relation_endpoint_possible | 315 / 625 (0.5040) | 324 / 625 (0.5184) | 301 / 625 (0.4816) |
+| relation strict F1 | 0.4419 | 0.4579 | 0.4118 |
+| entity_normalized F1 | 0.5971 | 0.6011 | 0.5963 |
+| entity_mention_type F1 | 0.6064 | 0.6061 | 0.5910 |
+
+结论：**主动扩大清洗是负向结果**——改动更多标签（如补动作对象、压缩表述）
+使训练风格偏离测试集 gold 风格，模型输出的 normalized_name 与测试端点对齐度
+下降，strict F1 与端点覆盖均低于基线和第二步。当前最佳仍是第二步的
+`entity_v2_clean_e4...`（strict F1 0.4579、端点覆盖 324/625）。扩大清洗方案
+收手，不再继续；下一步优先检查点选择或语义评估补全。
