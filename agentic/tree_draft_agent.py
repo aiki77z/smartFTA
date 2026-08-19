@@ -56,6 +56,7 @@ class TreeDraftAgent:
         )
         context_assessment = self._assess_retrieval_context(run_id, retrieval_context)
         tool = self._select_build_tool(retrieval_context, context_assessment)
+        deterministic_policy = _deterministic_tool_policy(retrieval_context)
         append_agentic_event(
             run_id,
             EVENT_TOOL_SELECTED,
@@ -64,7 +65,11 @@ class TreeDraftAgent:
             message=f"TreeDraftAgent selected draft tool: {tool}.",
             progress=45,
             tool=tool,
-            details={"tool": tool, "context_assessment": context_assessment},
+            details={
+                "tool": tool,
+                "context_assessment": context_assessment,
+                "deterministic_policy": deterministic_policy,
+            },
         )
         draft_tree = self._call_build_tool(
             run_id,
@@ -202,11 +207,18 @@ class TreeDraftAgent:
         build_tools = {"build_tree_from_subgraph", "build_tree_from_chunks", "build_tree_draft"}
         allowed = [tool.name for tool in self.registry.list_for_agent(self.name) if tool.name in build_tools]
         subgraph = retrieval_context.get("subgraph_bundle") or {}
-        graph_ready = bool(ENABLE_GRAPH_RETRIEVAL and subgraph.get("nodes") and subgraph.get("edges"))
+        policy = _deterministic_tool_policy(retrieval_context)
+        graph_ready = bool(policy.get("graph_usable"))
+        if graph_ready and "build_tree_from_subgraph" in allowed:
+            return "build_tree_from_subgraph"
+        if not graph_ready and "build_tree_from_chunks" in allowed and policy.get("force_chunks"):
+            return "build_tree_from_chunks"
         assessed_tool = str(assessment.get("recommended_strategy") or "")
         fallback = assessed_tool if assessed_tool in {"build_tree_from_subgraph", "build_tree_from_chunks"} else ""
         if not fallback:
             fallback = "build_tree_from_subgraph" if graph_ready else "build_tree_from_chunks"
+        if fallback not in allowed:
+            fallback = allowed[0] if allowed else "build_tree_from_chunks"
         if not LLM_API_KEY:
             return fallback
         prompt = {
@@ -216,9 +228,15 @@ class TreeDraftAgent:
                 "Choose exactly one tool name from the allowed list. "
                 "Prefer build_tree_from_subgraph when the graph skeleton is usable; "
                 "choose build_tree_from_chunks only when the graph is clearly too weak or broken. "
+                "The subgraph has already been cleaned for selected-scope cycles and transitive shortcut edges; "
+                "if the cleaned graph still has a usable causal skeleton, choose build_tree_from_subgraph. "
                 f"Allowed tools: {allowed}\n"
                 f"Graph node count: {len(subgraph.get('nodes') or [])}\n"
                 f"Graph edge count: {len(subgraph.get('edges') or [])}\n"
+                f"Cleaned graph usable: {policy.get('graph_usable')}\n"
+                f"Graph policy reason: {policy.get('reason')}\n"
+                f"Disabled cycle edge count: {len(subgraph.get('disabled_cycle_edges') or [])}\n"
+                f"Pruned transitive edge count: {len(subgraph.get('pruned_transitive_edges') or [])}\n"
                 f"Evidence chunk count: {len(retrieval_context.get('raw_chunks') or [])}\n"
                 f"Context assessment: {json.dumps(assessment, ensure_ascii=False)}\n"
                 "Return only JSON: {\"tool\": \"...\"}"
@@ -234,6 +252,8 @@ class TreeDraftAgent:
             parsed = json.loads(response.choices[0].message.content or "{}")
             tool = str(parsed.get("tool") or "")
             if tool in allowed and tool in {"build_tree_from_subgraph", "build_tree_from_chunks", "build_tree_draft"}:
+                if tool == "build_tree_from_chunks" and graph_ready and "build_tree_from_subgraph" in allowed:
+                    return "build_tree_from_subgraph"
                 return tool
         except Exception:
             return fallback
@@ -331,13 +351,14 @@ def _fallback_context_assessment(retrieval_context: Dict[str, Any]) -> Dict[str,
     nodes = subgraph.get("nodes") or []
     edges = subgraph.get("edges") or []
     chunks = retrieval_context.get("raw_chunks") or []
-    graph_ready = bool(ENABLE_GRAPH_RETRIEVAL and nodes and edges)
+    policy = _deterministic_tool_policy(retrieval_context)
+    graph_ready = bool(policy.get("graph_usable"))
     node_count = len(nodes)
     edge_count = len(edges)
     chunk_count = len(chunks)
     coverage_score = min(1.0, (node_count / 8.0) * 0.6 + (edge_count / 7.0) * 0.4) if graph_ready else 0.0
     evidence_support_score = min(1.0, chunk_count / 6.0) if chunk_count else 0.0
-    graph_clearly_weak = not graph_ready or node_count < 2 or edge_count < 1
+    graph_clearly_weak = not graph_ready
     return {
         "subgraph_usable": not graph_clearly_weak,
         "coverage_score": round(coverage_score, 3),
@@ -345,12 +366,74 @@ def _fallback_context_assessment(retrieval_context: Dict[str, Any]) -> Dict[str,
         "noise_risk": "low" if graph_ready and edge_count <= max(node_count * 3, 3) else "medium",
         "recommended_strategy": "build_tree_from_chunks" if graph_clearly_weak else "build_tree_from_subgraph",
         "reason": (
-            "Graph skeleton has nodes and causal edges; prefer graph-guided generation."
+            f"Cleaned graph skeleton is usable; prefer graph-guided generation. {policy.get('reason')}"
             if not graph_clearly_weak
-            else "Graph skeleton is empty or too sparse; use evidence-only chunk generation."
+            else f"Cleaned graph skeleton is too weak; use evidence-only chunk generation. {policy.get('reason')}"
         ),
         "missing_context": [] if not graph_clearly_weak else ["usable_graph_edges"],
         "source": "deterministic_fallback",
+    }
+
+
+def _deterministic_tool_policy(retrieval_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Decide whether the already-cleaned subgraph is strong enough to guide tree drafting.
+
+    `expand_scoped_local_fault_subgraph()` cleans selected-scope causal cycles and
+    prunes transitive shortcuts before TreeDraftAgent receives the bundle. Tool
+    selection must therefore judge the cleaned bundle, not the noisy raw graph.
+    """
+
+    subgraph = retrieval_context.get("subgraph_bundle") or {}
+    nodes = [node for node in (subgraph.get("nodes") or []) if isinstance(node, dict)]
+    edges = [edge for edge in (subgraph.get("edges") or []) if isinstance(edge, dict)]
+    root_ids = {
+        str(item)
+        for item in (subgraph.get("roots") or ([subgraph.get("root")] if subgraph.get("root") else []))
+        if item
+    }
+    node_ids = {str(node.get("graph_node_id") or node.get("id") or "") for node in nodes}
+    root_present = bool(root_ids & node_ids) if root_ids else bool(subgraph.get("root") or nodes)
+    causal_edges = [
+        edge
+        for edge in edges
+        if str(edge.get("relation_type_code") or edge.get("relation_type") or "").upper()
+        in {"CAUSES", "CLUSTERED_CAUSES", "故障触发"}
+    ]
+    gate_groups = subgraph.get("gate_groups") or []
+    graph_enabled = bool(ENABLE_GRAPH_RETRIEVAL)
+    node_count = len(nodes)
+    edge_count = len(edges)
+    causal_edge_count = len(causal_edges)
+    has_structural_edges = edge_count >= 1 and (causal_edge_count >= 1 or bool(gate_groups))
+    graph_usable = bool(graph_enabled and root_present and node_count >= 2 and has_structural_edges)
+    if graph_usable:
+        reason = (
+            "cleaned_subgraph_ready:"
+            f" nodes={node_count}, edges={edge_count}, causal_edges={causal_edge_count}, "
+            f"gate_groups={len(gate_groups)}, disabled_cycles={len(subgraph.get('disabled_cycle_edges') or [])}, "
+            f"pruned_transitive={len(subgraph.get('pruned_transitive_edges') or [])}"
+        )
+    else:
+        missing = []
+        if not graph_enabled:
+            missing.append("graph_retrieval_disabled")
+        if not root_present:
+            missing.append("root_missing")
+        if node_count < 2:
+            missing.append("too_few_nodes")
+        if not has_structural_edges:
+            missing.append("no_usable_causal_or_gate_edges")
+        reason = "cleaned_subgraph_weak:" + ",".join(missing or ["unknown"])
+    return {
+        "graph_usable": graph_usable,
+        "force_chunks": not graph_usable,
+        "reason": reason,
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "causal_edge_count": causal_edge_count,
+        "gate_group_count": len(gate_groups),
+        "disabled_cycle_edge_count": len(subgraph.get("disabled_cycle_edges") or []),
+        "pruned_transitive_edge_count": len(subgraph.get("pruned_transitive_edges") or []),
     }
 
 
